@@ -327,6 +327,14 @@ class MultiAgentOrchestrator:
 
         raise RuntimeError("All router models failed (Kimi/Gemini/DeepSeek)")
 
+    async def _run_sync_in_executor(self, fn, *args, **kwargs):
+        """Temporary bridge for sync I/O until full migration to httpx.AsyncClient."""
+        import asyncio
+        import functools
+        loop = asyncio.get_running_loop()
+        bound = functools.partial(fn, *args, **kwargs)
+        return await loop.run_in_executor(None, bound)
+
     def _extract_ticker(self, message: str) -> str:
         """
         Extract stock ticker symbol from user message (AR/EN/Company names).
@@ -417,6 +425,7 @@ Ticker:"""
             return "GENERAL", "GENERAL", message, ""
 
 
+    # Temporary non-blocking bridge: requests stays sync for now; full upgrade to httpx.AsyncClient is next.
     async def _handle_dfm_query(self, message: str, dfm_context: str) -> str:
         """Fast-path DFM analysis using DeepSeek + local fundamentals. No blocking scraping."""
         import os, requests
@@ -441,7 +450,8 @@ Ticker:"""
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
-                r = requests.post(
+                r = await self._run_sync_in_executor(
+                    requests.post,
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                     json={
@@ -453,7 +463,7 @@ Ticker:"""
                         "max_tokens": 3000,
                         "temperature": 0.3
                     },
-                    timeout=60
+                    timeout=60,
                 )
                 resp = r.json()
                 if "choices" in resp:
@@ -468,6 +478,7 @@ Ticker:"""
             logger.warning(f"[DFMHandler] Gemini failed: {e}")
             return dfm_context  # Return raw data as last resort
 
+    # Temporary non-blocking bridge: requests stays sync for now; full upgrade to httpx.AsyncClient is next.
     async def _handle_bond_query(self, message: str) -> str:
         """
         CIO-grade fixed income analysis.
@@ -563,7 +574,8 @@ Ticker:"""
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
-                r = requests.post(
+                r = await self._run_sync_in_executor(
+                    requests.post,
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                     json={
@@ -575,7 +587,7 @@ Ticker:"""
                         "max_tokens": 30000,
                         "temperature": 0.3
                     },
-                    timeout=60
+                    timeout=60,
                 )
                 resp = r.json()
                 if "choices" in resp:
@@ -777,11 +789,9 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     try:
                         import asyncio as _asyncio
                         _result = await _asyncio.wait_for(
-                            _asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: self.financial_agent._handle_analytics(
-                                    session_id, {"user_ctx": _user_ctx, "user_id": user_id}, message
-                                ),
+                            self._run_sync_in_executor(
+                                self.financial_agent._handle_analytics,
+                                session_id, {"user_ctx": _user_ctx, "user_id": user_id}, message,
                             ),
                             timeout=120,
                         )
