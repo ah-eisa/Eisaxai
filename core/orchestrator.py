@@ -70,6 +70,10 @@ GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
 # Avg latency: ~800ms | Cost: Standard | Use: Fallback analysis, complex prompts
 GEMINI_MODEL_BACKUP = "gemini-2.5-flash"
 
+# ?? Kimi (Moonshot) Configuration - Primary Maestro ?????????????????????
+MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
+KIMI_MODEL = "kimi-k2.5"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # GEMINI Configuration — Primary & Backup Models for High Reliability
 # ═══════════════════════════════════════════════════════════════════════════
@@ -172,6 +176,19 @@ class MultiAgentOrchestrator:
         except Exception as e:
             logger.error("Gemini Client init failed: %s", e)
 
+        self.kimi_client = None
+        if MOONSHOT_API_KEY:
+            try:
+                from openai import OpenAI
+                self.kimi_client = OpenAI(
+                    api_key=MOONSHOT_API_KEY,
+                    base_url="https://api.moonshot.ai/v1"
+                )
+                logger.info("[Kimi] Client initialized successfully with model: %s", KIMI_MODEL)
+            except Exception as e:
+                logger.error("[Kimi] Client init failed: %s", e)
+                self.kimi_client = None
+
         self._financial_agent = None
 
     @property
@@ -250,6 +267,66 @@ class MultiAgentOrchestrator:
                 raise
         raise RuntimeError(f"No Gemini backup available for [{label}]")
 
+    def _maestro_route_generate(self, prompt: str) -> str:
+        """Primary router: Kimi maestro, then Gemini, then DeepSeek fallback."""
+        # Primary: Kimi K2.5
+        if self.kimi_client:
+            try:
+                resp = _retry(
+                    lambda: self.kimi_client.chat.completions.create(
+                        model=KIMI_MODEL,
+                        messages=[
+                            {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        temperature=0.1,
+                    ),
+                    max_attempts=2,
+                    base_delay=0.3,
+                )
+                content = ((resp.choices[0].message.content or "") if resp and resp.choices else "").strip()
+                if content:
+                    return content
+            except Exception as e:
+                logger.warning("[Router] Kimi failed: %s ? falling back to Gemini", e)
+
+        # Fallback 1: Gemini
+        try:
+            raw = self._gemini_generate(prompt, label="router-gemini-fallback")
+            if raw:
+                return raw
+        except Exception as e:
+            logger.warning("[Router] Gemini fallback failed: %s ? falling back to DeepSeek", e)
+
+        # Fallback 2: DeepSeek
+        ds_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if ds_key:
+            try:
+                import requests
+                r = requests.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [
+                            {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 800,
+                        "temperature": 0.1,
+                    },
+                    timeout=30,
+                )
+                resp = r.json()
+                if "choices" in resp:
+                    content = (resp["choices"][0]["message"]["content"] or "").strip()
+                    if content:
+                        return content
+            except Exception as e:
+                logger.error("[Router] DeepSeek fallback failed: %s", e)
+
+        raise RuntimeError("All router models failed (Kimi/Gemini/DeepSeek)")
+
     def _extract_ticker(self, message: str) -> str:
         """
         Extract stock ticker symbol from user message (AR/EN/Company names).
@@ -316,17 +393,25 @@ Ticker:"""
         import json, re
         try:
             prompt = ROUTER_PROMPT.format(message=message)
-            raw = self._gemini_generate(prompt, label="router")
+            raw = self._maestro_route_generate(prompt)
             if not raw:
                 return "GENERAL", "GENERAL", message, ""
             text = re.sub(r"```json|```", "", raw).strip()
-            result = json.loads(text)
-            route = result.get("route", "GENERAL").upper()
-            handler = result.get("handler", route).upper()
-            instruction = result.get("instruction", message)
-            clarification = result.get("clarification_question", "")
-            logger.info("[Brain] route=%s | handler=%s | %s", route, handler, instruction[:80])
-            return route, handler, instruction, clarification
+            try:
+                result = json.loads(text)
+                route = result.get("route", "GENERAL").upper()
+                handler = result.get("handler", route).upper()
+                instruction = result.get("instruction", message)
+                clarification = result.get("clarification_question", "")
+                logger.info("[Brain] route=%s | handler=%s | %s", route, handler, instruction[:80])
+                return route, handler, instruction, clarification
+            except Exception:
+                label = text.split()[0].upper() if text else "GENERAL"
+                if label in {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY"}:
+                    return label, label, message, ""
+                if label == "BOND":
+                    return "FINANCIAL", "BOND", message, ""
+                return "GENERAL", "GENERAL", message, ""
         except Exception as e:
             logger.warning("Brain failed: %s", e)
             return "GENERAL", "GENERAL", message, ""
