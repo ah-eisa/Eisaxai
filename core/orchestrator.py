@@ -1,5 +1,6 @@
 import os
 import time as _time
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -189,7 +190,40 @@ class MultiAgentOrchestrator:
                 logger.error("[Kimi] Client init failed: %s", e)
                 self.kimi_client = None
 
+        # Full async I/O migration: shared AsyncClient for DFM and Bond handlers.
+        self.httpx_client = httpx.AsyncClient()
+
         self._financial_agent = None
+
+    async def aclose(self):
+        client = getattr(self, "httpx_client", None)
+        if client and not client.is_closed:
+            await client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.aclose()
+
+    def __del__(self):
+        client = getattr(self, "httpx_client", None)
+        if not client or client.is_closed:
+            return
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+        except Exception:
+            try:
+                import asyncio
+                asyncio.run(client.aclose())
+            except Exception:
+                pass
+        else:
+            try:
+                loop.create_task(client.aclose())
+            except Exception:
+                pass
 
     @property
     def financial_agent(self):
@@ -425,7 +459,7 @@ Ticker:"""
             return "GENERAL", "GENERAL", message, ""
 
 
-    # Temporary non-blocking bridge: requests stays sync for now; full upgrade to httpx.AsyncClient is next.
+    # Full async I/O migration: use httpx.AsyncClient first, keep requests+executor as safety fallback.
     async def _handle_dfm_query(self, message: str, dfm_context: str) -> str:
         """Fast-path DFM analysis using DeepSeek + local fundamentals. No blocking scraping."""
         import os, requests
@@ -450,21 +484,40 @@ Ticker:"""
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
-                r = await self._run_sync_in_executor(
-                    requests.post,
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": message}
-                        ],
-                        "max_tokens": 3000,
-                        "temperature": 0.3
-                    },
-                    timeout=60,
-                )
+                try:
+                    if not self.httpx_client:
+                        raise RuntimeError("httpx AsyncClient is unavailable")
+                    r = await self.httpx_client.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": message}
+                            ],
+                            "max_tokens": 3000,
+                            "temperature": 0.3
+                        },
+                        timeout=60,
+                    )
+                except Exception as _httpx_e:
+                    logger.warning("[DFMHandler] httpx failed: %s; using requests fallback", _httpx_e)
+                    r = await self._run_sync_in_executor(
+                        requests.post,
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": message}
+                            ],
+                            "max_tokens": 3000,
+                            "temperature": 0.3
+                        },
+                        timeout=60,
+                    )
                 resp = r.json()
                 if "choices" in resp:
                     return resp["choices"][0]["message"]["content"].strip()
@@ -478,7 +531,7 @@ Ticker:"""
             logger.warning(f"[DFMHandler] Gemini failed: {e}")
             return dfm_context  # Return raw data as last resort
 
-    # Temporary non-blocking bridge: requests stays sync for now; full upgrade to httpx.AsyncClient is next.
+    # Full async I/O migration: use httpx.AsyncClient first, keep requests+executor as safety fallback.
     async def _handle_bond_query(self, message: str) -> str:
         """
         CIO-grade fixed income analysis.
@@ -574,21 +627,40 @@ Ticker:"""
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
-                r = await self._run_sync_in_executor(
-                    requests.post,
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
-                            {"role": "user", "content": message}
-                        ],
-                        "max_tokens": 30000,
-                        "temperature": 0.3
-                    },
-                    timeout=60,
-                )
+                try:
+                    if not self.httpx_client:
+                        raise RuntimeError("httpx AsyncClient is unavailable")
+                    r = await self.httpx_client.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
+                                {"role": "user", "content": message}
+                            ],
+                            "max_tokens": 30000,
+                            "temperature": 0.3
+                        },
+                        timeout=60,
+                    )
+                except Exception as _httpx_e:
+                    logger.warning("[BondHandler] httpx failed: %s; using requests fallback", _httpx_e)
+                    r = await self._run_sync_in_executor(
+                        requests.post,
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
+                                {"role": "user", "content": message}
+                            ],
+                            "max_tokens": 30000,
+                            "temperature": 0.3
+                        },
+                        timeout=60,
+                    )
                 resp = r.json()
                 if "choices" in resp:
                     return resp["choices"][0]["message"]["content"].strip()
