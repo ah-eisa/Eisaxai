@@ -145,8 +145,9 @@ def _save_analysis_to_memory(user_id: str, ticker: str, reply: str):
         # Save summary = first 300 chars of reply (the conclusion section)
         summary = reply[:300].replace("\n", " ").strip()
         from core.memory_manager import save_stock_analysis
-        save_stock_analysis(ticker.upper(), verdict, price, summary)
-        logger.info("[Memory] Saved analysis: %s → %s @ $%.2f", ticker, verdict, price)
+        # Pass user_id so per-user history is saved alongside global stock_memory
+        save_stock_analysis(ticker.upper(), verdict, price, summary, user_id=user_id)
+        logger.info("[Memory] Saved analysis: %s → %s @ $%.2f (user=%s)", ticker, verdict, price, user_id)
 
         # #9 Brain: persist prediction so the learning engine can track accuracy
         if price and price > 0 and verdict in (
@@ -313,7 +314,10 @@ class MultiAgentOrchestrator:
                             {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
                             {"role": "user", "content": prompt},
                         ],
-                        temperature=0.1,
+                        # Kimi K2.5 only supports temperature=1 — do not pass other values
+                        temperature=1,
+                        # Force JSON output — prevents prose wrapping around the JSON
+                        response_format={"type": "json_object"},
                     ),
                     max_attempts=2,
                     base_delay=0.3,
@@ -368,6 +372,129 @@ class MultiAgentOrchestrator:
         loop = asyncio.get_running_loop()
         bound = functools.partial(fn, *args, **kwargs)
         return await loop.run_in_executor(None, bound)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SSE STREAMING — yields SSE-formatted events for /v1/chat/stream endpoint
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    async def stream_process_message(
+        self, user_id: str, message: str, session_id: Optional[str] = None
+    ):
+        """
+        Async generator for Server-Sent Events streaming.
+
+        Yields SSE lines:
+          data: {"type":"status","text":"..."}   ← progress indicator
+          data: {"type":"token","text":"..."}    ← text chunk
+          data: {"type":"done","meta":{...}}     ← final metadata
+
+        Strategy:
+          GENERAL route   → true Gemini streaming (token-by-token)
+          All other routes → progress events while processing, then
+                             natural-chunk streaming of the completed reply
+        """
+        import json as _j
+        import asyncio as _aio
+        import re as _re
+
+        def _sse(type_: str, payload) -> str:
+            return f"data: {_j.dumps({'type': type_, 'text': payload}, ensure_ascii=False)}\n\n"
+
+        if not session_id:
+            session_id = self.session_mgr.get_or_create_session(user_id)
+
+        # ── Immediate acknowledgment ───────────────────────────────────────────
+        yield _sse("status", "⚡ EisaX يفكر...")
+
+        # ── Fast-path: GENERAL (greetings, capability questions) ──────────────
+        try:
+            from core.services.routing_service import is_greeting
+            _is_greet = is_greeting(message)
+        except Exception:
+            _is_greet = len(message.strip()) < 12
+
+        if _is_greet:
+            yield _sse("status", "💬 ...")
+            _reply_chunks = []
+            try:
+                # Run Gemini in executor (sync SDK), collect tokens
+                _system = (
+                    "You are EisaX, an AI financial assistant built by Ahmed Eisa. "
+                    "Reply warmly and briefly in the same language as the user."
+                )
+                _prompt = f"{_system}\n\nUser: {message}\n\nAssistant:"
+                _raw = await self._run_sync_in_executor(
+                    self._gemini_generate, _prompt, label="stream-greeting"
+                )
+                _reply_chunks = [_raw] if _raw else []
+            except Exception as _ge:
+                logger.warning("[Stream] Gemini greeting failed: %s", _ge)
+
+            _full_reply = "".join(_reply_chunks)
+            # Stream word-by-word for greeting
+            for _word in (_full_reply + " ").split(" "):
+                if _word:
+                    yield _sse("token", _word + " ")
+                    await _aio.sleep(0.03)
+            self.session_mgr.save_message(session_id, user_id, "user", message)
+            self.session_mgr.save_message(session_id, user_id, "assistant", _full_reply)
+            yield _sse("done", _j.dumps({"session_id": session_id, "agent": "EisaX AI"}, ensure_ascii=False))
+            return
+
+        # ── Complex routes: status heartbeat + background processing ──────────
+        _status_sequence = [
+            "🔍 تصنيف الطلب...",
+            "📊 جلب البيانات...",
+            "🧠 التحليل جارٍ...",
+            "✍️ إعداد التقرير...",
+        ]
+        _status_idx = 0
+
+        # Launch process_message as a background task
+        _task = _aio.create_task(
+            self.process_message(user_id, message, session_id)
+        )
+
+        # Send heartbeat status messages while waiting
+        while not _task.done():
+            await _aio.sleep(2.5)
+            if _status_idx < len(_status_sequence):
+                yield _sse("status", _status_sequence[_status_idx])
+                _status_idx += 1
+
+        # Retrieve result (re-raise if task raised exception)
+        try:
+            _result = _task.result()
+        except Exception as _te:
+            logger.error("[Stream] process_message task failed: %s", _te)
+            yield _sse("error", "⚠️ حدث خطأ أثناء المعالجة. حاول مرة أخرى.")
+            yield _sse("done", _j.dumps({"session_id": session_id}, ensure_ascii=False))
+            return
+
+        _reply = _result.get("reply", "")
+        if not _reply:
+            yield _sse("error", "⚠️ لم أتمكن من معالجة طلبك. حاول مرة أخرى.")
+            yield _sse("done", _j.dumps({"session_id": session_id}, ensure_ascii=False))
+            return
+
+        yield _sse("status", "✅ جاهز")
+
+        # ── Stream reply in natural sentence/line chunks ───────────────────────
+        # Split on sentence boundaries while preserving markdown structure
+        _chunks = _re.split(r'(?<=[\.\!\?؟\n])\s*', _reply)
+        for _chunk in _chunks:
+            if _chunk.strip():
+                yield _sse("token", _chunk)
+                # Brief pause between chunks — gives natural reading feel
+                await _aio.sleep(0.015)
+
+        # ── Done event with full metadata ──────────────────────────────────────
+        yield _sse("done", _j.dumps({
+            "session_id": session_id,
+            "agent":      _result.get("agent_name", "EisaX"),
+            "model":      _result.get("model", ""),
+            "download_url": _result.get("download_url"),
+        }, ensure_ascii=False))
 
     def _extract_ticker(self, message: str) -> str:
         """
@@ -439,21 +566,39 @@ Ticker:"""
             if not raw:
                 return "GENERAL", "GENERAL", message, ""
             text = re.sub(r"```json|```", "", raw).strip()
+            # Valid route + handler values
+            _VALID_ROUTES   = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY", "CRYPTO", "MACRO", "BOND"}
+            _VALID_HANDLERS = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY",
+                               "CIO_ANALYSIS", "PORTFOLIO_OPTIMIZE", "BOND", "DFM", "CRYPTO", "MACRO"}
+            # Route→handler default mapping when handler is missing or invalid
+            _ROUTE_HANDLER_MAP = {
+                "STOCK_ANALYSIS": "STOCK_ANALYSIS",
+                "FINANCIAL":      "CIO_ANALYSIS",
+                "PORTFOLIO":      "PORTFOLIO_OPTIMIZE",
+                "BOND":           "BOND",
+                "CRYPTO":         "STOCK_ANALYSIS",
+                "MACRO":          "GENERAL",
+                "GENERAL":        "GENERAL",
+                "CLARIFY":        "GENERAL",
+            }
             try:
                 result = json.loads(text)
                 route = result.get("route", "GENERAL").upper()
-                handler = result.get("handler", route).upper()
+                if route not in _VALID_ROUTES:
+                    route = "GENERAL"
+                raw_handler = result.get("handler", "").upper()
+                # Use explicit handler if valid, else derive from route
+                handler = raw_handler if raw_handler in _VALID_HANDLERS else _ROUTE_HANDLER_MAP.get(route, "GENERAL")
                 instruction = result.get("instruction", message)
                 clarification = result.get("clarification_question", "")
                 logger.info("[Brain] route=%s | handler=%s | %s", route, handler, instruction[:80])
                 return route, handler, instruction, clarification
             except Exception:
+                # Non-JSON fallback: parse first word as label
                 label = text.split()[0].upper() if text else "GENERAL"
-                if label in {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY"}:
-                    return label, label, message, ""
-                if label == "BOND":
-                    return "FINANCIAL", "BOND", message, ""
-                return "GENERAL", "GENERAL", message, ""
+                if label not in _VALID_ROUTES:
+                    label = "GENERAL"
+                return label, _ROUTE_HANDLER_MAP.get(label, "GENERAL"), message, ""
         except Exception as e:
             logger.warning("Brain failed: %s", e)
             return "GENERAL", "GENERAL", message, ""
@@ -639,7 +784,7 @@ Ticker:"""
                                 {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
                                 {"role": "user", "content": message}
                             ],
-                            "max_tokens": 30000,
+                            "max_tokens": 8000,
                             "temperature": 0.3
                         },
                         timeout=60,
@@ -656,7 +801,7 @@ Ticker:"""
                                 {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
                                 {"role": "user", "content": message}
                             ],
-                            "max_tokens": 30000,
+                            "max_tokens": 8000,
                             "temperature": 0.3
                         },
                         timeout=60,
@@ -775,21 +920,35 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
 
             # ── 5a. Clean Portfolio Pipeline (MUST be before bond check) ─────────
             try:
-                import sys as _sys, os as _os
+                import sys as _sys, os as _os, re as _re_pp
                 _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
                 if _root not in _sys.path:
                     _sys.path.insert(0, _root)
                 from portfolio_pipeline import is_pipeline_request, run as pipeline_run
                 if is_pipeline_request(message):
-                    logger.info("[Pipeline] Routing to clean pipeline: %s", message[:60])
-                    _pipe_report = pipeline_run(message)
-                    if _pipe_report:
-                        self.session_mgr.save_message(session_id, user_id, "user", message)
-                        self.session_mgr.save_message(session_id, user_id, "assistant", _pipe_report)
-                        return {
-                            "reply": _pipe_report, "session_id": session_id,
-                            "agent_name": "EisaX Portfolio Pipeline", "model": "pipeline+deepseek",
-                        }
+                    # Gate: require min inputs (amount OR risk OR markets) before executing.
+                    # Vague requests like "عايز محفظة" must be clarified first.
+                    _pp_low = message.lower()
+                    _pp_has_amount = bool(_re_pp.search(
+                        r'\d[\d,\.]*\s*(k|m|b|الف|مليون|مليار|دولار|ريال|درهم|\$|usd|eur|aed|sar)', _pp_low))
+                    _pp_has_risk   = any(w in _pp_low for w in [
+                        'aggressive','عدوانية','عدواني','risk','مخاطرة','مخاطر','conservative',
+                        'محافظ','متوازن','balanced','moderate','منخفض','متوسط','عالي','عالية'])
+                    _pp_has_market = any(w in _pp_low for w in [
+                        'uae','dubai','saudi','مصر','egypt','us ','america','global','gulf','خليج',
+                        'stocks','bonds','crypto','gold','سندات','اسهم','ذهب','دولي','محلي'])
+                    if _pp_has_amount or _pp_has_risk or _pp_has_market:
+                        logger.info("[Pipeline] Routing to clean pipeline: %s", message[:60])
+                        _pipe_report = pipeline_run(message)
+                        if _pipe_report:
+                            self.session_mgr.save_message(session_id, user_id, "user", message)
+                            self.session_mgr.save_message(session_id, user_id, "assistant", _pipe_report)
+                            return {
+                                "reply": _pipe_report, "session_id": session_id,
+                                "agent_name": "EisaX Portfolio Pipeline", "model": "pipeline+deepseek",
+                            }
+                    else:
+                        logger.info("[Pipeline] Vague portfolio request — skipping pipeline, will clarify")
             except Exception as _pipe_exc:
                 logger.warning("[Pipeline] Failed: %s — continuing", _pipe_exc)
 
@@ -905,7 +1064,41 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     reply_saver=self.session_mgr.save_message,
                 )
 
-            # ── 9. GENERAL (Gemini) ────────────────────────────────────────────
+            # ── 9. GENERAL — Agent Loop for tool-requiring queries, Gemini for chat ──
+            # Use the agent loop when the question likely needs live data tools.
+            # Pure conversation/greetings go directly to Gemini (faster).
+            _tool_signals = [
+                "price", "سعر", "analyze", "حلل", "news", "أخبار", "screen",
+                "portfolio", "محفظة", "compare", "قارن", "fundamentals",
+                "recommend", "best stock", "أفضل سهم", "buy", "sell",
+                "اشتري", "يبيع", "dividend", "earnings", "ربح", "return",
+            ]
+            _needs_tools = any(sig in message.lower() for sig in _tool_signals)
+            if _needs_tools:
+                try:
+                    from core.agent_loop import run_agent as _run_agent
+                    _agent_result = await _run_agent(
+                        message=instruction or message,
+                        user_ctx=_user_ctx,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    _agent_reply = _agent_result.get("reply", "")
+                    if _agent_reply:
+                        self.session_mgr.save_message(session_id, user_id, "user", message)
+                        self.session_mgr.save_message(session_id, user_id, "assistant", _agent_reply)
+                        logger.info("[AgentLoop] Answered via %d tool(s) in %d iter(s)",
+                                    len(_agent_result.get("tools_used", [])),
+                                    _agent_result.get("iterations", 0))
+                        return {
+                            "reply":      _agent_reply,
+                            "session_id": session_id,
+                            "agent_name": "EisaX Agent",
+                            "model":      _agent_result.get("model", "deepseek-agent"),
+                        }
+                except Exception as _ale:
+                    logger.warning("[AgentLoop] Failed: %s — falling back to Gemini", _ale)
+
             return await _handle_general(self, session_id, user_id, message, instruction, _user_ctx)
 
         except Exception as e:
@@ -917,6 +1110,174 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                 "model":      "error",
             }
 
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STREAMING — process_message_stream
+    # Async generator yielding SSE-style event dicts for the /v1/chat/stream
+    # endpoint.  Event schema:
+    #   {"type": "status",  "text": "..."}  — loader/progress message
+    #   {"type": "token",   "text": "..."}  — LLM content chunk
+    #   {"type": "done",    "session_id": "...", "agent": "...", "model": "..."}
+    #   {"type": "error",   "text": "..."}
+    # ══════════════════════════════════════════════════════════════════════════
+    async def process_message_stream(
+        self,
+        user_id: str,
+        message: str,
+        session_id: str | None = None,
+    ):
+        """
+        Streaming version of process_message.
+        - GENERAL / BOND / simple routes: true token-by-token streaming via Gemini/DeepSeek.
+        - STOCK_ANALYSIS: status events during heavy data-fetch, then streams the final reply.
+        - Everything else: falls back to non-streaming with a single 'token' flush.
+        """
+        import asyncio
+        from core.streaming import status, token, done, error as _err
+        from core.services.routing_service import (
+            is_export_request, is_file_analysis, is_bond_request, is_greeting,
+            detect_arabic_ticker, detect_dfm_screen,
+        )
+
+        try:
+            if not session_id:
+                session_id = self.session_mgr.get_or_create_session(user_id)
+
+            # ── Export / file — no streaming benefit, fall through ────────────
+            if is_export_request(message) or is_file_analysis(message):
+                yield status("⏳ جارٍ المعالجة...")
+                result = await self.process_message(user_id, message, session_id)
+                reply = result.get("reply", "")
+                for i in range(0, len(reply), 24):
+                    yield token(reply[i:i+24])
+                yield done(session_id=session_id, agent=result.get("agent_name","EisaX"), model=result.get("model"))
+                return
+
+            # ── Greeting fast-path — stream Gemini directly ───────────────────
+            if is_greeting(message):
+                yield status("...")
+                from core.streaming import stream_gemini
+                from state import SYSTEM_PROMPTS
+                sys_p = SYSTEM_PROMPTS.get("assistant", "You are EisaX AI.")
+                async for evt in stream_gemini(
+                    f"{sys_p}\n\nUser: {message}\nEisaX:",
+                    model=GEMINI_MODEL_BACKUP,
+                    max_tokens=300,
+                    temperature=0.7,
+                ):
+                    if evt["type"] in ("token", "error"):
+                        yield evt
+                self.session_mgr.save_message(session_id, user_id, "user", message[:500])
+                yield done(session_id=session_id, agent="EisaX", model=GEMINI_MODEL_BACKUP)
+                return
+
+            # ── Route classification ─────────────────────────────────────────
+            yield status("🔍 فهم الطلب...")
+            _fast_ticker = detect_arabic_ticker(message)
+            if _fast_ticker:
+                route, handler, instruction = "STOCK_ANALYSIS", "STOCK_ANALYSIS", f"analyze {_fast_ticker}"
+            else:
+                route, handler, instruction, _ = self._classify_intent(message)
+
+            # ── STOCK_ANALYSIS — ToolAgent streaming ────────────────────────
+            if route == "STOCK_ANALYSIS":
+                from core.tool_agent import ToolAgent
+                _ta = ToolAgent(user_id=user_id)
+                _reply_buf = []
+                async for evt in _ta.stream(message):
+                    if evt["type"] == "status":
+                        yield status(evt["text"])
+                    elif evt["type"] == "token":
+                        _reply_buf.append(evt["text"])
+                        yield token(evt["text"])
+                        await asyncio.sleep(0)
+                    elif evt["type"] == "error":
+                        # ToolAgent failed — fall back to legacy pipeline
+                        logger.warning("[StreamOrch] ToolAgent error: %s — falling back", evt["text"])
+                        yield status("📊 تحليل متعمق...")
+                        _fa_result = await asyncio.wait_for(
+                            self._run_sync_in_executor(
+                                self.financial_agent._handle_analytics,
+                                session_id,
+                                {"user_id": user_id},
+                                message,
+                            ),
+                            timeout=150,
+                        )
+                        _fb_reply = _fa_result.get("reply", "")
+                        yield status("")
+                        for i in range(0, len(_fb_reply), 32):
+                            yield token(_fb_reply[i:i+32])
+                            await asyncio.sleep(0)
+                        _reply_buf = [_fb_reply]
+                        break
+
+                _full_reply = "".join(_reply_buf)
+                if _full_reply:
+                    self.session_mgr.save_message(session_id, user_id, "user", message)
+                    self.session_mgr.save_message(session_id, user_id, "assistant", _full_reply)
+                yield done(session_id=session_id, agent="EisaX ToolAgent", model="DeepSeek+tools")
+                return
+
+            # ── GENERAL — true streaming via Gemini ──────────────────────────
+            if route == "GENERAL":
+                from core.streaming import stream_gemini
+                from state import SYSTEM_PROMPTS
+                from core.agents.general import GeneralAgent
+                _user_ctx: dict = {}
+                try:
+                    if MEMORY_ENABLED:
+                        _user_ctx = get_rich_user_context(user_id) or {}
+                except Exception:
+                    pass
+
+                sys_p = SYSTEM_PROMPTS.get("cio", SYSTEM_PROMPTS.get("assistant", ""))
+                _ctx_block = ""
+                try:
+                    if _user_ctx:
+                        from core.memory_manager import format_ctx_for_prompt
+                        _ctx_block = format_ctx_for_prompt(_user_ctx)
+                except Exception:
+                    pass
+
+                full_prompt = f"{sys_p}\n{_ctx_block}\n\nUser: {message}\nEisaX:"
+                _reply_buf = []
+                async for evt in stream_gemini(
+                    full_prompt,
+                    model=GEMINI_MODEL_BACKUP,
+                    max_tokens=1500,
+                    temperature=0.7,
+                ):
+                    if evt["type"] == "token":
+                        _reply_buf.append(evt["text"])
+                        yield evt
+                    elif evt["type"] == "error":
+                        yield evt
+
+                _full_reply = "".join(_reply_buf)
+                self.session_mgr.save_message(session_id, user_id, "user", message[:500])
+                self.session_mgr.save_message(session_id, user_id, "assistant", _full_reply)
+                yield done(session_id=session_id, agent="EisaX", model=GEMINI_MODEL_BACKUP)
+                return
+
+            # ── All other routes — non-streaming fallback ────────────────────
+            yield status("⏳ جارٍ التحليل...")
+            result = await self.process_message(user_id, message, session_id)
+            reply = result.get("reply", "")
+            chunk_size = 32
+            for i in range(0, len(reply), chunk_size):
+                yield token(reply[i:i+chunk_size])
+                await asyncio.sleep(0)
+            yield done(
+                session_id=session_id,
+                agent=result.get("agent_name", "EisaX"),
+                model=result.get("model"),
+            )
+
+        except Exception as e:
+            logger.error("[StreamingOrchestrator] error: %s", e)
+            yield _err(str(e))
+            yield done(session_id=session_id or "error", agent="ErrorHandler", model=None)
 
     # BUG-03 FIX: Only these path prefixes may be modified via admin chat.
     _ALLOWED_WRITE_PREFIXES = (
