@@ -2589,7 +2589,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 logger.debug("[MarketCache] Lookup failed for %s: %s", target, _ce)
 
             try:
-                profile    = _f_profile.result(timeout=15)
+                profile    = _f_profile.result(timeout=25)
                 quote      = profile.get("quote", {})
                 sentiment  = profile.get("sentiment", {})
                 macro      = profile.get("macro", {})
@@ -2603,7 +2603,11 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 news_sent  = sentiment.get("sentiment", "N/A")
                 news_score = sentiment.get("score", 0)
             except Exception as e:
-                logger.error(f"[Analytics] market_data failed: {e}")
+                logger.warning(f"[Analytics] market_data failed (non-fatal): {e}")
+                profile = {}
+                quote = {}
+                sentiment = {}
+                macro = {}
 
             # ── Inject Market Cache data if yfinance returned no price ────────
             if _cache_row and not real_price:
@@ -4245,16 +4249,16 @@ CONSISTENCY RULES (MANDATORY):
      "**Verdict Type: Tactical [Underweight/Reduce]** — based on timing/momentum, NOT fundamental weakness."
      Then explain: "Fundamental case is [strong/compelling] — the underweight reflects [specific timing risk, e.g. bearish trend, geopolitical premium, pending catalyst]."
    - If verdict is BUY/Strong Buy: confirm it is both fundamentally AND technically supported.
-   - Add one explicit line: **Confidence: [0-100]%**.
    - Add one explicit line: **Primary uncertainty:** [2 concrete uncertainty drivers].
    - Add one explicit line: **No-Action Case:** when HOLD/no trade is preferable.
 
-   **c) 🚀 Advisory Execution Plan (if investor chooses to act)** — Staged entry for institutional investors (3 tranches):
-   - Tranche 1 (X% of target position): When and at what level/condition to start
-   - Tranche 2 (Y%): Confirmation signal needed (e.g. RSI bottoms, price closes above SMA50, volume spike)
-   - Tranche 3 (Z%): Breakout/conviction signal (e.g. price reclaims SMA200, earnings beat)
+   **c) 📋 Entry Considerations (if investor chooses to act)**
+   - Stage 1: Describe the preferred market condition or price zone for initial exposure (use "consider" / "may be appropriate")
+   - Stage 2: Describe what confirmation signal would support adding further exposure
+   - Stage 3: Describe what thesis-validation event would support full allocation
    - Full position sizing: refer to EisaX Score → Core Allocation range from the Scorecard
-   - Use advisory language: "consider", "prefer", "may". Avoid command language like "must buy now" or "exit 100%".
+   ⛔ TONE RULES: Use ONLY advisory language: "consider", "may be appropriate", "preferred zone", "if confirmed".
+   ⛔ FORBIDDEN phrases: "Do not chase", "Initiate", "Execute", "Must", "Immediately reduce".
    ⛔ DO NOT repeat Entry/Stop/Target price levels (those are in the auto-generated Positioning Guide below)
 
    **d) ⚠️ Risk Action Plan** — What to DO if risks materialize (3 specific actions):
@@ -4270,6 +4274,7 @@ CONSISTENCY RULES (MANDATORY):
    Emoji rule: 🚀📈💡 for BULLISH rows · 📉🏦🤖⚠️ for BEARISH rows. NEVER use 📉 on a positive-impact row.
    ⛔ The SCENARIO ANALYSIS data already has exactly 4 columns: Scenario | Impact | Implied Price | Suggested Hedge. Copy this table EXACTLY — do NOT add a Market Move column or split any cell. Use "Expected Price" as the header for the price column.
    ADD a 5th column: **Trigger** — one specific, measurable event that would activate this scenario (e.g. "Brent breaks $80", "Price closes below SMA200", "Fed hikes +50bps"). This must be a concrete observable condition, NOT a vague description.
+   ⛔ PRECISION RULE: Expected Price values MUST be rounded ranges, NOT exact decimals. Write "~24.5–25.5 SAR" not "24.96 SAR". Exact decimal prices create false precision and mislead investors. Round to nearest 0.5 or whole number and use a ±5% range format.
    | Scenario | Impact | Expected Price | Trigger | Suggested Hedge |
    |----------|--------|----------------|---------|-----------------|
 
@@ -4295,6 +4300,7 @@ IMPORTANT RULES:
 - ⛔ CONSISTENCY RULE: Section 8 (Why Now) must be CONSISTENT with the Scorecard verdict. If the verdict is REDUCE or SELL, do NOT frame the analysis as a "contrarian opportunity" or suggest it is a good entry point. Instead, explain what would need to change for the thesis to improve. If the verdict is HOLD/BUY, you may describe constructive entry timing.
 - ⛔ UPSIDE LANGUAGE RULE: Only use "strong upside" when upside potential is genuinely >20%. For <10% upside use "modest upside" or "limited upside". For 10-20% upside use "moderate upside". Never call +3% to +5% returns "strong upside" — that misleads investors.
 - ⛔ ADVISORY LANGUAGE RULE: Avoid hard-command phrasing ("buy now", "exit 100%", "must do"). Use probability-aware language ("consider", "prefer", "if/then risk case").
+- ⛔ CORRELATION RULE: Never state a specific correlation coefficient (e.g. ">0.8", "0.85 correlation") unless it is explicitly provided in the data. Use qualitative language instead: "High positive correlation (historically strong relationship)", "Moderate positive correlation", "Low correlation". Stating unverified correlation numbers damages credibility.
 - ⛔ STRICT DATA INTEGRITY RULE: Never fabricate numeric values. If a metric is missing after using provided data, output 'N/A' and mention the data gap briefly.
 Do NOT include a standalone Positioning section.{_brain_ctx}
 {_macro_prompt_block}

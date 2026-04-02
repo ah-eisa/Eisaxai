@@ -10,6 +10,7 @@
 investwise.db*
 core/investwise.db*
 analysis_cache.db
+news_filter_cache.db
 
 # ── Logs & Backups ───────────────────────
 *.log
