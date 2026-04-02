@@ -9,6 +9,7 @@
 *.db-wal
 investwise.db*
 core/investwise.db*
+analysis_cache.db
 
 # ── Logs & Backups ───────────────────────
 *.log

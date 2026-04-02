@@ -43,6 +43,43 @@ async def handle_stock_analysis(
     Run the full EisaX stock-analysis pipeline (FinancialAgent → Gemini fallback).
     """
     import asyncio
+    _resolved_ticker = None
+
+    # ── Analysis Cache check ─────────────────────────────────────────────────
+    try:
+        try:
+            from core.ticker_resolver import resolve_ticker as _resolve
+        except Exception:
+            from core.tools.ticker_resolver import resolve_ticker as _resolve
+        from core.analysis_cache import get as _ac_get
+
+        _resolved_ticker = _resolve(message) or _resolve(instruction or "")
+        if not _resolved_ticker:
+            _combined = f"{message} {instruction or ''}".upper()
+            _candidates = _re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", _combined)
+            _skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
+            for _tk in _candidates:
+                if _tk not in _skip:
+                    _resolved_ticker = _tk
+                    break
+        if _resolved_ticker:
+            _cached = _ac_get(_resolved_ticker)
+            if _cached:
+                age_min = _cached["cache_age"] // 60
+                reply = _cached["reply"]
+                # Add subtle cache indicator
+                reply += f"\n\n*ℹ️ تحليل محدّث (منذ {age_min} دقيقة)*"
+                orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
+                orchestrator.session_mgr.save_message(session_id, user_id, "assistant", reply)
+                return {
+                    "reply": reply,
+                    "session_id": session_id,
+                    "agent_name": "EisaX Cache",
+                    "model": _cached["model"],
+                }
+    except Exception as _ce:
+        logger.debug(f"[AnalysisCache] cache check skipped: {_ce}")
+        _resolved_ticker = None
 
     try:
         # ── DFM screening inside STOCK_ANALYSIS ───────────────────────────────
@@ -144,6 +181,13 @@ async def handle_stock_analysis(
                 orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
                 orchestrator.session_mgr.save_message(session_id, user_id, "assistant", reply_text)
                 _track_memory(orchestrator, user_id, message, instruction, reply_text)
+                # ── Save to analysis cache ───────────────────────────────────
+                try:
+                    if _resolved_ticker:
+                        from core.analysis_cache import set as _ac_set
+                        _ac_set(_resolved_ticker, reply_text, result.get("model", "deepseek"))
+                except Exception as _ce:
+                    logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
                 return {
                     "reply":      reply_text,
                     "session_id": session_id,
@@ -157,7 +201,15 @@ async def handle_stock_analysis(
         logger.warning("FinancialAgent failed: %s — falling back to Gemini with live price", exc)
 
     # ── Gemini fallback with live price injection ─────────────────────────────
-    return await _stock_gemini_fallback(orchestrator, session_id, user_id, message, instruction)
+    result = await _stock_gemini_fallback(orchestrator, session_id, user_id, message, instruction)
+    # ── Save to analysis cache ───────────────────────────────────────────────
+    try:
+        if _resolved_ticker and isinstance(result, dict) and result.get("reply"):
+            from core.analysis_cache import set as _ac_set
+            _ac_set(_resolved_ticker, result["reply"], result.get("model", "deepseek"))
+    except Exception as _ce:
+        logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
+    return result
 
 
 async def _stock_gemini_fallback(
