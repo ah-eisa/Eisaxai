@@ -45,6 +45,16 @@ async def handle_stock_analysis(
     import asyncio
     _resolved_ticker = None
 
+    # ── Detect analysis mode ─────────────────────────────────────────────────
+    _msg_lower = (message or "").lower()
+    _analysis_mode = "full"  # default
+    _quick_kws = ["بسرعة", "سريع", "ملخص", "مختصر", "quick", "brief", "summary", "short"]
+    _cio_kws = ["cio memo", "memo", "مذكرة", "institutional", "مؤسسي"]
+    if any(k in _msg_lower for k in _quick_kws):
+        _analysis_mode = "quick"
+    elif any(k in _msg_lower for k in _cio_kws):
+        _analysis_mode = "cio"
+
     # ── Analysis Cache check ─────────────────────────────────────────────────
     try:
         try:
@@ -63,7 +73,7 @@ async def handle_stock_analysis(
                     _resolved_ticker = _tk
                     break
         if _resolved_ticker:
-            _cached = _ac_get(_resolved_ticker)
+            _cached = _ac_get(_resolved_ticker, mode=_analysis_mode)
             if _cached:
                 age_min = _cached["cache_age"] // 60
                 reply = _cached["reply"]
@@ -153,6 +163,13 @@ async def handle_stock_analysis(
             logger.warning("[EGX] Fast-path failed: %s", egx_err)
 
         # ── FinancialAgent (primary path) ─────────────────────────────────────
+        # Strip mode adjectives from instruction so they don't get treated as tickers
+        _mode_strip = ["quick analysis of", "quick ", "brief ", "summary of", "short analysis of",
+                       "detailed analysis of", "full analysis of", "deep analysis of"]
+        _clean_instruction = instruction
+        for _ms in _mode_strip:
+            _clean_instruction = _re.sub(rf"(?i)\b{_re.escape(_ms.strip())}\b\s*", "", _clean_instruction).strip()
+
         agent = orchestrator.financial_agent
         if agent:
             loop = asyncio.get_event_loop()
@@ -163,7 +180,8 @@ async def handle_stock_analysis(
                         lambda: agent._handle_analytics(
                             session_id,
                             {"user_ctx": user_ctx, "user_id": user_id},
-                            instruction,
+                            _clean_instruction,
+                            mode=_analysis_mode,
                         ),
                     ),
                     timeout=240,
@@ -185,7 +203,12 @@ async def handle_stock_analysis(
                 try:
                     if _resolved_ticker:
                         from core.analysis_cache import set as _ac_set
-                        _ac_set(_resolved_ticker, reply_text, result.get("model", "deepseek"))
+                        _ac_set(
+                            _resolved_ticker,
+                            reply_text,
+                            result.get("model", "deepseek"),
+                            mode=_analysis_mode,
+                        )
                 except Exception as _ce:
                     logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
                 return {
@@ -206,7 +229,12 @@ async def handle_stock_analysis(
     try:
         if _resolved_ticker and isinstance(result, dict) and result.get("reply"):
             from core.analysis_cache import set as _ac_set
-            _ac_set(_resolved_ticker, result["reply"], result.get("model", "deepseek"))
+            _ac_set(
+                _resolved_ticker,
+                result["reply"],
+                result.get("model", "deepseek"),
+                mode=_analysis_mode,
+            )
     except Exception as _ce:
         logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
     return result

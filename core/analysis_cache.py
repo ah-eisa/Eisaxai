@@ -44,13 +44,13 @@ def _ttl(ticker: str) -> int:
     return TTL_CRYPTO if _is_crypto(ticker) else TTL_STOCK
 
 
-def make_key(ticker: str) -> str:
-    return hashlib.md5(ticker.upper().encode()).hexdigest()
+def make_key(ticker: str, mode: str = "full") -> str:
+    return hashlib.md5(f"{ticker.upper()}:{mode}".encode()).hexdigest()
 
 
-def get(ticker: str) -> dict | None:
+def get(ticker: str, mode: str = "full") -> dict | None:
     try:
-        key = make_key(ticker)
+        key = make_key(ticker, mode)
         ttl = _ttl(ticker)
         with sqlite3.connect(DB) as c:
             row = c.execute(
@@ -66,9 +66,9 @@ def get(ticker: str) -> dict | None:
     return None
 
 
-def set(ticker: str, reply: str, model: str = "deepseek"):
+def set(ticker: str, reply: str, model: str = "deepseek", mode: str = "full"):
     try:
-        key = make_key(ticker)
+        key = make_key(ticker, mode)
         with sqlite3.connect(DB) as c:
             c.execute(
                 """
@@ -82,12 +82,12 @@ def set(ticker: str, reply: str, model: str = "deepseek"):
         logger.warning(f"[AnalysisCache] set failed: {e}")
 
 
-def invalidate(ticker: str):
+def invalidate(ticker: str, mode: str = "full"):
     try:
-        key = make_key(ticker)
+        key = make_key(ticker, mode)
         with sqlite3.connect(DB) as c:
             c.execute("DELETE FROM analyses WHERE cache_key=?", (key,))
-        logger.info(f"[AnalysisCache] INVALIDATED {ticker}")
+        logger.info(f"[AnalysisCache] INVALIDATED {ticker} ({mode})")
     except Exception as e:
         logger.warning(f"[AnalysisCache] invalidate failed: {e}")
 

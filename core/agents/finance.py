@@ -1713,6 +1713,64 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
         return softened
 
     @staticmethod
+    def _round_scenario_prices(text: str, currency_sym: str = "$") -> str:
+        """
+        Round exact decimal prices in scenario/valuation TABLE CELLS ONLY to ranges.
+        Targets only markdown table rows — never touches live price, SMA, RSI, etc.
+        Example: ﷼24.96 → ~24.5–25.5 ﷼
+        """
+        import re as _re
+        if not text:
+            return text
+
+        def _to_range(m):
+            raw = m.group(0)
+            num_str = _re.search(r'[\d,]+\.?\d*', raw.replace(',', ''))
+            if not num_str:
+                return raw
+            try:
+                val = float(num_str.group().replace(',', ''))
+            except ValueError:
+                return raw
+
+            # Skip very small values (ratios/percentages) and very large values.
+            if val < 1 or val > 100_000:
+                return raw
+
+            # Round to nearest 0.5 and produce a small range.
+            step = max(0.5, round(val * 0.025 * 2) / 2)
+            lo = round((val - step) / step) * step
+            hi = round((val + step) / step) * step
+
+            if val >= 1000:
+                return f"~{lo:,.0f}–{hi:,.0f} {currency_sym}".strip()
+            if val >= 10:
+                return f"~{lo:.1f}–{hi:.1f} {currency_sym}".strip()
+            return f"~{lo:.2f}–{hi:.2f} {currency_sym}".strip()
+
+        lines = text.split('\n')
+        result = []
+        in_scenario_section = False
+
+        for line in lines:
+            if any(kw in line for kw in ['Scenario', 'Bear', 'Bull', 'Base', 'Impact', 'Expected Price', 'Implied Price']):
+                in_scenario_section = True
+
+            if in_scenario_section and line.startswith('|'):
+                # Prices like: $123.45, ﷼24.96, €12.20, £9.15, SAR 24.96
+                line = _re.sub(
+                    r'(?<!~)(?:[\$﷼€£]\s?\d{1,6}(?:,\d{3})*\.\d{2}|SAR\s?\d{1,6}(?:,\d{3})*\.\d{2})(?!\d)',
+                    _to_range,
+                    line,
+                )
+            elif in_scenario_section and not line.startswith('|') and line.strip() and not line.startswith('>'):
+                in_scenario_section = False
+
+            result.append(line)
+
+        return '\n'.join(result)
+
+    @staticmethod
     def _fetch_onchain(ticker: str) -> dict:
         """Fetch on-chain metrics for crypto assets. Free APIs only."""
         import requests as _rq
@@ -2323,7 +2381,14 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
     # Main analytics handler (refactored)
     # ══════════════════════════════════════════════════════════════════════
 
-    def _handle_analytics(self, sid: str, mem: dict, msg: str, _no_multi: bool = False) -> dict:
+    def _handle_analytics(
+        self,
+        sid: str,
+        mem: dict,
+        msg: str,
+        _no_multi: bool = False,
+        mode: str = "full",
+    ) -> dict:
         import core.analytics as ca
         from core.data import get_prices
         import os, requests
@@ -2332,6 +2397,9 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
         # === DETECT LANGUAGE (for full Arabic report) ===
         _arabic_chars = sum(1 for c in msg if '\u0600' <= c <= '\u06FF')
         _is_arabic_request = _arabic_chars >= 2  # 2+ Arabic characters = Arabic request
+        _analysis_mode = (mode or "full").strip().lower()
+        if _analysis_mode not in {"quick", "full", "cio"}:
+            _analysis_mode = "full"
 
         # === EXTRACT TICKERS FIRST ===
         tickers = IntentClassifier.extract_tickers(msg)
@@ -2433,7 +2501,13 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 if _t in {"VS", "AND", "OR", "THE", "FOR"}:
                     continue
                 try:
-                    _r = self._handle_analytics("default", mem, f"analyze {_t}", _no_multi=True)
+                    _r = self._handle_analytics(
+                        "default",
+                        mem,
+                        f"analyze {_t}",
+                        _no_multi=True,
+                        mode=_analysis_mode,
+                    )
                     if _r.get("reply"):
                         reports.append(_r["reply"])
                 except Exception as _e:
@@ -4317,13 +4391,40 @@ Do NOT include a standalone Positioning section.{_brain_ctx}
                 # Add Local Market Data
                 prompt += _local_data_injection
 
+                # ── Mode-based prompt adjustment ──────────────────────────────
+                if _analysis_mode == "quick":
+                    _max_tokens = 1500
+                    _mode_instruction = """
+🎯 QUICK MODE: Write a condensed analysis with ONLY these 3 sections:
+1. Executive Summary (4 sentences max)
+2. Key Verdict + Scorecard (2 sentences: what the score means + why)
+3. Entry/Risk levels (bullet points only: Entry zone, Stop, Target, 1 key risk)
+
+Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionable.
+"""
+                elif _analysis_mode == "cio":
+                    _max_tokens = 3000
+                    _mode_instruction = """
+🎯 CIO MEMO MODE: Write a formal institutional investment memorandum.
+- Formal prose only — NO markdown tables, NO bullet lists, NO emojis
+- Sections: Executive Summary → Thesis → Risk Assessment → Recommendation
+- Tone: Board-room level, measured, cite specific data points
+- Length: 600-800 words maximum
+"""
+                else:
+                    _max_tokens = 4500
+                    _mode_instruction = ""
+
+                if _mode_instruction:
+                    prompt = _mode_instruction + "\n\n" + prompt
+
                 r = requests.post(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}",
                              "Content-Type": "application/json"},
                     json={"model": "deepseek-chat",
                           "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": 4500,
+                          "max_tokens": _max_tokens,
                           "temperature": 0},
                     timeout=150
                 )
@@ -4930,6 +5031,26 @@ Do NOT include a standalone Positioning section.{_brain_ctx}
                     deepseek_reply
                 )
             deepseek_reply = self._soften_execution_language(deepseek_reply)
+            deepseek_reply = self._round_scenario_prices(deepseek_reply, _currency_sym)
+            # ── Quick-mode reply trimmer: strip CIO boilerplate + cap at 3 sections ──
+            if _analysis_mode == "quick":
+                import re as _re2
+                # Strip CIO memo header (MEMORANDUM / To: / From: / Date: / Re:)
+                deepseek_reply = _re2.sub(
+                    r'\*\*MEMORANDUM\*\*.*?^---\n?',
+                    '', deepseek_reply, flags=_re2.DOTALL | _re2.MULTILINE
+                ).strip()
+                # Cap to first 3 markdown sections (###) — skip the intro if any
+                _sections = _re2.split(r'(?=^#{1,3} )', deepseek_reply, flags=_re2.MULTILINE)
+                _kept = [_sections[0]] if _sections[0].strip() else []
+                _sec_count = 0
+                for _sec in _sections[1:]:
+                    if _sec_count < 3:
+                        _kept.append(_sec)
+                        _sec_count += 1
+                    else:
+                        break
+                deepseek_reply = "".join(_kept).strip()
         # ── 7. Build Final Reply ───────────────────────────────────────────────
         if deepseek_reply:
             try:
@@ -4938,7 +5059,22 @@ Do NOT include a standalone Positioning section.{_brain_ctx}
                     next_earnings=next_earnings, fg_data=fg_data,
                     ticker=target, effective_beta=_effective_beta
                 )
-                reply = header + deepseek_reply + _decision_framework_block + factcheck_block + news_block + positioning_block + _pre_scorecard_md + chart_block + _analysis_disclaimer
+                if _analysis_mode == "quick":
+                    reply = header + deepseek_reply + _decision_framework_block + _analysis_disclaimer
+                elif _analysis_mode == "cio":
+                    reply = header + deepseek_reply + _decision_framework_block + _analysis_disclaimer
+                else:
+                    reply = (
+                        header
+                        + deepseek_reply
+                        + _decision_framework_block
+                        + factcheck_block
+                        + news_block
+                        + positioning_block
+                        + _pre_scorecard_md
+                        + chart_block
+                        + _analysis_disclaimer
+                    )
 
                 # ── EisaX Cache Enhancement ────────────────────────────────
                 try:
