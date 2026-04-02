@@ -65,7 +65,7 @@ GEMINI_API_KEY_BACKUP = os.getenv("GEMINI_API_KEY_BACKUP", "")
 
 # Primary model: Ultra-fast, economical, for routing and general queries
 # Avg latency: ~200ms | Cost: Low | Use: Intent classification, general chat
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # Backup model: More capable, for complex reasoning when primary fails
 # Avg latency: ~800ms | Cost: Standard | Use: Fallback analysis, complex prompts
@@ -303,7 +303,7 @@ class MultiAgentOrchestrator:
         raise RuntimeError(f"No Gemini backup available for [{label}]")
 
     def _maestro_route_generate(self, prompt: str) -> str:
-        """Primary router: Kimi maestro, then Gemini, then DeepSeek fallback."""
+        """Primary router: Kimi maestro, then DeepSeek, then Gemini fallback."""
         # Primary: Kimi K2.5
         if self.kimi_client:
             try:
@@ -326,44 +326,47 @@ class MultiAgentOrchestrator:
                 if content:
                     return content
             except Exception as e:
-                logger.warning("[Router] Kimi failed: %s ? falling back to Gemini", e)
+                logger.warning("[Router] Kimi failed: %s ? falling back to DeepSeek", e)
 
-        # Fallback 1: Gemini
-        try:
-            raw = self._gemini_generate(prompt, label="router-gemini-fallback")
-            if raw:
-                return raw
-        except Exception as e:
-            logger.warning("[Router] Gemini fallback failed: %s ? falling back to DeepSeek", e)
-
-        # Fallback 2: DeepSeek
+        # Fallback 1: DeepSeek (sync httpx; this function is sync by design)
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
-                import requests
-                r = requests.post(
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": [
-                            {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": 800,
-                        "temperature": 0.1,
-                    },
-                    timeout=30,
-                )
+                with httpx.Client(timeout=30.0) as client:
+                    r = client.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": "deepseek-chat",
+                            "messages": [
+                                {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "max_tokens": 800,
+                            "temperature": 0.1,
+                        },
+                    )
+                r.raise_for_status()
                 resp = r.json()
                 if "choices" in resp:
                     content = (resp["choices"][0]["message"]["content"] or "").strip()
                     if content:
                         return content
             except Exception as e:
-                logger.error("[Router] DeepSeek fallback failed: %s", e)
+                logger.warning("[Router] DeepSeek fallback failed: %s ? falling back to Gemini", e)
 
-        raise RuntimeError("All router models failed (Kimi/Gemini/DeepSeek)")
+        # Fallback 2: Gemini
+        try:
+            raw = self._gemini_generate(prompt, label="router-gemini-fallback")
+            if raw:
+                return raw
+        except Exception as e:
+            logger.error("[Router] Gemini fallback failed: %s", e)
+
+        # All 3 LLMs failed — return safe fallback JSON instead of crashing
+        logger.error("[Router] All models failed (Kimi/DeepSeek/Gemini) — using GENERAL fallback")
+        return '{"route":"GENERAL","handler":"GENERAL","instruction":"' + \
+               prompt[:100].replace('"', '') + '","clarification_question":""}'
 
     async def _run_sync_in_executor(self, fn, *args, **kwargs):
         """Temporary bridge for sync I/O until full migration to httpx.AsyncClient."""
@@ -538,7 +541,7 @@ Ticker:"""
             logger.warning("Ticker extraction failed: %s", e)
             return "UNKNOWN"
 
-    def _classify_intent(self, message: str) -> tuple:
+    def _classify_intent(self, message: str, chat_history: list = None) -> tuple:
         """
         Classify user intent and route to appropriate handler.
         
@@ -561,7 +564,19 @@ Ticker:"""
         """
         import json, re
         try:
-            prompt = ROUTER_PROMPT.format(message=message)
+            # Build conversation context block for smarter routing
+            _ctx_block = ""
+            if chat_history:
+                _recent = chat_history[-6:]
+                _ctx_lines = []
+                for m in _recent:
+                    _r = "User" if m.get("role") == "user" else "AI"
+                    _c = (m.get("content") or "")[:150]
+                    _ctx_lines.append(f"{_r}: {_c}")
+                if _ctx_lines:
+                    _ctx_block = "\nRecent conversation:\n" + "\n".join(_ctx_lines) + "\n"
+
+            prompt = ROUTER_PROMPT.format(message=(_ctx_block + "Current message: " + message))
             raw = self._maestro_route_generate(prompt)
             if not raw:
                 return "GENERAL", "GENERAL", message, ""
@@ -962,6 +977,13 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     "agent_name": "EisaX Fixed Income Analyst",
                 }
 
+            # ── Load recent conversation history for context ───────────────────
+            _recent_history: list = []
+            try:
+                _recent_history = self.session_mgr.get_chat_history(session_id)[-10:] or []
+            except Exception:
+                pass
+
             # ── 6 & 7. Greeting / Arabic-ticker fast-paths + Gemini router ────
             _user_ctx: dict = {}
             if is_greeting(message):
@@ -982,7 +1004,7 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     clarification = ""
                     logger.info("[Router] Arabic stock fast-path: '%s' → %s", message.strip(), _fast_ticker)
                 else:
-                    route, handler, instruction, clarification = self._classify_intent(message)
+                    route, handler, instruction, clarification = self._classify_intent(message, chat_history=_recent_history)
                     logger.info("[Router] route=%s | handler=%s | %s", route, handler, instruction[:60])
 
             # CLARIFY override when ticker is detectable
@@ -1052,7 +1074,8 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
 
             elif route == "FINANCIAL":
                 _fin_resp = await _handle_financial(
-                    self, session_id, user_id, message, instruction, handler, _user_ctx
+                    self, session_id, user_id, message, instruction, handler, _user_ctx,
+                    chat_history=_recent_history,
                 )
                 if _fin_resp is not None:
                     return _fin_resp
@@ -1099,12 +1122,13 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                 except Exception as _ale:
                     logger.warning("[AgentLoop] Failed: %s — falling back to Gemini", _ale)
 
-            return await _handle_general(self, session_id, user_id, message, instruction, _user_ctx)
+            return await _handle_general(self, session_id, user_id, message, instruction, _user_ctx,
+                                         chat_history=_recent_history)
 
         except Exception as e:
             logger.error("process_message error: %s", e)
             return {
-                "reply":      f"خطأ: {str(e)}",
+                "reply":      "عذراً، حدث خطأ غير متوقع. فريق EisaX يتابع.",
                 "session_id": session_id or "error",
                 "agent_name": "ErrorHandler",
                 "model":      "error",

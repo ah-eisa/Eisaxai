@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EisaX System Logs</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f172a;
+      --surface:   #1e293b;
+      --border:    #334155;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --accent:    #38bdf8;
+
+      --c-error:   #ef4444;
+      --c-warn:    #f59e0b;
+      --c-info:    #94a3b8;
+      --c-debug:   #475569;
+      --c-default: #cbd5e1;
+
+      --bg-error:  rgba(239, 68, 68,  0.10);
+      --bg-warn:   rgba(245, 158, 11, 0.08);
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* ── Layout ── */
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 12px;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 4px 10px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+      text-transform: uppercase;
+    }
+
+    #live-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #22c55e;
+      box-shadow: 0 0 6px #22c55e;
+      flex-shrink: 0;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+
+    #live-dot.paused  { background: var(--c-warn); box-shadow: 0 0 6px var(--c-warn); }
+    #live-dot.error   { background: var(--c-error); box-shadow: 0 0 6px var(--c-error); animation: blink 1s step-start infinite; }
+    #live-dot.offline { background: var(--muted);   box-shadow: none; animation: blink 1.4s step-start infinite; }
+
+    @keyframes blink { 50% { opacity: 0.15; } }
+
+    #status-text {
+      font-size: 11px;
+      color: var(--muted);
+      margin-left: 2px;
+    }
+
+    /* spacer */
+    header .spacer { flex: 1; }
+
+    /* ── Controls bar ── */
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 4px;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    .filter-group {
+      display: flex;
+      gap: 4px;
+    }
+
+    button {
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 4px 10px;
+      background: transparent;
+      color: var(--muted);
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+
+    button:hover { background: var(--surface); color: var(--text); border-color: #4b6280; }
+
+    /* Filter active states */
+    button[data-level="ALL"].active    { background: var(--surface); color: var(--accent); border-color: var(--accent); }
+    button[data-level="ERROR"].active  { background: var(--bg-error); color: var(--c-error); border-color: var(--c-error); }
+    button[data-level="WARNING"].active{ background: var(--bg-warn);  color: var(--c-warn);  border-color: var(--c-warn); }
+    button[data-level="INFO"].active   { color: var(--c-info); border-color: var(--c-info); }
+    button[data-level="DEBUG"].active  { color: var(--c-debug); border-color: var(--c-debug); }
+
+    /* Action buttons */
+    #btn-clear  { color: var(--muted); }
+    #btn-clear:hover  { color: #f87171; border-color: #f87171; }
+
+    #btn-pause { min-width: 84px; }
+    #btn-pause.paused { color: #4ade80; border-color: #4ade80; }
+
+    /* Entry count badge */
+    #count-badge {
+      margin-left: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 2px 10px;
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    /* ── Log area ── */
+    #log-wrap {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px 4px 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    #log-wrap::-webkit-scrollbar { width: 6px; }
+    #log-wrap::-webkit-scrollbar-track { background: transparent; }
+    #log-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    #log-list {
+      list-style: none;
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 0;
+      padding: 1px 6px;
+      border-radius: 3px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.55;
+      transition: background 0.1s;
+    }
+
+    .log-entry:hover { background: rgba(255,255,255,0.04) !important; }
+
+    .log-entry.level-error   { background: var(--bg-error); color: var(--c-error); font-weight: 700; }
+    .log-entry.level-warning { color: var(--c-warn); }
+    .log-entry.level-info    { color: var(--c-info); }
+    .log-entry.level-debug   { color: var(--c-debug); }
+    .log-entry.level-default { color: var(--c-default); }
+
+    /* hidden by filter */
+    .log-entry.hidden { display: none; }
+
+    /* ── Reconnect notice ── */
+    #reconnect-notice {
+      display: none;
+      padding: 6px 4px;
+      font-size: 12px;
+      color: var(--c-warn);
+      flex-shrink: 0;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── Responsive ── */
+    @media (max-width: 600px) {
+      header h1 { font-size: 13px; }
+      #controls  { gap: 6px; }
+      button     { padding: 4px 7px; font-size: 10px; }
+    }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <header>
+    <div id="live-dot"></div>
+    <h1>EisaX System Logs</h1>
+    <span id="status-text">connecting…</span>
+    <span class="spacer"></span>
+  </header>
+
+  <div id="controls">
+    <div class="filter-group">
+      <button data-level="ALL"     class="active" onclick="setFilter('ALL')">ALL</button>
+      <button data-level="ERROR"   onclick="setFilter('ERROR')">ERROR</button>
+      <button data-level="WARNING" onclick="setFilter('WARNING')">WARNING</button>
+      <button data-level="INFO"    onclick="setFilter('INFO')">INFO</button>
+    </div>
+    <button id="btn-clear"  onclick="clearLogs()">Clear</button>
+    <button id="btn-pause"  onclick="togglePause()">Pause</button>
+    <span   id="count-badge">0 entries</span>
+  </div>
+
+  <ul id="log-list"></ul>
+  <div id="log-wrap" style="display:none"></div><!-- scroll anchor helper -->
+
+  <div id="reconnect-notice">&#9888; Connection lost — reconnecting…</div>
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ── Constants ── */
+  const MAX_ENTRIES    = 500;
+  const RETRY_DELAY_MS = 3000;
+  const TOKEN          = (typeof window.__AT !== 'undefined' && window.__AT) ? window.__AT : '';
+
+  /* ── State ── */
+  let activeFilter  = 'ALL';
+  let paused        = false;
+  let autoScroll    = true;
+  let totalCount    = 0;    // entries currently in DOM
+  let es            = null;
+  let retryTimer    = null;
+
+  /* ── DOM refs ── */
+  const logList     = document.getElementById('log-list');
+  const logWrap     = document.getElementById('log-list').parentElement; // #app child — use window scroll
+  const countBadge  = document.getElementById('count-badge');
+  const liveDot     = document.getElementById('live-dot');
+  const statusText  = document.getElementById('status-text');
+  const btnPause    = document.getElementById('btn-pause');
+  const reconnNotice= document.getElementById('reconnect-notice');
+
+  /* We'll scroll the window since #log-list is a direct child of #app (flex column).
+     Actually wrap it: give log-list a scrollable parent. */
+  // The log-list IS already inside #app which is height:100vh flex.
+  // Let's grab the real scrollable container. */
+  const scrollContainer = document.getElementById('app');
+
+  /* ── Level helpers ── */
+  function detectLevel(line) {
+    const u = line.toUpperCase();
+    if (u.includes('[ERROR]')   || u.includes(' ERROR ')   || u.includes(':ERROR:'))   return 'error';
+    if (u.includes('[WARNING]') || u.includes(' WARNING ')  || u.includes(':WARNING:') ||
+        u.includes('[WARN]')    || u.includes(' WARN '))    return 'warning';
+    if (u.includes('[INFO]')    || u.includes(' INFO ')     || u.includes(':INFO:'))    return 'info';
+    if (u.includes('[DEBUG]')   || u.includes(' DEBUG ')    || u.includes(':DEBUG:'))   return 'debug';
+    return 'default';
+  }
+
+  function levelMatchesFilter(level) {
+    if (activeFilter === 'ALL') return true;
+    return level.toUpperCase() === activeFilter;
+  }
+
+  /* ── Render a log entry ── */
+  function appendEntry(line) {
+    const level  = detectLevel(line);
+    const li     = document.createElement('li');
+    li.className = 'log-entry level-' + level;
+    li.textContent = line;
+
+    if (!levelMatchesFilter(level)) {
+      li.classList.add('hidden');
+    }
+
+    logList.appendChild(li);
+    totalCount++;
+
+    /* Enforce MAX_ENTRIES — remove oldest */
+    while (logList.children.length > MAX_ENTRIES) {
+      logList.removeChild(logList.firstChild);
+      totalCount = Math.max(0, totalCount - 1);
+    }
+
+    updateCount();
+
+    /* Auto-scroll */
+    if (autoScroll && !paused) {
+      requestAnimationFrame(() => {
+        logList.lastElementChild && logList.lastElementChild.scrollIntoView({ block: 'end' });
+      });
+    }
+  }
+
+  /* ── Filter ── */
+  window.setFilter = function (level) {
+    activeFilter = level;
+
+    /* Update button active states */
+    document.querySelectorAll('[data-level]').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.level === level);
+    });
+
+    /* Show/hide existing entries */
+    logList.querySelectorAll('.log-entry').forEach(li => {
+      const entryLevel = [...li.classList]
+        .find(c => c.startsWith('level-'))
+        ?.replace('level-', '') || 'default';
+      li.classList.toggle('hidden', !levelMatchesFilter(entryLevel));
+    });
+  };
+
+  /* ── Clear ── */
+  window.clearLogs = function () {
+    logList.innerHTML = '';
+    totalCount = 0;
+    updateCount();
+  };
+
+  /* ── Pause / Resume ── */
+  window.togglePause = function () {
+    paused = !paused;
+    btnPause.textContent = paused ? 'Resume' : 'Pause';
+    btnPause.classList.toggle('paused', paused);
+    liveDot.classList.toggle('paused', paused);
+    if (!paused && es) {
+      statusText.textContent = 'live';
+    }
+  };
+
+  /* ── Count badge ── */
+  function updateCount() {
+    countBadge.textContent = totalCount + (totalCount === 1 ? ' entry' : ' entries');
+  }
+
+  /* ── Status helpers ── */
+  function setStatus(state, msg) {
+    liveDot.className = '';
+    if (state !== 'live') liveDot.classList.add(state);
+    statusText.textContent = msg;
+    reconnNotice.style.display = (state === 'offline') ? 'block' : 'none';
+  }
+
+  /* ── SSE connection ── */
+  function connect() {
+    if (es) { try { es.close(); } catch(e) {} es = null; }
+
+    const url = '/admin/logs/stream' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+    setStatus('', 'connecting…');
+
+    try {
+      es = new EventSource(url);
+    } catch (e) {
+      scheduleRetry();
+      return;
+    }
+
+    es.onopen = function () {
+      setStatus('live', 'live');
+      reconnNotice.style.display = 'none';
+    };
+
+    es.onmessage = function (evt) {
+      if (paused) return;
+      try {
+        const obj  = JSON.parse(evt.data);
+        const line = obj.line || evt.data;
+        if (line) appendEntry(line);
+      } catch (e) {
+        if (evt.data) appendEntry(evt.data);
+      }
+    };
+
+    es.onerror = function () {
+      es.close();
+      es = null;
+      setStatus('offline', 'disconnected');
+      scheduleRetry();
+    };
+  }
+
+  function scheduleRetry() {
+    if (retryTimer) return;
+    setStatus('offline', 'reconnecting in 3s…');
+    retryTimer = setTimeout(function () {
+      retryTimer = null;
+      connect();
+    }, RETRY_DELAY_MS);
+  }
+
+  /* ── Auto-scroll detection: pause auto-scroll if user scrolled up ── */
+  window.addEventListener('scroll', function () {
+    const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 60);
+    autoScroll = nearBottom;
+  }, { passive: true });
+
+  /* ── Kick off ── */
+  updateCount();
+  connect();
+})();
+</script>
+</body>
+</html>

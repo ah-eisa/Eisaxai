@@ -1,0 +1,60 @@
+# ── Secrets ──────────────────────────────
+.env
+*.key
+*.pem
+
+# ── Database ─────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+investwise.db*
+core/investwise.db*
+
+# ── Logs & Backups ───────────────────────
+*.log
+*.log.*
+*.bak
+*.bak.*
+*.backup*
+nohup.out
+backend.log*
+
+# ── Cache & Runtime Data ─────────────────
+file_cache/
+market_cache/
+data/
+backups/
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Python Environment ───────────────────
+venv/
+.venv/
+*.egg-info/
+
+# ── Temp & Dev Files ─────────────────────
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+.claude/
+
+# ── Large Data Files ─────────────────────
+*.xlsx
+*.csv
+*.json.bak
+adx_all_results.json
+id_price_map_2026.json
+uae_id_matches.json
+
+# ── Old/Orphan Files ─────────────────────
+GET
+Host:
+Accept:
+User-Agent:
+str
+0.15
+Conviction
+*EisaX

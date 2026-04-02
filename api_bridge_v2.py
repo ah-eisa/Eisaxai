@@ -4,11 +4,11 @@ import logging
 import time as _time
 from core.config import (
     APP_DB, STATIC_DIR, EXPORTS_DIR, FILE_CACHE_DIR,
-    CHAT_HTML, BACKEND_LOG, ENV_FILE,
+    BACKEND_LOG, ENV_FILE,
 )
 from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form, Request, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -16,6 +16,7 @@ from typing import Optional
 import uvicorn
 import io
 import jwt as _jwt
+import re as _re
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -103,6 +104,79 @@ def _file_store_get(file_id: str):
         return _json.load(_f)
 
 
+def _soften_portfolio_advice(text: str) -> str:
+    """Convert directive wording to advisory wording for safer decision support."""
+    if not text:
+        return text
+    softened = str(text)
+    replacements = [
+        (r"(?i)\bexecute (?:the )?rebalancing plan immediately\b", "consider gradual rebalancing based on risk triggers"),
+        (r"(?i)\bexecute immediately\b", "consider phased execution"),
+        (r"(?i)\bexit 100%\b", "consider a full exit"),
+        (r"(?i)\breduce to 50%\b", "consider reducing to 50%"),
+        (r"(?i)\bmust\b", "should"),
+    ]
+    for pattern, repl in replacements:
+        softened = _re.sub(pattern, repl, softened)
+    return softened
+
+
+def _compute_portfolio_confidence(sharpe: float,
+                                  eff_n: float,
+                                  avg_corr: float,
+                                  beta_total: Optional[float],
+                                  cvar_95: float,
+                                  rolling_sharpe_now: Optional[float] = None) -> int:
+    """Deterministic confidence score for portfolio verdict communication."""
+    score = 66.0
+    score += min(max((sharpe - 0.8) * 12.0, -10.0), 10.0)
+    score += min(max((eff_n - 2.5) * 4.0, -8.0), 8.0)
+    score -= min(max((avg_corr - 0.45) * 20.0, 0.0), 8.0)
+    if isinstance(beta_total, (int, float)):
+        score -= min(max((beta_total - 1.2) * 8.0, 0.0), 10.0)
+    else:
+        score -= 3.0  # uncertainty penalty when beta data coverage is missing
+    score -= min(max((abs(cvar_95) - 3.0) * 3.0, 0.0), 8.0)
+    if rolling_sharpe_now is not None:
+        score += min(max((rolling_sharpe_now - 0.2) * 5.0, -6.0), 6.0)
+    return int(max(45, min(88, round(score))))
+
+
+def _build_portfolio_decision_layer(*,
+                                    confidence: int,
+                                    risk_label: str,
+                                    rolling_sharpe_now: Optional[float],
+                                    tech_weight: float,
+                                    next_review_hint: str = "next review cycle") -> str:
+    """Adds explicit decision discipline: uncertainty, no-action case, and boundary."""
+    rolling_note = (
+        f"rolling Sharpe currently {rolling_sharpe_now:+.2f}"
+        if rolling_sharpe_now is not None else
+        "rolling Sharpe trend requires ongoing confirmation"
+    )
+    if tech_weight >= 0.70:
+        alt_case = (
+            "If AI mega-cap momentum persists and earnings revisions remain positive, concentrated tech could continue to outperform in the near term."
+        )
+    else:
+        alt_case = (
+            "If macro volatility cools and correlations normalize, current allocation may remain acceptable with only minor rebalancing."
+        )
+    no_action_case = (
+        f"If risk metrics stay stable and no catalyst break occurs before the {next_review_hint}, HOLD/no-trade remains a valid decision."
+    )
+    return (
+        "\n\n---\n"
+        "## 🎯 Decision Discipline Layer\n"
+        f"- **Confidence:** {confidence}%\n"
+        f"- **Risk Posture:** {risk_label}\n"
+        f"- **Primary Uncertainty:** concentration regime sensitivity and {rolling_note}\n"
+        f"- **No-Action Case:** {no_action_case}\n"
+        f"- **Alternative Scenario:** {alt_case}\n"
+        "> **Decision Boundary:** This analysis provides strategic guidance, not execution instructions."
+    )
+
+
 class MessagePayload(BaseModel):
     message: str = Field(..., max_length=16000)
     user_id: Optional[str] = "admin"
@@ -112,8 +186,7 @@ class MessagePayload(BaseModel):
 
 @app.get("/")
 async def root():
-    from fastapi.responses import FileResponse
-    return FileResponse(str(CHAT_HTML))
+    return RedirectResponse(url="https://eisax.com", status_code=301)
 
 @app.get("/v1/chart-data")
 async def chart_data(ticker: str = "NVDA", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
@@ -177,6 +250,8 @@ async def upload_portfolio(
     access_token_alt: str = Header(None, alias="access-token")
 ):
     """Upload CSV/Excel portfolio file and analyze it"""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         contents = await file.read()
 
@@ -212,20 +287,39 @@ async def upload_portfolio(
             weights = [1/len(tickers)] * len(tickers)
         
         portfolio = dict(zip(tickers, weights))
+        # Always work on normalized total-portfolio weights (including cash-like rows)
+        # to avoid hidden basis-mismatch between "total portfolio" and "equity sleeve".
+        _sum_input_w = sum(float(w) for w in portfolio.values())
+        if _sum_input_w <= 0:
+            return {"error": "Invalid portfolio weights: sum must be > 0"}
+        portfolio = {t: float(w) / _sum_input_w for t, w in portfolio.items()}
         
         # Build Portfolio Risk Report
         import yfinance as yf
         import numpy as np
         from dotenv import load_dotenv
         load_dotenv(str(ENV_FILE))
+        def _to_float(v):
+            try:
+                f = float(v)
+                return f if np.isfinite(f) else None
+            except Exception:
+                return None
+        def _safe_round(v, n=3):
+            f = _to_float(v)
+            return round(f, n) if f is not None else None
 
         valid_tickers = [t for t in tickers if t.upper() not in ["CASH","USD","AED"]]
-        valid_weights = {t: portfolio[t] for t in valid_tickers}
+        valid_weights_total = {t: portfolio.get(t, 0.0) for t in valid_tickers}
         
         # Normalize weights
-        total_w = sum(valid_weights.values())
+        total_w = sum(valid_weights_total.values())
+        equity_alloc_total = total_w
         if total_w > 0:
-            valid_weights = {t: w/total_w for t,w in valid_weights.items()}
+            # Equity-sleeve normalized weights (sum to 100% across non-cash assets)
+            valid_weights = {t: w / total_w for t, w in valid_weights_total.items()}
+        else:
+            valid_weights = {}
 
         # ── Fetch 1yr price history + fundamentals ──────────────────────────────
         RF_RATE = 0.045   # US T-Bill risk-free rate (4.5%)
@@ -246,10 +340,10 @@ async def upload_portfolio(
                 _safe_dy = min(max(_raw_dy, 0.0), 0.15)   # clamp decimal [0, 15%]
                 stock_info[t] = {
                     "price":     info.get("regularMarketPrice") or info.get("previousClose", 0),
-                    "beta":      info.get("beta", 1.0),
+                    "beta":      _to_float(info.get("beta")),
                     "sector":    info.get("sector", "N/A"),
-                    "pe":        info.get("trailingPE", 0),
-                    "mktcap":    info.get("marketCap", 0),
+                    "pe":        _to_float(info.get("trailingPE")),
+                    "mktcap":    _to_float(info.get("marketCap")),
                     "div_yield": _safe_dy,   # current market yield, NOT yield-on-cost
                 }
             except Exception as _fe:
@@ -273,8 +367,10 @@ async def upload_portfolio(
         port_total_return = 0.0
         cvar_95 = 0.0
         rolling_sharpe_str = ""
+        rolling_sharpe_now = None
         sector_concentration = {}
         factor_exposure = {}
+        port_beta_equity = None
 
         if len(price_data) >= 2:
             prices_df = pd.DataFrame(price_data).dropna()
@@ -298,8 +394,6 @@ async def upload_portfolio(
             # VaR 95% and CVaR 95% (Expected Shortfall — tail risk beyond VaR)
             var_95  = float(np.percentile(port_returns, 5) * 100)
             cvar_95 = float(port_returns[port_returns <= np.percentile(port_returns, 5)].mean() * 100)
-
-            port_beta = float(sum(stock_info.get(t,{}).get("beta",1) * valid_weights.get(t,0) for t in valid_tickers))
 
             # Max drawdown + duration (calendar days in drawdown)
             cum      = (1 + pd.Series(port_returns)).cumprod()
@@ -327,6 +421,7 @@ async def upload_portfolio(
                     roll_sh.append(round(s, 2))
                 if roll_sh:
                     rs_min = min(roll_sh); rs_max = max(roll_sh); rs_now = roll_sh[-1]
+                    rolling_sharpe_now = float(rs_now)
                     rs_trend = "↗ Improving" if rs_now > np.mean(roll_sh) else "↘ Declining"
                     rolling_sharpe_str = (
                         f"Current (last 63d): **{rs_now:.2f}** | "
@@ -364,8 +459,36 @@ async def upload_portfolio(
             hhi = sum(v**2 for v in sector_concentration.values())  # 0=diversified, 1=concentrated
 
         else:
-            ann_return, ann_vol, sharpe, var_95, port_beta = 0, 0, 0, 0, 1.0
+            ann_return, ann_vol, sharpe, var_95, port_beta_equity = 0, 0, 0, 0, None
             port_total_return, max_dd, avg_corr, eff_n, hhi = 0.0, 0.0, 0.0, 1.0, 1.0
+
+        # Keep both bases explicit:
+        # - equity basis: normalized over non-cash holdings
+        # - total basis: normalized over all uploaded rows (including cash-like rows)
+        def _weighted_beta(weights_map):
+            _num = 0.0
+            _den = 0.0
+            _coverage = 0.0
+            for _t, _w in weights_map.items():
+                _b = stock_info.get(_t, {}).get("beta")
+                if _b is None:
+                    continue
+                _num += float(_b) * float(_w)
+                _den += float(_w)
+                _coverage += float(_w)
+            if _den <= 0:
+                return None, 0.0
+            return float(_num / _den), float(_coverage)
+
+        port_beta_equity, beta_cov_equity = _weighted_beta(valid_weights)
+        port_beta_total, beta_cov_total = _weighted_beta(valid_weights_total)
+        port_beta = port_beta_equity
+        def _beta_is_valid(v):
+            return isinstance(v, (int, float)) and np.isfinite(v)
+        def _fmt_beta(v):
+            return f"{v:.2f}" if _beta_is_valid(v) else "N/A"
+        _has_beta_total = _beta_is_valid(port_beta_total)
+        _has_beta_equity = _beta_is_valid(port_beta_equity)
 
         # ── Historical Stress Tests (actual crisis returns, NOT linear beta) ──
         # Each scenario uses historically observed market returns + portfolio beta
@@ -389,19 +512,30 @@ async def upload_portfolio(
         for label, spx_ret, tech_mult, note in _CRISIS_SCENARIOS:
             # Blend: non-tech portion tracks beta linearly; tech amplified by sector mult
             non_tech_w = max(0, 1 - tech_weight)
-            blended    = (tech_weight * spx_ret * tech_mult) + (non_tech_w * spx_ret * port_beta)
-            icon = "🔴" if blended < 0 else "🟢"
-            scenario_lines.append(
-                f"| {label} | {spx_ret*100:+.1f}% | **{blended*100:+.1f}%** | *{note}* |"
-            )
+            if _has_beta_equity:
+                blended = (tech_weight * spx_ret * tech_mult) + (non_tech_w * spx_ret * port_beta_equity)
+                icon = "🔴" if blended < 0 else "🟢"
+                scenario_lines.append(
+                    f"| {label} | {spx_ret*100:+.1f}% | **{blended*100:+.1f}%** | *{note}* |"
+                )
+            else:
+                scenario_lines.append(
+                    f"| {label} | {spx_ret*100:+.1f}% | **N/A** | *{note} · beta unavailable* |"
+                )
 
         # ── Portfolio Dividend Yield (weighted) ──────────────────────────────
-        port_div_yield = sum(
+        port_div_yield_equity = sum(
             stock_info.get(t, {}).get("div_yield", 0) * valid_weights.get(t, 0)
             for t in valid_tickers
         ) * 100
+        port_div_yield_total = sum(
+            stock_info.get(t, {}).get("div_yield", 0) * valid_weights_total.get(t, 0)
+            for t in valid_tickers
+        ) * 100
+        port_div_yield = port_div_yield_equity
 
-        cash_pct = (1 - sum(portfolio[t] for t in valid_tickers)) * 100
+        cash_pct = max(0.0, (1 - equity_alloc_total) * 100)
+        port_total_return_total_est = port_total_return * equity_alloc_total
 
         # ══════════════════════════════════════════════════════════════════════
         # Build report
@@ -411,15 +545,25 @@ async def upload_portfolio(
         now_str = datetime.now().strftime("%B %d, %Y")
 
         # ── Executive Summary ──────────────────────────────────────────────
-        alpha = (port_total_return - (spx_return or 0)*100)
-        risk_label = "Aggressive 🔴" if port_beta > 1.5 else "Moderate 🟡" if port_beta > 1.0 else "Conservative 🟢"
+        alpha = (port_total_return - (spx_return or 0) * 100)
+        alpha_total_est = (port_total_return_total_est - (spx_return or 0) * 100)
+        risk_label = (
+            "Aggressive 🔴" if (_has_beta_total and port_beta_total > 1.5) else
+            "Moderate 🟡" if (_has_beta_total and port_beta_total > 1.0) else
+            "Conservative 🟢" if _has_beta_total else
+            "Unknown ⚪"
+        )
+        elevated_risk = ((_has_beta_total and port_beta_total > 1.5) or (tech_weight >= 0.70) or (eff_n < 2.8) or (cvar_95 <= -3.5))
         verdict_line = (
-            f"Portfolio returned **{port_total_return:+.1f}%** vs S&P 500 **{spx_return*100:+.1f}%** "
-            f"(Alpha: **{alpha:+.1f}%**). Risk profile: **{risk_label}**. "
-            f"Sharpe: **{sharpe:.2f}** (rf=4.5%, 1Y Historical). "
-            f"Immediate action: {'Reduce tech concentration & add defensive assets.' if port_beta > 1.5 else 'Monitor correlation clusters.' if high_corr else 'Portfolio is well-positioned.'}"
+            f"Equity sleeve returned **{port_total_return:+.1f}%**; estimated total-portfolio return "
+            f"(including {cash_pct:.1f}% cash) is **{port_total_return_total_est:+.1f}%**. "
+            f"Vs S&P 500 **{spx_return*100:+.1f}%**: equity alpha **{alpha:+.1f}%**, "
+            f"estimated total alpha **{alpha_total_est:+.1f}%**. "
+            f"Risk profile (total beta): **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{sharpe:.1f}**. "
+            f"Strategic guidance: {'Strong performance, but concentration-driven with elevated risk — consider gradual de-risking and defensive diversification.' if elevated_risk else 'Returns are solid, but correlation clustering remains — consider incremental diversification while monitoring rolling Sharpe.' if high_corr else 'Strong historical performance with balanced risk controls — continue disciplined monitoring before adding incremental risk.'}"
             if spx_return is not None else
-            f"Portfolio 1Y Return: **{port_total_return:+.1f}%**. Risk: **{risk_label}**. Sharpe: **{sharpe:.2f}**."
+            f"Equity sleeve 1Y Return: **{port_total_return:+.1f}%** (estimated total portfolio: **{port_total_return_total_est:+.1f}%**). "
+            f"Risk: **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{sharpe:.1f}**."
         )
         lines.append("# 📊 EisaX Portfolio Risk Report")
         lines.append(f"**Date:** {now_str}  |  **Period:** 1 Year  |  **Risk-Free Rate:** 4.5% (US T-Bill)")
@@ -430,42 +574,52 @@ async def upload_portfolio(
 
         # ── Holdings ───────────────────────────────────────────────────────
         lines.append("## 📋 Holdings")
-        lines.append("| Ticker | Weight | Sector | Beta | P/E | Div Yield |")
-        lines.append("|--------|--------|--------|------|-----|-----------|")
+        lines.append("| Ticker | Weight (Total) | Weight (Equity Sleeve) | Sector | Beta | P/E | Div Yield |")
+        lines.append("|--------|----------------|------------------------|--------|------|-----|-----------|")
         for t in valid_tickers:
             info  = stock_info.get(t, {})
-            w_pct = portfolio.get(t, 0) * 100
+            w_total_pct = portfolio.get(t, 0) * 100
+            w_equity_pct = valid_weights.get(t, 0) * 100
             dy    = info.get("div_yield", 0) * 100
+            _beta_str = _fmt_beta(info.get("beta"))
+            _pe_v = info.get("pe")
+            _pe_str = f"{_pe_v:.1f}" if isinstance(_pe_v, (int, float)) and np.isfinite(_pe_v) else "N/A"
             lines.append(
-                f"| {t} | {w_pct:.1f}% | {info.get('sector','N/A')} "
-                f"| {info.get('beta',0) or '—':.2f} "
-                f"| {info.get('pe',0) or '—':.1f} "
+                f"| {t} | {w_total_pct:.1f}% | {w_equity_pct:.1f}% | {info.get('sector','N/A')} "
+                f"| {_beta_str} "
+                f"| {_pe_str} "
                 f"| {dy:.2f}% |"
             )
         if cash_pct > 0.5:
-            lines.append(f"| CASH | {cash_pct:.1f}% | — | 0 | — | 0% |")
-        lines.append(f"\n> **Weighted Portfolio Dividend Yield:** {port_div_yield:.2f}%")
+            lines.append(f"| CASH | {cash_pct:.1f}% | — | — | 0 | — | 0% |")
+        lines.append(
+            f"\n> **Weighted Dividend Yield (Total Portfolio):** {port_div_yield_total:.2f}%  "
+            f"| **Equity Sleeve:** {port_div_yield_equity:.2f}%"
+        )
 
         # ── Risk Metrics ───────────────────────────────────────────────────
         lines.append("")
         lines.append("## 📈 Risk Metrics")
-        lines.append("*Method: Historical Simulation (252 trading days) · rf = 4.5%*")
+        lines.append("*Method: Historical Simulation (252 trading days) · rf = 4.5% · equity-sleeve normalized*")
         lines.append("")
         lines.append("| Metric | Value | Assessment |")
         lines.append("|--------|-------|------------|")
-        lines.append(f"| 1Y Total Return | {port_total_return:+.1f}% | {'🟢 Strong' if port_total_return > 15 else '🟡 Moderate' if port_total_return > 0 else '🔴 Negative'} |")
+        lines.append(f"| 1Y Return (Equity Sleeve) | {port_total_return:+.1f}% | {'🟢 Strong' if port_total_return > 15 else '🟡 Moderate' if port_total_return > 0 else '🔴 Negative'} |")
+        lines.append(f"| Estimated 1Y Return (Total Portfolio) | {port_total_return_total_est:+.1f}% | Includes {cash_pct:.1f}% cash drag |")
         if spx_return is not None:
             alpha_icon = "🟢" if alpha > 0 else "🔴"
             lines.append(f"| vs S&P 500 (Alpha) | {alpha:+.1f}% | {alpha_icon} {'Outperforming' if alpha > 0 else 'Underperforming'} benchmark |")
         lines.append(f"| Annualized Volatility | {ann_vol*100:.1f}% | {'🔴 High' if ann_vol > 0.30 else '🟡 Moderate' if ann_vol > 0.15 else '🟢 Low'} |")
         lines.append(f"| Sharpe Ratio (1Y, rf=4.5%) | {sharpe:.2f} | {'🟢 Excellent' if sharpe > 1.5 else '🟡 Acceptable' if sharpe > 0.5 else '🔴 Poor'} |")
         lines.append(f"| Sortino Ratio (1Y, rf=4.5%) | {sortino:.2f} | {'🟢 Good' if sortino > 1.0 else '🟡 Acceptable' if sortino > 0.5 else '🔴 Poor'} downside-adjusted |")
-        lines.append(f"| Portfolio Beta (weighted) | {port_beta:.2f} | {'🔴 High Risk' if port_beta > 1.5 else '🟡 Moderate' if port_beta > 1 else '🟢 Defensive'} |")
+        lines.append(f"| Portfolio Beta (Total Weight) | {_fmt_beta(port_beta_total)} | {'🔴 High Risk' if (_has_beta_total and port_beta_total > 1.5) else '🟡 Moderate' if (_has_beta_total and port_beta_total > 1) else '🟢 Defensive' if _has_beta_total else '⚪ N/A (missing beta data)'} |")
+        lines.append(f"| Portfolio Beta (Equity Sleeve) | {_fmt_beta(port_beta_equity)} | {'Normalized over non-cash assets' if _has_beta_equity else 'N/A (insufficient beta coverage)'} |")
         lines.append(f"| VaR 95% 1-Day (Historical) | {var_95:.2f}% | 95% of days, loss ≤ this |")
         lines.append(f"| CVaR 95% (Expected Shortfall) | {cvar_95:.2f}% | Avg loss **when** VaR is breached — tail risk |")
         lines.append(f"| Max Drawdown (1Y) | {max_dd:.1f}% | Worst peak-to-trough |")
         lines.append(f"| Max Drawdown Duration | {max_dd_duration}d | Longest time underwater |")
-        lines.append(f"| Portfolio Div Yield | {port_div_yield:.2f}% | Weighted annual income |")
+        lines.append(f"| Portfolio Div Yield (Total) | {port_div_yield_total:.2f}% | Weighted annual income |")
+        lines.append(f"| Portfolio Div Yield (Equity Sleeve) | {port_div_yield_equity:.2f}% | Normalized over non-cash assets |")
         if rolling_sharpe_str:
             lines.append(f"| Rolling Sharpe (63d) | — | {rolling_sharpe_str} |")
 
@@ -511,27 +665,35 @@ async def upload_portfolio(
             lines.append(sl)
         lines.append(f"\n> **Tech Weight:** {tech_weight*100:.0f}% of equity. "
                      f"In risk-off events, tech typically amplifies market moves by 1.2–1.8×. "
-                     f"Linear beta alone (β={port_beta:.2f}) understates true drawdown risk.")
+                     f"{'Linear beta alone (equity β=' + _fmt_beta(port_beta_equity) + ') understates true drawdown risk.' if _has_beta_equity else 'Equity beta unavailable (N/A) — avoid beta-based inference until data coverage improves.'}")
 
         # ── EisaX Risk Assessment ─────────────────────────────────────────
         lines.append("")
         lines.append("## 💡 EisaX Risk Assessment")
         _top_sector = max(sector_concentration, key=sector_concentration.get) if sector_concentration else "N/A"
         _top_sector_pct = sector_concentration.get(_top_sector, 0) * 100
-        if port_beta > 1.5:
+        if _has_beta_total and port_beta_total > 1.5:
             lines.append(
-                f"🔴 **Aggressive** — β={port_beta:.2f}, CVaR={cvar_95:.2f}%/day, Eff.N={eff_n:.1f} bets. "
+                f"🔴 **Aggressive** — total β={_fmt_beta(port_beta_total)} (equity β={_fmt_beta(port_beta_equity)}), "
+                f"CVaR={cvar_95:.2f}%/day, Eff.N={eff_n:.1f} bets. "
                 f"{_top_sector_pct:.0f}% in {_top_sector}. "
-                f"In a 2022-style selloff your portfolio would have lost ~{abs(tech_weight * -0.33 + (1-tech_weight) * -0.195 * port_beta)*100:.0f}% "
+                f"{('In a 2022-style selloff your equity sleeve would have lost ~' + str(round(abs(tech_weight * -0.33 + (1-tech_weight) * -0.195 * port_beta_equity)*100)) + '% ') if _has_beta_equity else ''}"
                 f"vs SPX -19.5%. Diversification is urgently needed."
             )
-        elif port_beta > 1.0:
+        elif _has_beta_total and port_beta_total > 1.0:
             lines.append(
-                f"🟡 **Moderate-Aggressive** — β={port_beta:.2f}, CVaR={cvar_95:.2f}%/day. "
+                f"🟡 **Moderate-Aggressive** — total β={_fmt_beta(port_beta_total)} (equity β={_fmt_beta(port_beta_equity)}), CVaR={cvar_95:.2f}%/day. "
                 "Above-market sensitivity. Trim highest-beta names on strength; add one defensive sector."
             )
+        elif _has_beta_total:
+            lines.append(
+                f"🟢 **Balanced** — total β={_fmt_beta(port_beta_total)} (equity β={_fmt_beta(port_beta_equity)}), "
+                f"CVaR={cvar_95:.2f}%/day, Eff.N={eff_n:.1f}. Reasonable risk profile."
+            )
         else:
-            lines.append(f"🟢 **Balanced** — β={port_beta:.2f}, CVaR={cvar_95:.2f}%/day, Eff.N={eff_n:.1f}. Reasonable risk profile.")
+            lines.append(
+                f"⚪ **Risk Classification Limited** — beta data unavailable for enough holdings. CVaR={cvar_95:.2f}%/day, Eff.N={eff_n:.1f}. Add missing beta data before beta-based decisions."
+            )
         lines.append("")
 
         # ══════════════════════════════════════════════════════════════════════
@@ -539,10 +701,10 @@ async def upload_portfolio(
         # Shows each holding's contribution to total return (Brinson model)
         # ══════════════════════════════════════════════════════════════════════
         if len(price_data) >= 1:
-            lines.append("## 📐 Performance Attribution (1Y)")
-            lines.append("*Brinson-Hood-Beebower: each holding's contribution to total portfolio return*")
+            lines.append("## 📐 Performance Attribution (1Y, Equity Sleeve)")
+            lines.append("*Brinson-Hood-Beebower: each holding's contribution to equity-sleeve return*")
             lines.append("")
-            lines.append("| Ticker | Weight | 1Y Return | Contribution | Attribution |")
+            lines.append("| Ticker | Weight (Equity Sleeve) | 1Y Return | Contribution | Attribution |")
             lines.append("|--------|--------|-----------|--------------|-------------|")
             attr_rows = []
             for t in valid_tickers:
@@ -554,11 +716,11 @@ async def upload_portfolio(
             for t, w, ret, contrib in attr_rows:
                 bar = "🟢" if contrib > 0 else "🔴"
                 lines.append(f"| {t} | {w*100:.1f}% | {ret:+.1f}% | {contrib:+.2f}pp | {bar} |")
-            # Unexplained (cash drag + rounding)
+            # Residual from compounding + rounding differences
             explained = sum(c for _, _, _, c in attr_rows)
-            cash_drag = port_total_return - explained
-            if abs(cash_drag) > 0.05:
-                lines.append(f"| CASH/Other | — | — | {cash_drag:+.2f}pp | {'🔴' if cash_drag < 0 else '⚪'} |")
+            residual = port_total_return - explained
+            if abs(residual) > 0.05:
+                lines.append(f"| Residual (model) | — | — | {residual:+.2f}pp | {'🔴' if residual < 0 else '⚪'} |")
             lines.append(f"| **TOTAL** | 100% | — | **{port_total_return:+.2f}pp** | |")
             lines.append("")
             # Alpha source: top contributor vs S&P
@@ -577,34 +739,40 @@ async def upload_portfolio(
         lines.append("")
 
         factor_scores = {}
+        factor_weights = {}
+        _factor_order = ["Market (Beta)", "Growth (P/E tilt)", "Size (SMB proxy)", "Momentum (12M)"]
         for t in valid_tickers:
             info   = stock_info.get(t, {})
             w      = valid_weights.get(t, 0)
-            beta   = info.get("beta", 1.0) or 1.0
-            pe     = info.get("pe", 20) or 20
-            mc     = info.get("mktcap", 1e10) or 1e10
+            beta   = info.get("beta")
+            pe     = info.get("pe")
+            mc     = info.get("mktcap")
             # 1Y momentum from price data
-            mom = 0.0
+            mom = None
             if t in price_data and len(price_data[t]) > 20:
                 _s = price_data[t]
                 mom = float((_s.iloc[-1] / _s.iloc[max(0, len(_s)-252)]) - 1)
 
             # Factor scoring (institutional proxy)
             # Market beta exposure
-            factor_scores.setdefault("Market (Beta)", 0)
-            factor_scores["Market (Beta)"] += beta * w
+            if isinstance(beta, (int, float)) and np.isfinite(beta):
+                factor_scores["Market (Beta)"] = factor_scores.get("Market (Beta)", 0.0) + (beta * w)
+                factor_weights["Market (Beta)"] = factor_weights.get("Market (Beta)", 0.0) + w
             # Growth (inverse P/E proxy — high PE = growth tilt)
-            growth_score = min(max((pe - 15) / 50, -1), 1)  # normalize
-            factor_scores.setdefault("Growth (P/E tilt)", 0)
-            factor_scores["Growth (P/E tilt)"] += growth_score * w
+            if isinstance(pe, (int, float)) and np.isfinite(pe):
+                growth_score = min(max((pe - 15) / 50, -1), 1)  # normalize
+                factor_scores["Growth (P/E tilt)"] = factor_scores.get("Growth (P/E tilt)", 0.0) + (growth_score * w)
+                factor_weights["Growth (P/E tilt)"] = factor_weights.get("Growth (P/E tilt)", 0.0) + w
             # Size (log market cap — large = negative small-cap factor)
-            import math as _math
-            size_score = -(_math.log10(mc) - 10) / 3  # large cap = negative SMB
-            factor_scores.setdefault("Size (SMB proxy)", 0)
-            factor_scores["Size (SMB proxy)"] += size_score * w
+            if isinstance(mc, (int, float)) and np.isfinite(mc) and mc > 0:
+                import math as _math
+                size_score = -(_math.log10(mc) - 10) / 3  # large cap = negative SMB
+                factor_scores["Size (SMB proxy)"] = factor_scores.get("Size (SMB proxy)", 0.0) + (size_score * w)
+                factor_weights["Size (SMB proxy)"] = factor_weights.get("Size (SMB proxy)", 0.0) + w
             # Momentum (12-1 month)
-            factor_scores.setdefault("Momentum (12M)", 0)
-            factor_scores["Momentum (12M)"] += mom * w
+            if isinstance(mom, (int, float)) and np.isfinite(mom):
+                factor_scores["Momentum (12M)"] = factor_scores.get("Momentum (12M)", 0.0) + (mom * w)
+                factor_weights["Momentum (12M)"] = factor_weights.get("Momentum (12M)", 0.0) + w
 
         lines.append("| Factor | Portfolio Exposure | Interpretation |")
         lines.append("|--------|--------------------|----------------|")
@@ -614,7 +782,12 @@ async def upload_portfolio(
             "Size (SMB proxy)":    lambda v: ("🟢 Large-cap dominated (low SMB)" if v < -0.1 else "🔴 Small-cap tilt" if v > 0.2 else "🟡 Mid-cap blend"),
             "Momentum (12M)":      lambda v: ("🟢 Strong momentum" if v > 0.20 else "🔴 Negative momentum" if v < -0.10 else "🟡 Neutral momentum"),
         }
-        for fname, fval in factor_scores.items():
+        for fname in _factor_order:
+            _w_cov = factor_weights.get(fname, 0.0)
+            if _w_cov <= 0:
+                lines.append(f"| {fname} | **N/A** | ⚪ Insufficient data |")
+                continue
+            fval = factor_scores.get(fname, 0.0) / _w_cov
             label_fn = _factor_labels.get(fname, lambda v: "—")
             lines.append(f"| {fname} | **{fval:+.2f}** | {label_fn(fval)} |")
         lines.append("")
@@ -643,7 +816,10 @@ async def upload_portfolio(
                 _mu       = np.array([float(returns_df[t].mean() * 252) for t in _opt_tickers])
                 _cov_raw  = returns_df[_opt_tickers].cov().values * 252
                 _cov      = np.array(_cov_raw, dtype=float) + np.eye(_n) * 1e-8   # PSD regularisation
-                _betas_v  = np.array([max(stock_info.get(t,{}).get("beta",1.0) or 1.0, 0.01)
+                _missing_beta = [t for t in _opt_tickers if stock_info.get(t, {}).get("beta") is None]
+                if _missing_beta:
+                    raise ValueError(f"Missing beta data for optimization: {', '.join(_missing_beta)}")
+                _betas_v  = np.array([max(float(stock_info.get(t, {}).get("beta")), 0.01)
                                       for t in _opt_tickers])
                 _MIN_W    = 0.01          # 1 % floor per holding
                 _PORT_V   = 100_000       # $100k reference for dollar amounts
@@ -1124,26 +1300,43 @@ async def upload_portfolio(
             import requests as _rq, os as _os
             deepseek_key = _os.environ.get("DEEPSEEK_API_KEY", "")
 
-            holdings_summary = ", ".join([f"{t} ({portfolio.get(t,0)*100:.0f}%)" for t in valid_tickers])
+            holdings_summary = ", ".join(
+                [f"{t} ({portfolio.get(t,0)*100:.0f}% total / {valid_weights.get(t,0)*100:.0f}% equity)" for t in valid_tickers]
+            )
             corr_note = "High correlations: " + ", ".join(high_corr) if high_corr else "No high-correlation pairs."
             benchmark_note = (f"S&P 500 returned {spx_return*100:+.1f}% over the same period (Alpha: {alpha:+.1f}%)"
                               if spx_return is not None else "Benchmark data unavailable.")
-            div_note = f"Portfolio weighted dividend yield: {port_div_yield:.2f}%"
+            div_note = (
+                f"Portfolio dividend yield (total): {port_div_yield_total:.2f}% | "
+                f"equity sleeve: {port_div_yield_equity:.2f}%"
+            )
             scenario_summary = "; ".join([
-                f"{lbl}: portfolio {mkt*port_beta*100:+.1f}%"
+                f"{lbl}: equity sleeve {(mkt*port_beta_equity*100):+.1f}%"
                 for lbl, mkt, _, _ in _CRISIS_SCENARIOS
-            ])
+            ]) if _has_beta_equity else "N/A (beta data unavailable)"
 
             _sector_summary = "; ".join([f"{s}: {w*100:.0f}%" for s, w in sorted(sector_concentration.items(), key=lambda x: -x[1])])
+            _stock_level_lines = []
+            for t in valid_tickers:
+                _si = stock_info.get(t, {})
+                _b = _si.get("beta")
+                _p = _si.get("pe")
+                _d = _si.get("div_yield")
+                _beta_txt = _fmt_beta(_b)
+                _pe_txt = f"{_p:.1f}" if isinstance(_p, (int, float)) and np.isfinite(_p) else "N/A"
+                _div_txt = f"{_d*100:.2f}%" if isinstance(_d, (int, float)) and np.isfinite(_d) else "N/A"
+                _stock_level_lines.append(f"- {t}: {_si.get('sector','N/A')} | β={_beta_txt} | P/E={_pe_txt} | Div={_div_txt}")
             ds_prompt = f"""You are a CIO-level portfolio risk analyst at an institutional fund. Provide a rigorous, data-driven analysis.
 
 PORTFOLIO: {holdings_summary}
 Cash: {cash_pct:.1f}%
 
 QUANTITATIVE METRICS (1Y, rf=4.5%, Historical Simulation):
-- Total Return: {port_total_return:+.1f}% | {benchmark_note}
+- Equity Sleeve Return: {port_total_return:+.1f}%
+- Estimated Total Portfolio Return (incl. cash): {port_total_return_total_est:+.1f}% | {benchmark_note}
 - Annualized Volatility: {ann_vol*100:.1f}% | Sharpe: {sharpe:.2f} | Sortino: {sortino:.2f}
-- Portfolio Beta: {port_beta:.2f} | VaR (95%): {var_95:.2f}%/day | CVaR (95%): {cvar_95:.2f}%/day
+- Portfolio Beta (total): {_fmt_beta(port_beta_total)} | Portfolio Beta (equity): {_fmt_beta(port_beta_equity)}
+- VaR (95%): {var_95:.2f}%/day | CVaR (95%): {cvar_95:.2f}%/day
 - Max Drawdown: {max_dd:.1f}% (duration: {max_dd_duration} trading days)
 - {rolling_sharpe_str if rolling_sharpe_str else "Rolling Sharpe: insufficient data"}
 - {div_note}
@@ -1155,10 +1348,10 @@ DIVERSIFICATION:
 - {corr_note}
 
 STOCK-LEVEL DETAIL:
-{chr(10).join([f"- {t}: {stock_info.get(t,{}).get('sector','N/A')} | β={stock_info.get(t,{}).get('beta',1):.2f} | P/E={stock_info.get(t,{}).get('pe',0) or 'N/A'} | Div={stock_info.get(t,{}).get('div_yield',0)*100:.2f}%" for t in valid_tickers])}
+{chr(10).join(_stock_level_lines)}
 
 HISTORICAL STRESS TESTS (sector-adjusted, NOT linear beta):
-{chr(10).join([f"- {lbl}: SPX {spx*100:+.1f}% → portfolio {(tech_weight*spx*tm + (1-tech_weight)*spx*port_beta)*100:+.1f}%" for lbl, spx, tm, _ in _CRISIS_SCENARIOS])}
+{chr(10).join([f"- {lbl}: SPX {spx*100:+.1f}% → equity sleeve {(tech_weight*spx*tm + (1-tech_weight)*spx*port_beta_equity)*100:+.1f}%" for lbl, spx, tm, _ in _CRISIS_SCENARIOS]) if _has_beta_equity else "- N/A (insufficient beta coverage)"}
 
 Write a comprehensive institutional analysis with EXACTLY these 6 sections:
 1. **📋 Executive Assessment** — Alpha quality, risk-adjusted performance, Sharpe trend (improving/declining?)
@@ -1166,9 +1359,19 @@ Write a comprehensive institutional analysis with EXACTLY these 6 sections:
 3. **🔄 Rebalancing Plan** — Exact target weights (must sum to 100%), rationale using CVaR and Eff.N metrics
 4. **➕ Suggested Additions** — 3 specific tickers with expected Sharpe/Beta/correlation impact on portfolio
 5. **📊 Tax & Income Note** — Capital gains exposure on highest-return holdings + income gap analysis
-6. **✅ EisaX Final Verdict** — Rating: Conservative/Balanced/Aggressive/Speculative + one precise action
+6. **✅ EisaX Final Verdict** — Rating: Conservative/Balanced/Aggressive/Speculative + one advisory suggested action
+   - Include explicit lines: Confidence (%), Primary Uncertainty (2 drivers), No-Action Case, Alternative Scenario
 
-CRITICAL: Reference CVaR, Effective N, and rolling Sharpe trend in your analysis. Be institutional — no platitudes. Max 550 words."""
+CRITICAL:
+- Do not invent or re-derive numeric values. Use the metrics exactly as provided above.
+- If any metric is unavailable, state "N/A" explicitly. Do not backfill with assumptions.
+- Keep weights consistent with the provided basis labels (total vs equity sleeve).
+- Reference CVaR, Effective N, and rolling Sharpe trend in your analysis.
+- Use advisory language only ("consider", "prefer", "may"). Avoid command language ("execute immediately", "must sell", "exit 100%").
+- If risk profile is elevated, do NOT use phrases like "well-positioned" in the executive opening.
+- Include this exact boundary line at the end of section 6:
+  "Decision Boundary: This analysis provides strategic guidance, not execution instructions."
+- Be institutional — no platitudes. Max 550 words."""
 
             if deepseek_key:
                 ds_resp = _rq.post(
@@ -1182,6 +1385,19 @@ CRITICAL: Reference CVaR, Effective N, and rolling Sharpe trend in your analysis
                     cio_analysis = (ds_resp.json().get("choices", [{}])[0]
                                     .get("message", {}).get("content", ""))
                     if cio_analysis:
+                        cio_analysis = _soften_portfolio_advice(cio_analysis)
+                        # Keep one confidence source in the final report (Decision Discipline Layer only).
+                        _cio_lines = []
+                        for _ln in cio_analysis.splitlines():
+                            if _re.search(r'(?i)\bconfidence\b', _ln):
+                                continue
+                            _cio_lines.append(_ln)
+                        cio_analysis = "\n".join(_cio_lines)
+                        cio_analysis = _re.sub(r'\n{3,}', '\n\n', cio_analysis).strip()
+                        if "Decision Boundary:" not in cio_analysis:
+                            cio_analysis += (
+                                "\n\n> Decision Boundary: This analysis provides strategic guidance, not execution instructions."
+                            )
                         lines.append("## 🧠 CIO Deep Analysis (AI-Powered)")
                         lines.append(cio_analysis)
                 else:
@@ -1189,22 +1405,40 @@ CRITICAL: Reference CVaR, Effective N, and rolling Sharpe trend in your analysis
             else:
                 lines.append("## 🧠 Portfolio Assessment")
                 lines.append("**Risk Level: Aggressive** — High-beta tech concentration. "
-                              "Reduce TSLA, add VIG/XLV/JPM for balance." if port_beta > 1.5 else
+                              "Reduce TSLA, add VIG/XLV/JPM for balance." if (_has_beta_total and port_beta_total > 1.5) else
                               "**Risk Level: Moderate** — Monitor correlation clusters and rebalance quarterly.")
         except Exception as _e:
             logger.warning("DeepSeek CIO analysis failed: %s", _e)
             lines.append("## 🧠 Portfolio Assessment")
-            _risk_label = "Aggressive" if port_beta > 1.5 else "Moderate-Aggressive" if port_beta > 1.2 else "Moderate"
+            _risk_label = "Aggressive" if (_has_beta_total and port_beta_total > 1.5) else "Moderate-Aggressive" if (_has_beta_total and port_beta_total > 1.2) else "Moderate" if _has_beta_total else "Unknown"
             _top_holding = max(valid_weights, key=valid_weights.get) if valid_weights else "N/A"
             _top_w = valid_weights.get(_top_holding, 0) * 100
             lines.append(
-                f"**Risk Profile: {_risk_label}** — β={port_beta:.2f}, CVaR={cvar_95:.2f}%/day, "
+                f"**Risk Profile: {_risk_label}** — total β={_fmt_beta(port_beta_total)} (equity β={_fmt_beta(port_beta_equity)}), CVaR={cvar_95:.2f}%/day, "
                 f"Sharpe={sharpe:.2f}, Effective N={eff_n:.1f} independent bets. "
                 f"Portfolio is {int(tech_weight*100)}% Technology with {_top_holding} as lead position ({_top_w:.0f}%). "
                 + ("Concentration risk is the primary concern — reduce single-sector exposure and add uncorrelated assets (TLT, GLD, BRK-B) to improve Effective N toward ≥4."
                    if tech_weight > 0.6 else
                    "Risk profile is within institutional bounds. Monitor rolling Sharpe for momentum deterioration.")
             )
+
+        decision_conf = _compute_portfolio_confidence(
+            sharpe=sharpe,
+            eff_n=eff_n,
+            avg_corr=avg_corr,
+            beta_total=port_beta_total,
+            cvar_95=cvar_95,
+            rolling_sharpe_now=rolling_sharpe_now,
+        )
+        lines.append(
+            _build_portfolio_decision_layer(
+                confidence=decision_conf,
+                risk_label=("Aggressive" if (_has_beta_total and port_beta_total > 1.5) else "Moderate-Aggressive" if (_has_beta_total and port_beta_total > 1.2) else "Moderate" if _has_beta_total else "Unknown"),
+                rolling_sharpe_now=rolling_sharpe_now,
+                tech_weight=tech_weight,
+                next_review_hint="next quarterly review",
+            )
+        )
 
         lines.append("")
         lines.append("*To analyze any individual stock: type `analyze TICKER`*")
@@ -1250,13 +1484,16 @@ CRITICAL: Reference CVaR, Effective N, and rolling Sharpe trend in your analysis
             from portfolio_memory import save_snapshot as _save_snap
             _metrics_for_mem = {
                 "sharpe":       sharpe,
-                "beta":         round(port_beta, 3),
+                "beta":         _safe_round(port_beta_total, 3),
+                "beta_equity":  _safe_round(port_beta_equity, 3),
                 "cvar_95":      round(cvar_95, 3),
                 "ann_vol":      round(ann_vol * 100, 2),
                 "total_return": round(port_total_return, 2),
+                "total_return_total_est": round(port_total_return_total_est, 2),
                 "sortino":      sortino,
                 "max_dd":       round(max_dd, 2),
-                "div_yield":    round(port_div_yield, 3),
+                "div_yield":    round(port_div_yield_total, 3),
+                "div_yield_equity": round(port_div_yield_equity, 3),
             }
             _sources_for_mem = [{
                 "source":       "Yahoo Finance (yfinance)",
@@ -1294,16 +1531,22 @@ CRITICAL: Reference CVaR, Effective N, and rolling Sharpe trend in your analysis
             },
             "metrics": {
                 "total_return_pct":  round(port_total_return, 2),
+                "total_return_total_est_pct": round(port_total_return_total_est, 2),
                 "spx_return_pct":    round(spx_return * 100, 2) if spx_return is not None else None,
                 "alpha_pct":         round(alpha, 2) if spx_return is not None else None,
+                "alpha_total_est_pct": round(alpha_total_est, 2) if spx_return is not None else None,
                 "ann_return_pct":    round(ann_return * 100, 2),
                 "ann_vol_pct":       round(ann_vol * 100, 2),
                 "sharpe":            sharpe,
                 "sortino":           sortino,
                 "var_95_pct":        round(var_95, 3),
                 "max_drawdown_pct":  round(max_dd, 2),
-                "beta":              round(port_beta, 3),
-                "div_yield_pct":     round(port_div_yield, 3),
+                "beta":              _safe_round(port_beta_total, 3),
+                "beta_equity":       _safe_round(port_beta_equity, 3),
+                "div_yield_pct":     round(port_div_yield_total, 3),
+                "div_yield_equity_pct": round(port_div_yield_equity, 3),
+                "equity_allocation_pct": round(equity_alloc_total * 100, 2),
+                "cash_allocation_pct": round(cash_pct, 2),
                 "risk_free_rate":    "4.5% (US T-Bill)",
                 "method":            "Historical Simulation, 252 trading days",
             }
@@ -2588,6 +2831,7 @@ async def auth_login(body: LoginRequest):
     )
     return {
         "token":       token,
+        "access_token": SECURE_TOKEN,
         "must_change": bool(user["must_change_pw"]),
         "name":        user["name"],
         "role":        user["role"],
@@ -2665,3 +2909,82 @@ async def admin_reset_password(user_id: int, _: dict = Depends(_require_admin)):
     temp_pw = generate_temp_password()
     update_user(user_id, password_hash=hash_password(temp_pw), must_change_pw=1)
     return {"temp_password": temp_pw}
+
+
+# ── Health Check ──────────────────────────────────────────────────────────────
+
+@app.get("/v1/health")
+async def health_check(
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    _token = access_token or access_token_alt
+    if _token != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from core.services.health_service import run_health_check
+    result = await run_health_check(SECURE_TOKEN)
+    status_code = 200 if result["status"] == "ok" else (503 if result["status"] == "down" else 207)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(content=result, status_code=status_code)
+
+
+# ── Session Cleanup ───────────────────────────────────────────────────────────
+
+@app.post("/admin/cleanup")
+async def run_cleanup(
+    days: int = 30,
+    access_token: str = Header(None, alias="X-Admin-Key"),
+):
+    _check_admin(access_token)
+    result = orchestrator.session_mgr.cleanup_old_sessions(days_to_keep=days)
+    return result
+
+
+# ── Logging Dashboard ─────────────────────────────────────────────────────────
+
+@app.get("/admin/logs")
+async def admin_logs_page(
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    _token = access_token or access_token_alt
+    if _token != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from fastapi.responses import FileResponse
+    return FileResponse(str(STATIC_DIR / "admin_logs.html"))
+
+
+@app.get("/admin/logs/stream")
+async def admin_logs_stream(token: str = "", request: Request = None):
+    if token != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from fastapi.responses import StreamingResponse
+    import asyncio as _aio
+
+    async def _generate():
+        log_path = str(BACKEND_LOG)
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f.readlines()[-100:]:
+                    line = line.strip()
+                    if line:
+                        yield f"data: {_json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                f.seek(0, 2)
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    new_line = f.readline()
+                    if new_line:
+                        line = new_line.strip()
+                        if line:
+                            yield f"data: {_json.dumps({'line': line}, ensure_ascii=False)}\n\n"
+                    else:
+                        await _aio.sleep(0.5)
+        except Exception as exc:
+            yield f"data: {_json.dumps({'line': f'[ERROR] {exc}'})}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

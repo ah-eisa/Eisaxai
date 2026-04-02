@@ -258,6 +258,7 @@ async def handle_financial(
     instruction:  str,
     handler:      str,
     user_ctx:     dict,
+    chat_history: list = None,
 ) -> dict | None:
     """
     Handle CIO_ANALYSIS and PORTFOLIO_OPTIMIZE routes.
@@ -266,37 +267,80 @@ async def handle_financial(
     from core.agents.finance import FinancialAgent
 
     # ── PORTFOLIO_OPTIMIZE: Gate — require min inputs before executing ────────
-    # If the user didn't provide amount, risk level, or markets, ask first.
+    # Checks current message AND recent conversation history combined.
     # This prevents the system from inventing a portfolio from a vague request.
     if handler == "PORTFOLIO_OPTIMIZE":
         import re as _re_po
-        _msg_low = message.lower()
-        _has_amount  = bool(_re_po.search(r'\d[\d,\.]*\s*(k|m|b|الف|مليون|مليار|دولار|ريال|درهم|\$|usd|eur|aed|sar)', _msg_low))
-        _has_risk    = any(w in _msg_low for w in [
-            'aggressive','عدوانية','عدواني','risk','مخاطرة','مخاطر','conservative',
-            'محافظ','متوازن','balanced','moderate','low risk','high risk',
-            'منخفض','متوسط','عالي','عالية'
+        # Build accumulated context: current message + last 6 history messages
+        _hist_text = " ".join(
+            m.get("content", "") for m in (chat_history or [])[-6:]
+            if m.get("role") in ("user", "assistant")
+        )
+        _full_ctx = (message + " " + _hist_text).lower()
+        _has_amount  = bool(_re_po.search(
+            r'\d[\d,\.]*\s*(k|m|b|الف|مليون|مليار|دولار|ريال|درهم|\$|usd|eur|aed|sar)',
+            _full_ctx
+        ))
+        _has_risk    = any(w in _full_ctx for w in [
+            'aggressive','عدوانية','عدواني','عدوانى','جريئة','جريء','جرئ','جريئ',
+            'risk','مخاطرة','مخاطر','conservative','محافظ','متوازن',
+            'balanced','moderate','low risk','high risk',
+            'منخفض','متوسط','عالي','عالية','bold','جرئ',
         ])
-        _has_market  = any(w in _msg_low for w in [
+        _has_market  = any(w in _full_ctx for w in [
             'uae','dubai','saudi','مصر','egypt','us','america','global',
             'gulf','خليج','سوق','stocks','bonds','crypto','gold','سندات',
-            'اسهم','ذهب','خام','تشفير','محلي','دولي'
+            'اسهم','اسهم','ذهب','خام','تشفير','محلي','دولي',
+            'امريكي','امريكية','سعودي','سعودية','اماراتي','اماراتية',
         ])
         _missing = []
-        if not _has_amount:  _missing.append("الميزانية أو المبلغ المتاح للاستثمار")
-        if not _has_risk:    _missing.append("مستوى المخاطرة المقبول (محافظ / متوازن / عدواني)")
-        if not _has_market:  _missing.append("الأسواق المفضلة (خليجي / أمريكي / دولي / مختلط)")
+        if not _has_amount:  _missing.append("budget")
+        if not _has_risk:    _missing.append("risk_tolerance")
+        if not _has_market:  _missing.append("preferred_markets")
         if _missing:
-            _q_lines = "\n".join(f"• {m}" for m in _missing)
-            _clarify = (
-                "بالتأكيد أقدر أبني لك محفظة متكاملة! 💼\n\n"
-                "بس محتاج منك بعض المعلومات الأساسية الأول:\n\n"
-                f"{_q_lines}\n\n"
-                "كمان لو عندك:\n"
-                "• المدى الزمني للاستثمار (قصير / متوسط / طويل)\n"
-                "• هدف العائد المستهدف (اختياري)\n\n"
-                "شاركني التفاصيل دي وهبنيلك محفظة مخصوصة ليك. 🎯"
+            _is_ar = bool(_re.search(r"[\u0600-\u06FF]", message))
+            _lang_guard = (
+                "User language is Arabic. You MUST reply fully in Arabic only.\n"
+                if _is_ar else
+                "User language is English. You MUST reply fully in English only.\n"
             )
+            _gate_prompt = (
+                "Reply in the same language as the user's message. If the user wrote in Arabic, respond entirely in Arabic. If in English, respond in English.\n\n"
+                + _lang_guard + "\n"
+                "You are EisaX Portfolio Advisor. The user asked for portfolio construction/optimization, "
+                "but key inputs are missing.\n"
+                f"User message: {message}\n"
+                f"Recent context: {_hist_text[:1200]}\n"
+                f"Missing required fields: {', '.join(_missing)}\n\n"
+                "Field definitions:\n"
+                "- budget: investable amount and currency.\n"
+                "- risk_tolerance: conservative / balanced / aggressive.\n"
+                "- preferred_markets: GCC / US / International / mixed.\n\n"
+                "Also ask for optional details:\n"
+                "- investment horizon (short/medium/long)\n"
+                "- target return (optional)\n\n"
+                "Write a concise, friendly clarification message with bullet points. "
+                "Do not build a portfolio yet."
+            )
+            _clarify = (orchestrator._gemini_generate(_gate_prompt, label="PORTFOLIO_GATE") or "").strip()
+            _clarify_has_ar = bool(_re.search(r"[\u0600-\u06FF]", _clarify or ""))
+            if (not _clarify) or (_is_ar and not _clarify_has_ar):
+                if _is_ar:
+                    _clarify = (
+                        "حتى أبني لك محفظة دقيقة، أحتاج المعلومات التالية:\n"
+                        "• الميزانية والعملة\n"
+                        "• مستوى المخاطرة (محافظ/متوازن/عدواني)\n"
+                        "• الأسواق المفضلة (خليجي/أمريكي/دولي/مختلط)\n\n"
+                        "اختياريًا: المدة الزمنية وهدف العائد."
+                    )
+                else:
+                    _clarify = (
+                        "To build an accurate portfolio, please share:\n"
+                        "• Budget and currency\n"
+                        "• Risk tolerance (conservative/balanced/aggressive)\n"
+                        "• Preferred markets (GCC/US/international/mixed)\n\n"
+                        "Optional: time horizon and target return."
+                    )
             orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
             orchestrator.session_mgr.save_message(session_id, user_id, "assistant", _clarify)
             return {"reply": _clarify, "session_id": session_id, "agent_name": "EisaX Portfolio Advisor"}
@@ -561,7 +605,7 @@ async def handle_portfolio(
         }
     except Exception as exc:
         logger.warning("Portfolio handler failed: %s", exc)
-        reply_text = f"❌ خطأ في المحفظة: {exc}"
+        reply_text = "عذراً، حدث خطأ أثناء بناء المحفظة. حاول مرة أخرى."
         return {"reply": reply_text, "session_id": session_id, "agent_name": "EisaX", "model": "error"}
 
 
@@ -574,6 +618,7 @@ async def handle_general(
     message:      str,
     instruction:  str,
     user_ctx:     dict,
+    chat_history: list = None,
 ) -> dict:
     """
     Handle general questions via Gemini with Playbook + optional memory/RAG context.
@@ -651,7 +696,18 @@ async def handle_general(
             except Exception:
                 pass
 
-    full_prompt = f"{system_prompt}\n\n{memory_context}\n{rag_context}\n\nUser: {message}\n\nAssistant:"
+    # Build conversation history block (last 6 messages = 3 turns)
+    history_block = ""
+    if chat_history:
+        _hist_lines = []
+        for m in chat_history[-6:]:
+            _role = "المستخدم" if m.get("role") == "user" else "EisaX"
+            _content = (m.get("content") or "")[:300]  # cap per message
+            _hist_lines.append(f"{_role}: {_content}")
+        if _hist_lines:
+            history_block = "\n\n## سياق المحادثة السابقة:\n" + "\n".join(_hist_lines) + "\n"
+
+    full_prompt = f"{system_prompt}\n\n{memory_context}\n{rag_context}{history_block}\nUser: {message}\n\nAssistant:"
 
     if not orchestrator.gemini_client:
         reply_text = "عذراً، خدمة الذكاء الاصطناعي غير متاحة حالياً."
@@ -663,7 +719,7 @@ async def handle_general(
             )
         except Exception as exc:
             logger.error("Gemini failed: %s", exc)
-            reply_text = f"خطأ في الاتصال بـ Gemini: {exc}"
+            reply_text = "عذراً، حدث خطأ مؤقت. حاول مرة أخرى."
 
     orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
     orchestrator.session_mgr.save_message(session_id, user_id, "assistant", reply_text)
@@ -681,4 +737,3 @@ async def handle_general(
         "agent_name": "EisaX AI",
         "model":      GEMINI_MODEL,
     }
-
