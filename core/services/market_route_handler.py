@@ -265,24 +265,40 @@ def _apply_quality_filter(stocks: list[dict], screening_type: str = "dividend") 
 def _div_stability_score(s: dict) -> float:
     """Composite dividend ranking score balancing yield and stability proxies."""
     dy = _get_row_yield_pct(s)
-    mc = _to_float(s.get("market_cap_basic") or 0) / 1e9
+    mc = _to_float(s.get("market_cap_basic") or 0) / 1e9  # billions
     pe = _to_float(s.get("price_earnings_ttm") or 0)
     rsi = _to_float(s.get("RSI") or s.get("rsi") or 50)
     vol = _to_float(s.get("volume") or 0)
 
-    score = dy
-    if mc > 10:
-        score += 2
+    score = dy  # base: yield %
+
+    # Market cap bonus — much stronger weighting
+    if mc > 50:
+        score += 6    # mega cap (EMAAR, FAB, ENBD)
+    elif mc > 10:
+        score += 4    # large cap
     elif mc > 2:
+        score += 2    # mid cap
+    elif mc > 0.5:
+        score += 1    # small cap
+    # micro cap: no bonus
+
+    # P/E bonus: profitable and reasonably valued
+    if 3 < pe < 15:
+        score += 1.5
+    elif 15 <= pe < 25:
+        score += 0.5
+
+    # RSI: healthy range bonus
+    if 35 <= rsi <= 65:
+        score += 0.5
+
+    # Volume bonus: liquid
+    if vol > 5_000_000:
+        score += 1.5
+    elif vol > 1_000_000:
         score += 1
-
-    if 3 < pe < 20:
-        score += 1
-
-    if rsi < 30 or rsi > 75:
-        score -= 1
-
-    if vol > 1_000_000:
+    elif vol > 200_000:
         score += 0.5
 
     return score
@@ -349,33 +365,34 @@ def _screen_rows(
     stocks: list[dict],
     screening_type: str,
     message: str,
+    top_n: int = 10,
 ) -> tuple[list[dict], str, str]:
     filtered_stocks = _apply_quality_filter(stocks, screening_type)
 
     if screening_type == "rsi_oversold":
         rows = [s for s in filtered_stocks if 0 < _get_row_rsi(s) < 35]
         rows.sort(key=_get_row_rsi)
-        return rows[:10], "أكثر الأسهم تشبعاً بيعياً (RSI < 35)", "RSI"
+        return rows[:top_n], "أكثر الأسهم تشبعاً بيعياً (RSI < 35)", "RSI"
 
     if screening_type == "rsi_overbought":
         rows = [s for s in filtered_stocks if _get_row_rsi(s) > 65]
         rows.sort(key=_get_row_rsi, reverse=True)
-        return rows[:10], "أكثر الأسهم تشبعاً شرائياً (RSI > 65)", "RSI"
+        return rows[:top_n], "أكثر الأسهم تشبعاً شرائياً (RSI > 65)", "RSI"
 
     if screening_type == "top_gainers":
         rows = sorted(filtered_stocks, key=_get_row_change_pct, reverse=True)
-        return rows[:10], "أعلى الأسهم ارتفاعاً", "التغير %"
+        return rows[:top_n], "أعلى الأسهم ارتفاعاً", "التغير %"
 
     if screening_type == "top_losers":
         rows = sorted(filtered_stocks, key=_get_row_change_pct)
-        return rows[:10], "أعلى الأسهم انخفاضاً", "التغير %"
+        return rows[:top_n], "أعلى الأسهم انخفاضاً", "التغير %"
 
     if screening_type == "sector":
         sector_term = _extract_sector_filter(message, filtered_stocks)
         if sector_term:
             rows = [s for s in filtered_stocks if sector_term.lower() in _row_sector_text(s).lower()]
             rows.sort(key=_get_row_yield_pct, reverse=True)
-            return rows[:10], f"أفضل أسهم قطاع {sector_term}", "القطاع"
+            return rows[:top_n], f"أفضل أسهم قطاع {sector_term}", "القطاع"
 
     if screening_type == "defensive":
         rows = [
@@ -384,14 +401,14 @@ def _screen_rows(
         ]
         if rows:
             rows.sort(key=_get_row_yield_pct, reverse=True)
-            return rows[:10], "أفضل الأسهم الدفاعية", "Dividend Yield"
+            return rows[:top_n], "أفضل الأسهم الدفاعية", "Dividend Yield"
 
     rows = [s for s in filtered_stocks if _get_row_yield_pct(s) > 0]
     if screening_type == "dividend":
         rows.sort(key=_div_stability_score, reverse=True)
     else:
         rows.sort(key=_get_row_yield_pct, reverse=True)
-    return rows[:10], "أفضل أسهم التوزيعات", "Dividend Yield"
+    return rows[:top_n], "أفضل أسهم التوزيعات", "Dividend Yield"
 
 
 def _fmt_screen_metric(stock_row: dict, metric_label: str) -> str:
@@ -413,8 +430,11 @@ def _build_screening_reply(message: str, market: str | None = None, forced_type:
     if not stocks:
         return "⚠️ بيانات السوق غير متاحة حالياً — جاري التحديث\nحاول تاني خلال دقيقتين"
 
+    _num_match = _re.search(r"\b(\d+)\b", message)
+    top_n = int(_num_match.group(1)) if _num_match and 3 <= int(_num_match.group(1)) <= 20 else 10
+
     screening_type = forced_type or _detect_screening_type(message)
-    top, title, metric_label = _screen_rows(stocks, screening_type, message)
+    top, title, metric_label = _screen_rows(stocks, screening_type, message, top_n=top_n)
     if not top:
         return "⚠️ لا تتوفر نتائج كافية للفلاتر المطلوبة حالياً"
 
