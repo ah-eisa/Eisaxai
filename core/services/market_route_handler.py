@@ -218,6 +218,33 @@ def _get_row_yield_pct(stock_row: dict) -> float:
     return max(0.0, dy)
 
 
+def _get_row_payout_ratio(s: dict) -> float | None:
+    """Calculate payout ratio from available data. Returns None if not computable."""
+    try:
+        price = _to_float(s.get("close") or s.get("price") or s.get("current_price") or 0)
+        dy_pct = _get_row_yield_pct(s)
+        eps = _to_float(s.get("earnings_per_share_diluted_ttm") or s.get("eps") or 0)
+        if price > 0 and dy_pct > 0 and eps > 0:
+            dps = (dy_pct / 100) * price
+            return round((dps / eps) * 100, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _sustainability_flag(payout: float | None) -> str:
+    """Return emoji sustainability indicator based on payout ratio."""
+    if payout is None:
+        return "—"
+    if payout <= 50:
+        return "🟢"
+    if payout <= 70:
+        return "🟡"
+    if payout <= 90:
+        return "🟠"
+    return "🔴"
+
+
 def _fmt_num(value: Any, digits: int = 2, fallback: str = "—") -> str:
     num = _to_float(value, default=float("nan"))
     if num != num:  # NaN
@@ -300,6 +327,20 @@ def _div_stability_score(s: dict) -> float:
         score += 1
     elif vol > 200_000:
         score += 0.5
+
+    # Payout ratio — most important for sustainability
+    payout = _get_row_payout_ratio(s)
+    if payout is not None:
+        if payout <= 40:
+            score += 4
+        elif payout <= 60:
+            score += 2
+        elif payout <= 80:
+            score += 0
+        elif payout <= 100:
+            score -= 3
+        else:
+            score -= 6
 
     return score
 
@@ -443,20 +484,35 @@ def _build_screening_reply(message: str, market: str | None = None, forced_type:
     age_min = _resolve_cache_age_minutes(cache_age_min, snapshot_ts, stocks)
     ts_text = _fmt_snapshot_ts(snapshot_ts, stocks)
 
-    rows = [
-        f"| # | الشركة | الرمز | السعر | {metric_label} | P/E | RSI |",
-        "|---|--------|-------|-------|----------|-----|-----|",
-    ]
+    if screening_type == "dividend":
+        rows = [
+            "| # | الشركة | الرمز | السعر | Div Yield | Payout | P/E | الاستدامة |",
+            "|---|--------|-------|-------|-----------|--------|-----|-----------|",
+        ]
+    else:
+        rows = [
+            f"| # | الشركة | الرمز | السعر | {metric_label} | P/E | RSI |",
+            "|---|--------|-------|-------|----------|-----|-----|",
+        ]
     for i, s in enumerate(top, 1):
         ticker = str(s.get("ticker") or "").strip()
         name = s.get("name") or (ticker.split(":", 1)[-1] if ticker else "N/A")
         price = _to_float(s.get("price") or s.get("current_price") or s.get("close") or 0, 0.0)
-        metric_val = _fmt_screen_metric(s, metric_label)
         pe = _fmt_num(s.get("price_earnings_ttm") or s.get("pe_ratio") or s.get("pe") or s.get("forwardPE"), 2)
-        rsi = _fmt_num(_get_row_rsi(s), 1)
-        rows.append(
-            f"| {i} | {name} | {ticker or '—'} | {currency}{price:,.2f} | {metric_val} | {pe} | {rsi} |"
-        )
+        if screening_type == "dividend":
+            dy_pct = _get_row_yield_pct(s)
+            payout = _get_row_payout_ratio(s)
+            sustain = _sustainability_flag(payout)
+            payout_str = f"{payout:.0f}%" if payout is not None else "—"
+            rows.append(
+                f"| {i} | {name} | {ticker or '—'} | {currency}{price:,.2f} | {dy_pct:.2f}% | {payout_str} | {pe} | {sustain} |"
+            )
+        else:
+            metric_val = _fmt_screen_metric(s, metric_label)
+            rsi = _fmt_num(_get_row_rsi(s), 1)
+            rows.append(
+                f"| {i} | {name} | {ticker or '—'} | {currency}{price:,.2f} | {metric_val} | {pe} | {rsi} |"
+            )
 
     table = "\n".join(rows)
     return (
