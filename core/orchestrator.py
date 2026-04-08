@@ -582,14 +582,15 @@ Ticker:"""
                 return "GENERAL", "GENERAL", message, ""
             text = re.sub(r"```json|```", "", raw).strip()
             # Valid route + handler values
-            _VALID_ROUTES   = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY", "CRYPTO", "MACRO", "BOND"}
-            _VALID_HANDLERS = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "GENERAL", "CLARIFY",
+            _VALID_ROUTES   = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "SCREENER", "GENERAL", "CLARIFY", "CRYPTO", "MACRO", "BOND"}
+            _VALID_HANDLERS = {"STOCK_ANALYSIS", "FINANCIAL", "PORTFOLIO", "SCREENER", "GENERAL", "CLARIFY",
                                "CIO_ANALYSIS", "PORTFOLIO_OPTIMIZE", "BOND", "DFM", "CRYPTO", "MACRO"}
             # Route→handler default mapping when handler is missing or invalid
             _ROUTE_HANDLER_MAP = {
                 "STOCK_ANALYSIS": "STOCK_ANALYSIS",
                 "FINANCIAL":      "CIO_ANALYSIS",
                 "PORTFOLIO":      "PORTFOLIO_OPTIMIZE",
+                "SCREENER":       "SCREENER",
                 "BOND":           "BOND",
                 "CRYPTO":         "STOCK_ANALYSIS",
                 "MACRO":          "GENERAL",
@@ -887,6 +888,7 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
         from core.services.market_route_handler import (
             handle_stock_analysis as _handle_stock,
             handle_financial      as _handle_financial,
+            handle_screening      as _handle_screening,
             handle_portfolio      as _handle_portfolio,
             handle_general        as _handle_general,
         )
@@ -915,6 +917,7 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     gemini_model=GEMINI_MODEL,
                     gemini_api_key=GEMINI_API_KEY,
                     user_id=user_id,
+                    session_id=session_id,
                 )
                 self.session_mgr.save_message(session_id, user_id, "user", message[:500])
                 self.session_mgr.save_message(session_id, user_id, "assistant", reply)
@@ -1069,6 +1072,19 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     logger.warning("[DFM handler] failed: %s", _dfm_e)
 
             # ── 8. Route handlers ──────────────────────────────────────────────
+            if route == "SCREENER" or handler == "SCREENER":
+                return await _handle_screening(
+                    message=message,
+                    session_id=session_id,
+                    user_id=user_id,
+                    orchestrator=self,
+                    instruction=instruction,
+                    user_ctx=_user_ctx,
+                    chat_history=_recent_history,
+                    route=route,
+                    handler=handler,
+                )
+
             if route == "STOCK_ANALYSIS":
                 return await _handle_stock(self, session_id, user_id, message, instruction, _user_ctx)
 

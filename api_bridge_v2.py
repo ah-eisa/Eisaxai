@@ -1853,6 +1853,16 @@ async def unified_chat(
     if orchestrator.session_mgr.is_ip_blocked(client_ip):
         raise HTTPException(status_code=403, detail="Access denied from this network.")
 
+    from core.rate_limiter import is_rate_limited, get_usage
+    if is_rate_limited(payload.user_id):
+        usage = get_usage(payload.user_id)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {usage['count']}/{usage['limit']} requests per minute. "
+                   f"Reset in {usage['reset_in']:.0f}s.",
+            headers={"Retry-After": str(int(usage["reset_in"]))},
+        )
+
     session_id = payload.session_id or orchestrator.session_mgr.get_or_create_session(
         payload.user_id, ip=client_ip, user_agent=user_agent
     )

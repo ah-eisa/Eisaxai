@@ -322,6 +322,7 @@ def handle_file_analysis(
     gemini_model:    str = "gemini-2.0-flash",
     gemini_api_key:  str = "",
     user_id:         str = "anonymous",
+    session_id:      str = "default",
 ) -> tuple[str, str]:
     """
     Route a [FILE ANALYSIS] message:
@@ -359,7 +360,7 @@ def handle_file_analysis(
 
     if is_portfolio_file and financial_agent:
         try:
-            result = financial_agent._handle_cio_analysis(message)
+            result = financial_agent._handle_cio_analysis(message, session_id)
             reply  = result.get("reply") or None
             if reply:
                 logger.info("[File→CIO] Shares/cost portfolio → CIO analysis")
