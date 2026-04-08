@@ -233,6 +233,61 @@ def _get_row_change_pct(stock_row: dict) -> float:
     return _to_float(stock_row.get("change") or stock_row.get("change_percent") or stock_row.get("chg"), 0.0)
 
 
+def _apply_quality_filter(stocks: list[dict], screening_type: str = "dividend") -> list[dict]:
+    """Remove anomalous/illiquid stocks before ranking."""
+    out: list[dict] = []
+    for s in stocks:
+        # Skip zero/near-zero volume rows (likely stale, halted, or anomalous).
+        vol = _to_float(s.get("volume") or 0)
+        if vol < 50_000:
+            continue
+
+        # Filter clear RSI outliers that are usually data quality issues.
+        rsi = _to_float(s.get("RSI") or s.get("rsi") or 50)
+        if rsi >= 99 or rsi <= 5:
+            continue
+
+        # Unrealistically high dividend yields are often anomalies/special events.
+        if screening_type == "dividend":
+            dy = _get_row_yield_pct(s)
+            if dy > 25:
+                continue
+
+        # Drop micro-caps if market cap exists and is too small for liquid screening.
+        mc = _to_float(s.get("market_cap_basic") or 0)
+        if mc > 0 and mc < 200_000_000:
+            continue
+
+        out.append(s)
+    return out
+
+
+def _div_stability_score(s: dict) -> float:
+    """Composite dividend ranking score balancing yield and stability proxies."""
+    dy = _get_row_yield_pct(s)
+    mc = _to_float(s.get("market_cap_basic") or 0) / 1e9
+    pe = _to_float(s.get("price_earnings_ttm") or 0)
+    rsi = _to_float(s.get("RSI") or s.get("rsi") or 50)
+    vol = _to_float(s.get("volume") or 0)
+
+    score = dy
+    if mc > 10:
+        score += 2
+    elif mc > 2:
+        score += 1
+
+    if 3 < pe < 20:
+        score += 1
+
+    if rsi < 30 or rsi > 75:
+        score -= 1
+
+    if vol > 1_000_000:
+        score += 0.5
+
+    return score
+
+
 _SECTOR_ALIAS_HINTS = {
     "banks": ["bank", "banks", "بنك", "بنوك", "مصرف", "مصارف"],
     "real estate": ["real estate", "realestate", "عقار", "عقاري"],
@@ -295,42 +350,47 @@ def _screen_rows(
     screening_type: str,
     message: str,
 ) -> tuple[list[dict], str, str]:
+    filtered_stocks = _apply_quality_filter(stocks, screening_type)
+
     if screening_type == "rsi_oversold":
-        rows = [s for s in stocks if 0 < _get_row_rsi(s) < 35]
+        rows = [s for s in filtered_stocks if 0 < _get_row_rsi(s) < 35]
         rows.sort(key=_get_row_rsi)
         return rows[:10], "أكثر الأسهم تشبعاً بيعياً (RSI < 35)", "RSI"
 
     if screening_type == "rsi_overbought":
-        rows = [s for s in stocks if _get_row_rsi(s) > 65]
+        rows = [s for s in filtered_stocks if _get_row_rsi(s) > 65]
         rows.sort(key=_get_row_rsi, reverse=True)
         return rows[:10], "أكثر الأسهم تشبعاً شرائياً (RSI > 65)", "RSI"
 
     if screening_type == "top_gainers":
-        rows = sorted(stocks, key=_get_row_change_pct, reverse=True)
+        rows = sorted(filtered_stocks, key=_get_row_change_pct, reverse=True)
         return rows[:10], "أعلى الأسهم ارتفاعاً", "التغير %"
 
     if screening_type == "top_losers":
-        rows = sorted(stocks, key=_get_row_change_pct)
+        rows = sorted(filtered_stocks, key=_get_row_change_pct)
         return rows[:10], "أعلى الأسهم انخفاضاً", "التغير %"
 
     if screening_type == "sector":
-        sector_term = _extract_sector_filter(message, stocks)
+        sector_term = _extract_sector_filter(message, filtered_stocks)
         if sector_term:
-            rows = [s for s in stocks if sector_term.lower() in _row_sector_text(s).lower()]
+            rows = [s for s in filtered_stocks if sector_term.lower() in _row_sector_text(s).lower()]
             rows.sort(key=_get_row_yield_pct, reverse=True)
             return rows[:10], f"أفضل أسهم قطاع {sector_term}", "القطاع"
 
     if screening_type == "defensive":
         rows = [
-            s for s in stocks
+            s for s in filtered_stocks
             if any(h in _row_sector_text(s).lower() for h in _DEFENSIVE_SECTOR_HINTS)
         ]
         if rows:
             rows.sort(key=_get_row_yield_pct, reverse=True)
             return rows[:10], "أفضل الأسهم الدفاعية", "Dividend Yield"
 
-    rows = [s for s in stocks if _get_row_yield_pct(s) > 0]
-    rows.sort(key=_get_row_yield_pct, reverse=True)
+    rows = [s for s in filtered_stocks if _get_row_yield_pct(s) > 0]
+    if screening_type == "dividend":
+        rows.sort(key=_div_stability_score, reverse=True)
+    else:
+        rows.sort(key=_get_row_yield_pct, reverse=True)
     return rows[:10], "أفضل أسهم التوزيعات", "Dividend Yield"
 
 
