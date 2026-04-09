@@ -48,6 +48,21 @@ app = FastAPI(title="InvestWise & EisaX AI Gateway", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ── Request body size guard (prevent >4 MB payloads from crashing workers) ──
+_MAX_BODY_BYTES = 4 * 1024 * 1024  # 4 MB
+
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_BODY_BYTES:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large (max 4 MB)"},
+            )
+    return await call_next(request)
+
 static_dir = str(STATIC_DIR)
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -189,7 +204,8 @@ async def root():
     return RedirectResponse(url="https://eisax.com", status_code=301)
 
 @app.get("/v1/chart-data")
-async def chart_data(ticker: str = "NVDA", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("30/minute")
+async def chart_data(request: Request, ticker: str = "NVDA", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     import yfinance as yf
@@ -1593,7 +1609,9 @@ CRITICAL:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/v1/portfolio/history/{user_id}")
+@limiter.limit("30/minute")
 async def portfolio_history(
+    request: Request,
     user_id: str,
     limit: int = 20,
     access_token: str = Header(None, alias="X-API-Key"),
@@ -1620,7 +1638,9 @@ async def portfolio_history(
 
 
 @app.get("/v1/portfolio/snapshot/{snapshot_id}")
+@limiter.limit("30/minute")
 async def get_portfolio_snapshot(
+    request: Request,
     snapshot_id: str,
     access_token: str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
@@ -1644,7 +1664,9 @@ async def get_portfolio_snapshot(
 
 
 @app.get("/v1/portfolio/compare")
+@limiter.limit("20/minute")
 async def compare_portfolio_snapshots(
+    request: Request,
     snap_a: str,
     snap_b: str,
     access_token: str = Header(None, alias="X-API-Key"),
@@ -1699,6 +1721,7 @@ async def compare_portfolio_snapshots(
 
 
 @app.post("/v1/global-allocate")
+@limiter.limit("5/minute")
 async def global_allocate(
     request: Request,
     access_token: str = Header(None, alias="X-API-Key"),
@@ -1749,7 +1772,9 @@ async def global_allocate(
 
 
 @app.get("/v1/global-allocate/profiles")
+@limiter.limit("60/minute")
 async def global_allocate_profiles(
+    request: Request,
     access_token: str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
 ):
@@ -1774,7 +1799,9 @@ async def global_allocate_profiles(
 
 
 @app.get("/v1/portfolio/performance/{user_id}")
+@limiter.limit("30/minute")
 async def portfolio_performance_chart(
+    request: Request,
     user_id: str,
     access_token: str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
@@ -1827,7 +1854,8 @@ async def upload_file_ui(request: Request, file: UploadFile = File(...), access_
     return {"status": "received", "file_id": file_id, "filename": file.filename}
 
 @app.get("/health")
-async def health(access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("30/minute")
+async def health(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     import psutil, time
@@ -2067,11 +2095,12 @@ class TTSRequest(BaseModel):
     language: str = "en"
 
 @app.post("/v1/tts")
-async def text_to_speech(request: TTSRequest, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("20/minute")
+async def text_to_speech(request: Request, tts_body: TTSRequest, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        audio_bytes = tts_service.generate_speech(request.text, request.language)
+        audio_bytes = tts_service.generate_speech(tts_body.text, tts_body.language)
         return StreamingResponse(
             io.BytesIO(audio_bytes),
             media_type="audio/mpeg",
@@ -2093,7 +2122,8 @@ def _check_admin(token: str):
         raise HTTPException(status_code=403, detail="Forbidden")
 
 @app.get("/admin/sessions")
-async def admin_sessions(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def admin_sessions(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     from collections import defaultdict
     sessions = orchestrator.session_mgr.get_all_sessions_admin()
@@ -2124,31 +2154,36 @@ async def admin_sessions(access_token: str = Header(None, alias="X-Admin-Key")):
     return result
 
 @app.get("/admin/session/{session_id}")
-async def admin_session_detail(session_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("60/minute")
+async def admin_session_detail(request: Request, session_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     return orchestrator.session_mgr.get_chat_history(session_id)
 
 @app.get("/admin/stats")
-async def admin_stats(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def admin_stats(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     return orchestrator.session_mgr.get_admin_stats()
 
 @app.post("/admin/user/{user_id}/block")
-async def block_user(user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def block_user(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     orchestrator.session_mgr.set_user_blocked(user_id, True)
     orchestrator.session_mgr.log_admin_action("block_user", user_id)
     return {"status": "blocked", "user_id": user_id}
 
 @app.post("/admin/user/{user_id}/unblock")
-async def unblock_user(user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def unblock_user(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     orchestrator.session_mgr.set_user_blocked(user_id, False)
     orchestrator.session_mgr.log_admin_action("unblock_user", user_id)
     return {"status": "unblocked", "user_id": user_id}
 
 @app.post("/admin/user/{user_id}/message")
-async def send_admin_message(user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("20/minute")
+async def send_admin_message(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     content = body.get("content", "").strip()
     if not content:
@@ -2158,12 +2193,14 @@ async def send_admin_message(user_id: str, body: dict, access_token: str = Heade
     return {"status": "queued", "user_id": user_id}
 
 @app.get("/admin/messages")
-async def get_admin_messages(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def get_admin_messages(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     return orchestrator.session_mgr.get_admin_message_history()
 
 @app.post("/admin/settings/password")
-async def change_admin_password(body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("5/minute")
+async def change_admin_password(request: Request, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     new_password = body.get("new_password", "").strip()
     if len(new_password) < 8:
@@ -2172,7 +2209,8 @@ async def change_admin_password(body: dict, access_token: str = Header(None, ali
     return {"status": "password updated"}
 
 @app.post("/admin/user/{user_id}/limit")
-async def set_user_limit(user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def set_user_limit(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     daily_limit = int(body.get("daily_limit", 0))
     if daily_limit < 0:
@@ -2182,7 +2220,8 @@ async def set_user_limit(user_id: str, body: dict, access_token: str = Header(No
     return {"status": "ok", "user_id": user_id, "daily_limit": daily_limit}
 
 @app.post("/admin/user/{user_id}/note")
-async def set_user_note(user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def set_user_note(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     note = body.get("note", "")
     orchestrator.session_mgr.set_user_profile(user_id, note=note)
@@ -2190,7 +2229,8 @@ async def set_user_note(user_id: str, body: dict, access_token: str = Header(Non
     return {"status": "ok", "user_id": user_id}
 
 @app.post("/admin/user/{user_id}/tier")
-async def set_user_tier(user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def set_user_tier(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     tier = body.get("tier", "basic")
     if tier not in ("basic", "pro", "vip"):
@@ -2200,7 +2240,8 @@ async def set_user_tier(user_id: str, body: dict, access_token: str = Header(Non
     return {"status": "ok", "user_id": user_id, "tier": tier}
 
 @app.post("/admin/broadcast")
-async def broadcast_message(body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("5/minute")
+async def broadcast_message(request: Request, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     content = body.get("content", "").strip()
     if not content:
@@ -2210,14 +2251,16 @@ async def broadcast_message(body: dict, access_token: str = Header(None, alias="
     return {"status": "broadcast", "recipients": count}
 
 @app.delete("/admin/user/{user_id}/sessions")
-async def delete_user_sessions(user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def delete_user_sessions(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     count = orchestrator.session_mgr.delete_user_sessions(user_id)
     orchestrator.session_mgr.log_admin_action("delete_sessions", user_id, f"{count} sessions deleted")
     return {"status": "deleted", "user_id": user_id, "sessions_deleted": count}
 
 @app.post("/admin/ip/{ip}/block")
-async def block_ip_endpoint(ip: str, body: dict = {}, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def block_ip_endpoint(request: Request, ip: str, body: dict = {}, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     reason = (body or {}).get("reason", "")
     orchestrator.session_mgr.block_ip(ip, reason)
@@ -2225,24 +2268,28 @@ async def block_ip_endpoint(ip: str, body: dict = {}, access_token: str = Header
     return {"status": "blocked", "ip": ip}
 
 @app.post("/admin/ip/{ip}/unblock")
-async def unblock_ip_endpoint(ip: str, access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def unblock_ip_endpoint(request: Request, ip: str, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     orchestrator.session_mgr.unblock_ip(ip)
     orchestrator.session_mgr.log_admin_action("unblock_ip", ip)
     return {"status": "unblocked", "ip": ip}
 
 @app.get("/admin/blocked-ips")
-async def get_blocked_ips(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def get_blocked_ips(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     return orchestrator.session_mgr.get_blocked_ips()
 
 @app.get("/admin/audit-log")
-async def get_audit_log(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("30/minute")
+async def get_audit_log(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     return orchestrator.session_mgr.get_audit_log()
 
 @app.get("/admin/notifications")
-async def get_notifications(since: str = "", access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("60/minute")
+async def get_notifications(request: Request, since: str = "", access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     if not since:
         from datetime import datetime, timedelta, timezone
@@ -2250,7 +2297,8 @@ async def get_notifications(since: str = "", access_token: str = Header(None, al
     return orchestrator.session_mgr.get_new_activity(since)
 
 @app.get("/admin/export/users")
-async def export_users(access_token: str = Header(None, alias="X-Admin-Key")):
+@limiter.limit("10/minute")
+async def export_users(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     from fastapi.responses import StreamingResponse as SR
     import csv
     _check_admin(access_token)
@@ -2284,25 +2332,29 @@ async def export_users(access_token: str = Header(None, alias="X-Admin-Key")):
 # --- New History Endpoints ---
 
 @app.get("/api/history")
-async def get_history(user_id: Optional[str] = "admin", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("60/minute")
+async def get_history(request: Request, user_id: Optional[str] = "admin", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     return orchestrator.session_mgr.get_user_sessions(user_id)
 
 @app.get("/api/history/{session_id}")
-async def get_session_history(session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("60/minute")
+async def get_session_history(request: Request, session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     return orchestrator.session_mgr.get_chat_history(session_id)
 
 @app.delete("/api/history/{session_id}")
-async def delete_session(session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+@limiter.limit("20/minute")
+async def delete_session(request: Request, session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     orchestrator.session_mgr.delete_session(session_id)
     return {"status": "deleted", "session_id": session_id}
 
 @app.post("/v1/export")
+@limiter.limit("10/minute")
 async def export_chat(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
     import re, shutil
     try:
@@ -2419,7 +2471,8 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/download/{filename}")
-async def download_file(filename: str):
+@limiter.limit("60/minute")
+async def download_file(request: Request, filename: str):
     """Download exported file — public endpoint so browser links work directly."""
     import re as _re
     from fastapi.responses import FileResponse
@@ -2437,14 +2490,16 @@ async def download_file(filename: str):
     return FileResponse(file_path, filename=filename)
 
 @app.get("/v1/brain/status")
-async def brain_status(access_token: str = Header(None, alias="X-API-Key")):
+@limiter.limit("30/minute")
+async def brain_status(request: Request, access_token: str = Header(None, alias="X-API-Key")):
     if access_token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     from learning_engine import get_engine
     return get_engine().status()
 
 @app.get("/v1/brain/wisdom")
-async def brain_wisdom(access_token: str = Header(None, alias="X-API-Key")):
+@limiter.limit("20/minute")
+async def brain_wisdom(request: Request, access_token: str = Header(None, alias="X-API-Key")):
     if access_token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     from learning_engine import get_engine
@@ -2475,7 +2530,9 @@ class HtmlExportPayload(BaseModel):
     access_token: str = ""
 
 @app.post("/v1/export/html")
+@limiter.limit("10/minute")
 async def export_html_to_pdf(
+    request: Request,
     payload: HtmlExportPayload,
     access_token: str = Header(None, alias="X-API-Key")
 ):
@@ -2497,7 +2554,8 @@ async def export_html_to_pdf(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/dashboard/{ticker}")
-async def dashboard(ticker: str, access_token: str = Header(None, alias="X-API-Key")):
+@limiter.limit("20/minute")
+async def dashboard(request: Request, ticker: str, access_token: str = Header(None, alias="X-API-Key")):
     """Return all dashboard data for a ticker in one call — no LLM, runs concurrently."""
     if access_token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -2708,7 +2766,8 @@ class TranslatePayload(BaseModel):
     access_token: str = ""
 
 @app.post("/v1/translate-ar")
-async def translate_to_arabic(payload: TranslatePayload, access_token: str = Header(None, alias="X-API-Key")):
+@limiter.limit("20/minute")
+async def translate_to_arabic(request: Request, payload: TranslatePayload, access_token: str = Header(None, alias="X-API-Key")):
     """Translate an English investment report to Arabic. Primary: DeepSeek. Fallback: GLM."""
     token = access_token or payload.access_token
     if token != SECURE_TOKEN:
@@ -2788,7 +2847,8 @@ async def translate_to_arabic(payload: TranslatePayload, access_token: str = Hea
 
 
 @app.post("/v1/export/html-pdf")
-async def export_html_pdf(payload: HtmlExportPayload, access_token: str = Header(None, alias="X-API-Key")):
+@limiter.limit("5/minute")
+async def export_html_pdf(request: Request, payload: HtmlExportPayload, access_token: str = Header(None, alias="X-API-Key")):
     token = access_token or payload.access_token
     if token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
@@ -2861,7 +2921,8 @@ class UpdateUserRequest(BaseModel):
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 @app.post("/auth/login")
-async def auth_login(body: LoginRequest):
+@limiter.limit("10/minute")
+async def auth_login(request: Request, body: LoginRequest):
     user = get_user_by_email(body.email)
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -2882,7 +2943,8 @@ async def auth_login(body: LoginRequest):
 
 
 @app.post("/auth/change-password")
-async def auth_change_password(body: ChangePasswordRequest, payload: dict = Depends(_require_jwt)):
+@limiter.limit("5/minute")
+async def auth_change_password(request: Request, body: ChangePasswordRequest, payload: dict = Depends(_require_jwt)):
     user = get_user_by_id(int(payload["sub"]))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2896,7 +2958,8 @@ async def auth_change_password(body: ChangePasswordRequest, payload: dict = Depe
 
 
 @app.get("/auth/me")
-async def auth_me(payload: dict = Depends(_require_jwt)):
+@limiter.limit("60/minute")
+async def auth_me(request: Request, payload: dict = Depends(_require_jwt)):
     user = get_user_by_id(int(payload["sub"]))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2910,7 +2973,8 @@ async def auth_me(payload: dict = Depends(_require_jwt)):
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────
 @app.post("/admin/users")
-async def admin_create_user(body: CreateUserRequest, _: dict = Depends(_require_admin)):
+@limiter.limit("10/minute")
+async def admin_create_user(request: Request, body: CreateUserRequest, _: dict = Depends(_require_admin)):
     if get_user_by_email(body.email):
         raise HTTPException(status_code=409, detail="Email already exists")
     temp_pw = generate_temp_password()
@@ -2925,12 +2989,14 @@ async def admin_create_user(body: CreateUserRequest, _: dict = Depends(_require_
 
 
 @app.get("/admin/users")
-async def admin_list_users(_: dict = Depends(_require_admin)):
+@limiter.limit("30/minute")
+async def admin_list_users(request: Request, _: dict = Depends(_require_admin)):
     return list_users()
 
 
 @app.patch("/admin/users/{user_id}")
-async def admin_update_user(user_id: int, body: UpdateUserRequest, _: dict = Depends(_require_admin)):
+@limiter.limit("20/minute")
+async def admin_update_user(request: Request, user_id: int, body: UpdateUserRequest, _: dict = Depends(_require_admin)):
     changes = {k: v for k, v in body.model_dump().items() if v is not None}
     if not update_user(user_id, **changes):
         raise HTTPException(status_code=404, detail="User not found")
@@ -2938,14 +3004,16 @@ async def admin_update_user(user_id: int, body: UpdateUserRequest, _: dict = Dep
 
 
 @app.delete("/admin/users/{user_id}")
-async def admin_delete_user(user_id: int, _: dict = Depends(_require_admin)):
+@limiter.limit("10/minute")
+async def admin_delete_user(request: Request, user_id: int, _: dict = Depends(_require_admin)):
     if not delete_user(user_id):
         raise HTTPException(status_code=404, detail="User not found")
     return {"ok": True}
 
 
 @app.post("/admin/users/{user_id}/reset-password")
-async def admin_reset_password(user_id: int, _: dict = Depends(_require_admin)):
+@limiter.limit("10/minute")
+async def admin_reset_password(request: Request, user_id: int, _: dict = Depends(_require_admin)):
     user = get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -2957,7 +3025,9 @@ async def admin_reset_password(user_id: int, _: dict = Depends(_require_admin)):
 # ── Health Check ──────────────────────────────────────────────────────────────
 
 @app.get("/v1/health")
+@limiter.limit("30/minute")
 async def health_check(
+    request: Request,
     access_token:     str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
 ):
@@ -2974,7 +3044,9 @@ async def health_check(
 # ── Session Cleanup ───────────────────────────────────────────────────────────
 
 @app.post("/admin/cleanup")
+@limiter.limit("5/minute")
 async def run_cleanup(
+    request: Request,
     days: int = 30,
     access_token: str = Header(None, alias="X-Admin-Key"),
 ):
@@ -2986,7 +3058,9 @@ async def run_cleanup(
 # ── Logging Dashboard ─────────────────────────────────────────────────────────
 
 @app.get("/admin/logs")
+@limiter.limit("30/minute")
 async def admin_logs_page(
+    request: Request,
     access_token:     str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
 ):
@@ -2998,7 +3072,8 @@ async def admin_logs_page(
 
 
 @app.get("/admin/logs/stream")
-async def admin_logs_stream(token: str = "", request: Request = None):
+@limiter.limit("10/minute")
+async def admin_logs_stream(request: Request, token: str = ""):
     if token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
     from fastapi.responses import StreamingResponse
