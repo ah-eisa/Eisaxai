@@ -24,9 +24,23 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Module-level start time – used to compute process uptime
+# Module-level start time – fallback for environments without psutil
 # ---------------------------------------------------------------------------
 _START_TIME: float = time.monotonic()
+
+# ---------------------------------------------------------------------------
+# Version – read once at import time from version.txt if available
+# ---------------------------------------------------------------------------
+_VERSION_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "version.txt")
+
+def _read_version() -> str:
+    try:
+        with open(_VERSION_FILE, "r") as fh:
+            return fh.read().strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+_VERSION: str = _read_version()
 
 # ---------------------------------------------------------------------------
 # Type alias for a single service result
@@ -223,6 +237,69 @@ async def _check_memory() -> ServiceResult:
         return _degraded(f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000)
 
 
+# ── LLM Fallback Chain Stats ──────────────────────────────────────────────────
+
+def _get_llm_fallback_stats() -> dict:
+    """
+    Query the llm_fallback module for provider health status.
+
+    Returns a dict with kimi/deepseek availability and circuit-breaker
+    failure counts, plus response-cache stats.  Never raises.
+    """
+    try:
+        from core.llm_fallback import get_llm_health  # local import – avoid circular deps
+        return get_llm_health()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ── Worker uptime ─────────────────────────────────────────────────────────────
+
+def _get_worker_uptime() -> float:
+    """
+    Return the number of seconds the current gunicorn worker process has been
+    running, derived from the OS process creation time via psutil.
+
+    Falls back to the module-level monotonic clock (_START_TIME) when psutil
+    is unavailable.
+    """
+    try:
+        import psutil
+        create_time = psutil.Process(os.getpid()).create_time()
+        return round(time.time() - create_time, 3)
+    except Exception:
+        # psutil unavailable – use the module import time as approximation
+        return round(time.monotonic() - _START_TIME, 3)
+
+
+# ── Last analysis timestamp ───────────────────────────────────────────────────
+
+def _get_last_analysis_at() -> str | None:
+    """
+    Return the ISO-8601 UTC timestamp of the most recent chat message stored
+    in the sessions DB, or None if the table is empty or the query fails.
+    """
+    try:
+        from core.session_manager import SessionManager  # local import
+        sm = SessionManager()
+        from core.db import db
+        with db.get_cursor() as (conn, c):
+            c.execute("SELECT MAX(timestamp) FROM chat_history")
+            row = c.fetchone()
+        if row and row[0]:
+            raw = row[0]
+            # SQLite stores timestamps as strings; normalise to ISO-8601 UTC
+            if isinstance(raw, str) and raw:
+                # Append Z if no timezone designator present
+                if raw.endswith("Z") or "+" in raw or (raw.count("-") > 2):
+                    return raw
+                return raw + "Z"
+            return str(raw)
+        return None
+    except Exception as exc:
+        return None  # silently degrade – health check must not raise
+
+
 # ---------------------------------------------------------------------------
 # Overall status aggregation
 # ---------------------------------------------------------------------------
@@ -310,10 +387,33 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
 
     overall_status, summary = _aggregate_status(services)
 
+    # ── New extended fields (each wrapped defensively) ────────────────────
+    llm_providers: dict = {}
+    try:
+        llm_providers = _get_llm_fallback_stats()
+    except Exception as exc:
+        llm_providers = {"error": f"{type(exc).__name__}: {exc}"}
+
+    worker_uptime: float = 0.0
+    try:
+        worker_uptime = _get_worker_uptime()
+    except Exception:
+        worker_uptime = round(time.monotonic() - _START_TIME, 3)
+
+    last_analysis_at: str | None = None
+    try:
+        last_analysis_at = _get_last_analysis_at()
+    except Exception:
+        last_analysis_at = None
+
     return {
         "status": overall_status,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         "uptime_seconds": round(time.monotonic() - _START_TIME, 3),
+        "worker_uptime_seconds": worker_uptime,
+        "version": _VERSION,
+        "last_analysis_at": last_analysis_at,
+        "llm_providers": llm_providers,
         "services": services,
         "summary": summary,
     }
