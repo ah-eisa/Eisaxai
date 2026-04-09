@@ -363,10 +363,32 @@ class MultiAgentOrchestrator:
                             GEMINI_MODEL_BACKUP, f" [{label}]" if label else "")
                 return (resp.text or "").strip()
             except Exception as e2:
-                logger.error("[Gemini] Backup (%s) also failed%s: %s",
+                logger.error("[Gemini] Backup (%s) also failed%s: %s — escalating to fallback chain",
                              GEMINI_MODEL_BACKUP, f" [{label}]" if label else "", e2)
-                raise
-        raise RuntimeError(f"No Gemini backup available for [{label}]")
+
+        # ── ATTEMPT 3: Kimi → DeepSeek → Cache → Static fallback chain ──
+        # Reached when both Gemini primary and backup are exhausted (e.g. 429 quota).
+        try:
+            from core.llm_fallback import generate_with_fallback_sync
+            fb_response = generate_with_fallback_sync(
+                contents,
+                system="You are a professional financial analyst assistant.",
+            )
+            if fb_response.success and fb_response.content:
+                logger.info(
+                    "[LLMFallback] fallback chain succeeded via provider=%s%s",
+                    fb_response.provider, f" [{label}]" if label else "",
+                )
+            else:
+                logger.warning(
+                    "[LLMFallback] all providers exhausted%s — returning static message",
+                    f" [{label}]" if label else "",
+                )
+            return fb_response.content.strip()
+        except Exception as e_chain:
+            logger.error("[LLMFallback] fallback chain raised unexpectedly%s: %s",
+                         f" [{label}]" if label else "", e_chain)
+            raise RuntimeError(f"All LLM providers exhausted [{label}]") from e_chain
 
     def _maestro_route_generate(self, prompt: str) -> str:
         """Primary router: Kimi maestro, then DeepSeek, then Gemini fallback."""

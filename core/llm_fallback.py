@@ -407,6 +407,76 @@ async def generate_with_fallback(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Synchronous Fallback Chain (safe to call from sync contexts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_with_fallback_sync(
+    prompt: str,
+    system: str = "",
+    preferred_provider: str = "kimi",
+    **kwargs,
+) -> LLMResponse:
+    """
+    Synchronous fallback chain: Kimi → DeepSeek → Cache → Static.
+
+    Identical logic to ``generate_with_fallback`` but fully synchronous,
+    safe to call from any sync context (e.g. gunicorn worker threads,
+    ``_gemini_generate`` inside the orchestrator).
+
+    Args:
+        prompt: Prompt / message content.
+        system: Optional system prompt.
+        preferred_provider: First provider to attempt (default ``"kimi"``).
+        **kwargs: Extra args forwarded to client.generate() (temperature, max_tokens, …).
+
+    Returns:
+        LLMResponse — always returns, never raises.
+    """
+    logger.info("generate_with_fallback_sync (preferred: %s)", preferred_provider)
+
+    # 1. Cache first
+    cached = _get_cached_response(prompt)
+    if cached:
+        return LLMResponse(content=cached, provider="cache", success=True, cached=True)
+
+    # 2. Kimi
+    kimi = get_kimi_client()
+    if kimi.is_available():
+        result = kimi.generate(prompt, system, **kwargs)
+        if result.success:
+            _cache_response(prompt, result.content)
+            return result
+        logger.warning("Kimi failed: %s — trying DeepSeek", result.error)
+
+    # 3. DeepSeek
+    deepseek = get_deepseek_client()
+    if deepseek.is_available():
+        result = deepseek.generate(prompt, system, **kwargs)
+        if result.success:
+            _cache_response(prompt, result.content)
+            return result
+        logger.warning("DeepSeek failed: %s — trying cache", result.error)
+
+    # 4. Cache as last resort
+    cached = _get_cached_response(prompt)
+    if cached:
+        return LLMResponse(content=cached, provider="cache", success=True, cached=True)
+
+    # 5. Static fallback — never raises
+    logger.error("All LLM providers exhausted, returning static fallback response")
+    return LLMResponse(
+        content=(
+            "I apologize, but I'm temporarily unable to process your request. "
+            "Please try again in a moment."
+        ),
+        provider="fallback",
+        success=False,
+        error="All providers unavailable",
+        cached=False,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Health Check
 # ═══════════════════════════════════════════════════════════════════════════
 

@@ -115,8 +115,8 @@ def is_bond_request(message: str) -> bool:
         from core.fixed_income import extract_isin as _extract_isin
         if _extract_isin(message):
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[RoutingService] ISIN extraction failed; falling back to keywords: %s", exc)
     return any(kw in ml for kw in _BOND_KEYWORDS)
 
 
@@ -251,7 +251,14 @@ def _try_parse_weight_csv(message: str) -> dict | None:
                 continue
             try:
                 w = float(str(row[weight_col]).replace("%", "").replace(",", ""))
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "[FileCSV] skipping row with invalid weight: ticker=%r column=%s value=%r (%s)",
+                    t or row.get(ticker_col),
+                    weight_col,
+                    row.get(weight_col),
+                    exc,
+                )
                 continue
             if w <= 0:
                 continue

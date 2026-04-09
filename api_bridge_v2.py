@@ -309,6 +309,28 @@ async def upload_portfolio(
             f = _to_float(v)
             return round(f, n) if f is not None else None
 
+        def _clean_nan(obj):
+            """Recursively replace NaN/Inf with None — prevents JSON serialization crash."""
+            if isinstance(obj, dict):
+                return {k: _clean_nan(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_clean_nan(v) for v in obj]
+            if isinstance(obj, float):
+                return None if (obj != obj or obj == float('inf') or obj == float('-inf')) else obj
+            return obj
+
+        def _fmt_safe(val, fmt=".1f", fallback="N/A"):
+            """Format a float safely — return fallback if NaN/None."""
+            if val is None:
+                return fallback
+            try:
+                f = float(val)
+                if f != f:  # NaN check
+                    return fallback
+                return f"{f:{fmt}}"
+            except (ValueError, TypeError):
+                return fallback
+
         valid_tickers = [t for t in tickers if t.upper() not in ["CASH","USD","AED"]]
         valid_weights_total = {t: portfolio.get(t, 0.0) for t in valid_tickers}
         
@@ -331,8 +353,10 @@ async def upload_portfolio(
             try:
                 tk = yf.Ticker(t)
                 hist = tk.history(period=LOOKBACK)
-                if not hist.empty:
-                    price_data[t] = hist["Close"]
+                if hist.empty or hist["Close"].isna().all():
+                    hist = tk.history(period="6mo")  # fallback to 6M
+                if not hist.empty and not hist["Close"].isna().all():
+                    price_data[t] = hist["Close"].dropna()
                 info = tk.info
                 # trailingAnnualDividendYield is a reliable decimal fraction (0.004 = 0.4%).
                 # dividendYield returns as a percentage value (0.4 for 0.4%) — avoid it.
@@ -353,8 +377,10 @@ async def upload_portfolio(
         spx_return = None
         try:
             spx = yf.Ticker("^GSPC").history(period=LOOKBACK)
+            if spx.empty or spx["Close"].isna().all():
+                spx = yf.Ticker("^GSPC").history(period="6mo")
             if not spx.empty:
-                spx_return = float((spx["Close"].iloc[-1] / spx["Close"].iloc[0]) - 1)
+                spx_return = float((spx["Close"].dropna().iloc[-1] / spx["Close"].dropna().iloc[0]) - 1)
         except Exception:
             pass
 
@@ -545,8 +571,8 @@ async def upload_portfolio(
         now_str = datetime.now().strftime("%B %d, %Y")
 
         # ── Executive Summary ──────────────────────────────────────────────
-        alpha = (port_total_return - (spx_return or 0) * 100)
-        alpha_total_est = (port_total_return_total_est - (spx_return or 0) * 100)
+        alpha = (port_total_return - (spx_return or 0) * 100) if spx_return is not None else None
+        alpha_total_est = (port_total_return_total_est - (spx_return or 0) * 100) if spx_return is not None else None
         risk_label = (
             "Aggressive 🔴" if (_has_beta_total and port_beta_total > 1.5) else
             "Moderate 🟡" if (_has_beta_total and port_beta_total > 1.0) else
@@ -555,15 +581,16 @@ async def upload_portfolio(
         )
         elevated_risk = ((_has_beta_total and port_beta_total > 1.5) or (tech_weight >= 0.70) or (eff_n < 2.8) or (cvar_95 <= -3.5))
         verdict_line = (
-            f"Equity sleeve returned **{port_total_return:+.1f}%**; estimated total-portfolio return "
-            f"(including {cash_pct:.1f}% cash) is **{port_total_return_total_est:+.1f}%**. "
-            f"Vs S&P 500 **{spx_return*100:+.1f}%**: equity alpha **{alpha:+.1f}%**, "
-            f"estimated total alpha **{alpha_total_est:+.1f}%**. "
-            f"Risk profile (total beta): **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{sharpe:.1f}**. "
+            f"Equity sleeve returned **{_fmt_safe(port_total_return, '+.1f')}%**; estimated total-portfolio return "
+            f"(including {_fmt_safe(cash_pct)}% cash) is **{_fmt_safe(port_total_return_total_est, '+.1f')}%**. "
+            f"Vs S&P 500 **{_fmt_safe(spx_return * 100 if spx_return is not None else None, '+.1f')}%**: equity alpha **{_fmt_safe(alpha, '+.1f')}%**, "
+            f"estimated total alpha **{_fmt_safe(alpha_total_est, '+.1f')}%**. "
+            f"Risk profile (total beta): **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{_fmt_safe(sharpe)}**. "
             f"Strategic guidance: {'Strong performance, but concentration-driven with elevated risk — consider gradual de-risking and defensive diversification.' if elevated_risk else 'Returns are solid, but correlation clustering remains — consider incremental diversification while monitoring rolling Sharpe.' if high_corr else 'Strong historical performance with balanced risk controls — continue disciplined monitoring before adding incremental risk.'}"
             if spx_return is not None else
-            f"Equity sleeve 1Y Return: **{port_total_return:+.1f}%** (estimated total portfolio: **{port_total_return_total_est:+.1f}%**). "
-            f"Risk: **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{sharpe:.1f}**."
+            f"Equity sleeve 1Y Return: **{_fmt_safe(port_total_return, '+.1f')}%** (estimated total portfolio: **{_fmt_safe(port_total_return_total_est, '+.1f')}%**). "
+            f"Alpha: N/A (benchmark unavailable). "
+            f"Risk: **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{_fmt_safe(sharpe)}**."
         )
         lines.append("# 📊 EisaX Portfolio Risk Report")
         lines.append(f"**Date:** {now_str}  |  **Period:** 1 Year  |  **Risk-Free Rate:** 4.5% (US T-Bill)")
@@ -604,19 +631,21 @@ async def upload_portfolio(
         lines.append("")
         lines.append("| Metric | Value | Assessment |")
         lines.append("|--------|-------|------------|")
-        lines.append(f"| 1Y Return (Equity Sleeve) | {port_total_return:+.1f}% | {'🟢 Strong' if port_total_return > 15 else '🟡 Moderate' if port_total_return > 0 else '🔴 Negative'} |")
-        lines.append(f"| Estimated 1Y Return (Total Portfolio) | {port_total_return_total_est:+.1f}% | Includes {cash_pct:.1f}% cash drag |")
-        if spx_return is not None:
+        lines.append(f"| 1Y Return (Equity Sleeve) | {_fmt_safe(port_total_return, '+.1f')}% | {'🟢 Strong' if port_total_return > 15 else '🟡 Moderate' if port_total_return > 0 else '🔴 Negative'} |")
+        lines.append(f"| Estimated 1Y Return (Total Portfolio) | {_fmt_safe(port_total_return_total_est, '+.1f')}% | Includes {_fmt_safe(cash_pct)}% cash drag |")
+        if spx_return is not None and alpha is not None:
             alpha_icon = "🟢" if alpha > 0 else "🔴"
-            lines.append(f"| vs S&P 500 (Alpha) | {alpha:+.1f}% | {alpha_icon} {'Outperforming' if alpha > 0 else 'Underperforming'} benchmark |")
-        lines.append(f"| Annualized Volatility | {ann_vol*100:.1f}% | {'🔴 High' if ann_vol > 0.30 else '🟡 Moderate' if ann_vol > 0.15 else '🟢 Low'} |")
-        lines.append(f"| Sharpe Ratio (1Y, rf=4.5%) | {sharpe:.2f} | {'🟢 Excellent' if sharpe > 1.5 else '🟡 Acceptable' if sharpe > 0.5 else '🔴 Poor'} |")
-        lines.append(f"| Sortino Ratio (1Y, rf=4.5%) | {sortino:.2f} | {'🟢 Good' if sortino > 1.0 else '🟡 Acceptable' if sortino > 0.5 else '🔴 Poor'} downside-adjusted |")
+            lines.append(f"| vs S&P 500 (Alpha) | {_fmt_safe(alpha, '+.1f')}% | {alpha_icon} {'Outperforming' if alpha > 0 else 'Underperforming'} benchmark |")
+        elif spx_return is None:
+            lines.append(f"| vs S&P 500 (Alpha) | N/A | Alpha: N/A (benchmark unavailable) |")
+        lines.append(f"| Annualized Volatility | {_fmt_safe(ann_vol * 100 if isinstance(ann_vol, (int, float)) else None)}% | {'🔴 High' if ann_vol > 0.30 else '🟡 Moderate' if ann_vol > 0.15 else '🟢 Low'} |")
+        lines.append(f"| Sharpe Ratio (1Y, rf=4.5%) | {_fmt_safe(sharpe, '.2f')} | {'🟢 Excellent' if sharpe > 1.5 else '🟡 Acceptable' if sharpe > 0.5 else '🔴 Poor'} |")
+        lines.append(f"| Sortino Ratio (1Y, rf=4.5%) | {_fmt_safe(sortino, '.2f')} | {'🟢 Good' if sortino > 1.0 else '🟡 Acceptable' if sortino > 0.5 else '🔴 Poor'} downside-adjusted |")
         lines.append(f"| Portfolio Beta (Total Weight) | {_fmt_beta(port_beta_total)} | {'🔴 High Risk' if (_has_beta_total and port_beta_total > 1.5) else '🟡 Moderate' if (_has_beta_total and port_beta_total > 1) else '🟢 Defensive' if _has_beta_total else '⚪ N/A (missing beta data)'} |")
         lines.append(f"| Portfolio Beta (Equity Sleeve) | {_fmt_beta(port_beta_equity)} | {'Normalized over non-cash assets' if _has_beta_equity else 'N/A (insufficient beta coverage)'} |")
-        lines.append(f"| VaR 95% 1-Day (Historical) | {var_95:.2f}% | 95% of days, loss ≤ this |")
-        lines.append(f"| CVaR 95% (Expected Shortfall) | {cvar_95:.2f}% | Avg loss **when** VaR is breached — tail risk |")
-        lines.append(f"| Max Drawdown (1Y) | {max_dd:.1f}% | Worst peak-to-trough |")
+        lines.append(f"| VaR 95% 1-Day (Historical) | {_fmt_safe(var_95, '.2f')}% | 95% of days, loss ≤ this |")
+        lines.append(f"| CVaR 95% (Expected Shortfall) | {_fmt_safe(cvar_95, '.2f')}% | Avg loss **when** VaR is breached — tail risk |")
+        lines.append(f"| Max Drawdown (1Y) | {_fmt_safe(max_dd)}% | Worst peak-to-trough |")
         lines.append(f"| Max Drawdown Duration | {max_dd_duration}d | Longest time underwater |")
         lines.append(f"| Portfolio Div Yield (Total) | {port_div_yield_total:.2f}% | Weighted annual income |")
         lines.append(f"| Portfolio Div Yield (Equity Sleeve) | {port_div_yield_equity:.2f}% | Normalized over non-cash assets |")
@@ -715,19 +744,22 @@ async def upload_portfolio(
             attr_rows.sort(key=lambda x: -x[3])  # sort by contribution descending
             for t, w, ret, contrib in attr_rows:
                 bar = "🟢" if contrib > 0 else "🔴"
-                lines.append(f"| {t} | {w*100:.1f}% | {ret:+.1f}% | {contrib:+.2f}pp | {bar} |")
+                lines.append(f"| {t} | {_fmt_safe(w*100)}% | {_fmt_safe(ret, '+.1f')}% | {_fmt_safe(contrib, '+.2f')}pp | {bar} |")
             # Residual from compounding + rounding differences
             explained = sum(c for _, _, _, c in attr_rows)
             residual = port_total_return - explained
             if abs(residual) > 0.05:
-                lines.append(f"| Residual (model) | — | — | {residual:+.2f}pp | {'🔴' if residual < 0 else '⚪'} |")
-            lines.append(f"| **TOTAL** | 100% | — | **{port_total_return:+.2f}pp** | |")
+                lines.append(f"| Residual (model) | — | — | {_fmt_safe(residual, '+.2f')}pp | {'🔴' if residual < 0 else '⚪'} |")
+            lines.append(f"| **TOTAL** | 100% | — | **{_fmt_safe(port_total_return, '+.2f')}pp** | |")
             lines.append("")
+            _excluded = [t for t in valid_tickers if t not in price_data or len(price_data.get(t, [])) < 2]
+            if _excluded:
+                lines.append(f"\n> ⚠️ **Excluded from attribution:** {', '.join(_excluded)} (data unavailable)")
             # Alpha source: top contributor vs S&P
-            if attr_rows and spx_return is not None:
+            if attr_rows and spx_return is not None and alpha is not None:
                 top_t, top_w, top_ret, top_c = attr_rows[0]
-                lines.append(f"> 🏆 **Alpha driver:** {top_t} contributed {top_c:+.1f}pp (+{top_ret:.1f}% × {top_w*100:.0f}% weight). "
-                             f"S&P 500 returned {spx_return*100:+.1f}% — alpha gap of {alpha:+.1f}pp.")
+                lines.append(f"> 🏆 **Alpha driver:** {top_t} contributed {_fmt_safe(top_c, '+.1f')}pp (+{_fmt_safe(top_ret)}% × {top_w*100:.0f}% weight). "
+                             f"S&P 500 returned {_fmt_safe(spx_return * 100 if spx_return is not None else None, '+.1f')}% — alpha gap of {_fmt_safe(alpha, '+.1f')}pp.")
             lines.append("")
 
         # ══════════════════════════════════════════════════════════════════════
@@ -1514,7 +1546,7 @@ CRITICAL:
         except Exception as _mem_err:
             logger.warning("[PortfolioMemory] Save failed: %s", _mem_err)
 
-        return {
+        return _clean_nan({
             "status":      "success",
             "snapshot_id": _snap_id,
             "portfolio":   portfolio,
@@ -1550,9 +1582,10 @@ CRITICAL:
                 "risk_free_rate":    "4.5% (US T-Bill)",
                 "method":            "Historical Simulation, 252 trading days",
             }
-        }
+        })
     except Exception as e:
-        return {"error": str(e)}
+        logger.exception("[upload_portfolio] Unhandled error for file %s", getattr(file, 'filename', '?'))
+        return {"error": str(e), "detail": "Portfolio analysis failed — see server logs for details"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2212,8 +2245,8 @@ async def get_audit_log(access_token: str = Header(None, alias="X-Admin-Key")):
 async def get_notifications(since: str = "", access_token: str = Header(None, alias="X-Admin-Key")):
     _check_admin(access_token)
     if not since:
-        from datetime import datetime, timedelta
-        since = (datetime.utcnow() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
     return orchestrator.session_mgr.get_new_activity(since)
 
 @app.get("/admin/export/users")
