@@ -478,6 +478,20 @@ class SessionManager:
                 (json.dumps(state), session_id)
             )
 
+    # Aliases for backward compatibility with router.py
+    def get_state(self, session_id: str) -> dict:
+        """Alias for get_session_state() for backward compatibility."""
+        return self.get_session_state(session_id)
+
+    def update_state(self, session_id: str, state_updates: dict):
+        """
+        Alias for save_session_state() that merges updates.
+        Retrieves current state, merges in updates, then saves.
+        """
+        current_state = self.get_session_state(session_id)
+        current_state.update(state_updates)
+        self.save_session_state(session_id, current_state)
+
     def cleanup_old_sessions(self, days_to_keep: int = 30) -> dict:
         """
         Delete sessions and their chat history older than `days_to_keep` days.

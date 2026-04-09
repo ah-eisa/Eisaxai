@@ -1396,6 +1396,9 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
 # ── Singleton ──
 _orchestrator_instance = MultiAgentOrchestrator()
 
+# Alias for backward compatibility with router.py imports
+_orchestrator = _orchestrator_instance
+
 async def think(message: str, settings: dict = {}, history: list = []) -> dict:
     user_id = settings.get("user_id", settings.get("session_id", "default"))
     session_id = settings.get("session_id", None)
