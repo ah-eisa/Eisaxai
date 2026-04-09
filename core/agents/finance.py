@@ -12,13 +12,25 @@ from core.agents.base import BaseAgent
 import core.portfolio_manager as pm
 from core.broker import BrokerClient
 
-# Phase-1 refactor: TTLCache + yf_retry now live in core.utils
-from core.utils import TTLCache as _TTLCache, yf_retry as _yf_with_retry  # noqa: F401
+# Phase-1 refactor: TTLCache now lives in core.utils
+from core.utils import TTLCache as _TTLCache  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
 import threading as _threading  # kept for any legacy direct threading.Lock() usage
 import functools as _functools
+
+# ── Utility helpers (extracted to finance_helpers for independent testability) ─
+from core.agents.finance_helpers import (   # noqa: E402
+    _VERDICT_TIERS,
+    _safe_div_yield,
+    _consensus_divergence,
+    _fetch_btc_etf_flows,
+    _compute_decision_confidence,
+    _soften_execution_language,
+    _round_scenario_prices,
+    _fetch_onchain,
+)
 
 # ── Report Cache (TTL: 10 min) ─────────────────────────────────────────────
 _REPORT_CACHE: dict = {}
@@ -29,154 +41,8 @@ _div_yield_cache    = _TTLCache(ttl_seconds=3600)   # dividend yields → 1h TTL
 _fundamentals_cache = _TTLCache(ttl_seconds=600)    # fundamentals   → 10min TTL
 
 
-def _safe_div_yield(v) -> float:
-    """
-    Parse dividend yield from any format yfinance/FMP might return:
-      '5.00%'  → 0.05    (string with %)
-      '509.00%'→ 0.0     (corrupt data — cap at 30%)
-      0.05     → 0.05    (already decimal)
-      5.0      → 0.05    (whole-number percentage)
-    Returns decimal in [0.0, 0.30].
-    """
-    if not v:
-        return 0.0
-    import math
-    try:
-        if isinstance(v, str):
-            cleaned = v.replace('%', '').replace(',', '').strip()
-            val = float(cleaned)
-            # String with % sign — already in percentage form
-            val_dec = val / 100.0
-        else:
-            val = float(v)
-            # Heuristic: if > 1, assume it was stored as percentage (e.g. 5.0 = 5%)
-            val_dec = val / 100.0 if val > 1.0 else val
-        # Guard NaN / inf / corrupt data
-        if math.isnan(val_dec) or math.isinf(val_dec):
-            return 0.0
-        return max(0.0, min(val_dec, 0.30))   # cap at 30% — anything higher is bad data
-    except (ValueError, TypeError):
-        return 0.0
-
-
-_VERDICT_TIERS = {
-    'SELL': 0,
-    'AVOID': 0,
-    'REDUCE': 1,
-    'HOLD': 2,
-    'ACCUMULATE': 3,
-    'BUY': 3,
-    'STRONG BUY': 4,
-}
-
-
-def _consensus_divergence(eisax_verdict: str, analyst_consensus: str,
-                          adx: float = None, beta: float = None) -> dict:
-    '''
-    Returns divergence info between EisaX verdict and analyst consensus.
-    analyst_consensus examples: 'Strong Buy', 'Buy', 'Hold', 'Underperform', 'Sell'
-    adx / beta: optional — when provided, adds a "Driven by:" numeric reason line.
-    Returns: {diverges: bool, gap: int, direction: str, message: str}
-    '''
-    if not analyst_consensus or not eisax_verdict:
-        return {'diverges': False, 'gap': 0, 'direction': 'none', 'message': ''}
-
-    # Normalize consensus string → tier
-    ac = analyst_consensus.lower().strip()
-    if 'strong buy' in ac or 'outperform' in ac:
-        cons_tier = 4
-        cons_label = 'Strong Buy'
-    elif 'buy' in ac or 'overweight' in ac:
-        cons_tier = 3
-        cons_label = 'Buy'
-    elif 'hold' in ac or 'neutral' in ac or 'market perform' in ac:
-        cons_tier = 2
-        cons_label = 'Hold'
-    elif 'underperform' in ac or 'underweight' in ac or 'reduce' in ac:
-        cons_tier = 1
-        cons_label = 'Reduce/Underperform'
-    elif 'sell' in ac:
-        cons_tier = 0
-        cons_label = 'Sell'
-    else:
-        return {'diverges': False, 'gap': 0, 'direction': 'none', 'message': ''}
-
-    eisax_tier = _VERDICT_TIERS.get(eisax_verdict.upper().strip(), 2)
-    gap = cons_tier - eisax_tier  # positive = analysts more bullish than EisaX
-
-    if abs(gap) < 2:
-        return {'diverges': False, 'gap': gap, 'direction': 'none', 'message': ''}
-
-    # ── Build "Driven by" numeric reason when adx/beta available ─────────────
-    _driven = ""
-    if adx is not None and beta is not None:
-        _adx_label = (
-            "weak trend" if adx < 20 else
-            "moderate trend" if adx < 30 else
-            "strong trend"
-        )
-        if gap >= 2:  # EisaX more cautious
-            _driven = (
-                f"\nDriven by: ADX={adx:.1f} ({_adx_label}) + Beta={beta:.2f} (amplified risk) "
-                f"vs analyst 12-month horizon ignoring near-term technical damage."
-            )
-        else:  # EisaX more bullish
-            _driven = (
-                f"\nDriven by: ADX={adx:.1f} ({_adx_label}) + Beta={beta:.2f} "
-                f"— EisaX weighting near-term technical recovery signals."
-            )
-
-    direction = 'EisaX more bearish' if gap > 0 else 'EisaX more bullish'
-    if gap >= 2:
-        msg = (
-            f'⚠️ **Consensus Divergence:** EisaX rates **{eisax_verdict}** vs analysts **{cons_label}** '
-            f'— EisaX is {abs(gap)} tiers more cautious.{_driven}'
-        )
-    else:
-        msg = (
-            f'⚠️ **Consensus Divergence:** EisaX rates **{eisax_verdict}** vs analysts **{cons_label}** '
-            f'— EisaX is {abs(gap)} tiers more optimistic.{_driven}'
-        )
-    return {'diverges': True, 'gap': gap, 'direction': direction, 'message': msg}
-
-
-def _fetch_btc_etf_flows() -> str:
-    """
-    Fetch IBIT (iShares Bitcoin Trust) volume vs 90-day avg.
-    Returns a formatted signal string, or '' on any failure (silent fail).
-    """
-    try:
-        import yfinance as _yf_etf
-        _ibit = _yf_etf.download("IBIT", period="95d", progress=False, auto_adjust=True)
-        if _ibit is None or _ibit.empty or 'Volume' not in _ibit.columns:
-            return ""
-        _vol_s = _ibit['Volume'].dropna()
-        if len(_vol_s) < 30:
-            return ""
-        _latest = float(_vol_s.iloc[-1])
-        _hist   = _vol_s.iloc[:-1]
-        _avg90  = float(_hist.tail(90).mean()) if len(_hist) >= 90 else float(_hist.mean())
-        if _avg90 <= 0:
-            return ""
-        _pct = (_latest - _avg90) / _avg90 * 100
-        if _pct >= 20:
-            return (
-                f"📊 ETF Signal: IBIT volume {_pct:+.0f}% above avg "
-                f"— institutional accumulation signal"
-            )
-        elif _pct <= -20:
-            return (
-                f"📊 ETF Signal: IBIT volume {abs(_pct):.0f}% below avg "
-                f"— institutional distribution signal"
-            )
-        else:
-            return (
-                f"📊 ETF Signal: IBIT volume normal ({_pct:+.0f}% vs avg) "
-                f"— no directional institutional signal"
-            )
-    except Exception as _etf_e:
-        logger.debug(f"[BTC ETF] IBIT fetch failed: {_etf_e}")
-        return ""
+# _safe_div_yield, _VERDICT_TIERS, _consensus_divergence, _fetch_btc_etf_flows
+# → imported from core.agents.finance_helpers above
 
 
 def _yf_with_retry(ticker: str, max_attempts: int = 3, base_delay: float = 1.5):
@@ -199,10 +65,14 @@ def _yf_with_retry(ticker: str, max_attempts: int = 3, base_delay: float = 1.5):
                                ticker, attempt + 1, max_attempts, exc, wait)
                 _time.sleep(wait)
     raise last_exc
+
+
 try:
     from core.realtime_data import get_live_news, deepcrawl_stock
-except Exception as _e:
-    pass
+except Exception as _realtime_import_err:
+    logger.debug("[finance] core.realtime_data unavailable: %s — live news/deepcrawl disabled", _realtime_import_err)
+    get_live_news = None      # type: ignore[assignment]
+    deepcrawl_stock = None    # type: ignore[assignment]
 from core.intent_classifier import IntentClassifier
 from core.ticker_resolver import TickerResolver
 from core.local_tickers import SUPPORTED_CURRENCIES, get_all_tickers_flat, get_ticker_currency
@@ -1715,51 +1585,10 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
     # Helper methods – extracted from _handle_analytics to remove duplication
     # ══════════════════════════════════════════════════════════════════════
 
-    @staticmethod
-    def _compute_decision_confidence(score: float,
-                                     bullish_count: int,
-                                     bearish_count: int,
-                                     beta: float,
-                                     verdict: str) -> int:
-        """
-        Deterministic confidence score for advisory framing.
-        Keeps confidence bounded to avoid false certainty.
-        """
-        try:
-            _score = float(score or 50.0)
-            _bull = int(bullish_count or 0)
-            _bear = int(bearish_count or 0)
-            _beta = float(beta or 1.0)
-        except Exception:
-            return 55
-
-        signal_gap = abs(_bull - _bear)
-        beta_penalty = max(0.0, _beta - 1.5) * 8.0
-        verdict_penalty = 4.0 if str(verdict or "").upper() in ("SELL", "REDUCE", "AVOID") else 0.0
-        raw_conf = (_score * 0.72) + min(signal_gap * 6.0, 18.0) - beta_penalty - verdict_penalty
-        confidence = int(max(40, min(88, round(raw_conf))))
-
-        # Calibrate confidence to deterministic conviction buckets from score.
-        if _score < 45:
-            conviction = "Low"
-            lo, hi = 45, 54
-        elif _score < 60:
-            conviction = "Low/Medium"
-            lo, hi = 45, 60
-        elif _score < 70:
-            conviction = "Medium"
-            lo, hi = 55, 65
-        elif _score < 80:
-            conviction = "High"
-            lo, hi = 66, 80
-        else:
-            conviction = "Very High"
-            lo, hi = 81, 90
-
-        confidence = int(max(lo, min(hi, confidence)))
-        if conviction == "Medium" and confidence < 55:
-            confidence = 60
-        return confidence
+    # ── Static helpers re-exported from core.agents.finance_helpers ─────────
+    # These aliases keep all existing self._method() / FinancialAgent._method()
+    # call-sites working without change.
+    _compute_decision_confidence = staticmethod(_compute_decision_confidence)
 
     def _build_decision_framework_block(self,
                                         *,
@@ -1871,150 +1700,11 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             "> This layer is advisory and supports decision quality; it is not an execution command."
         )
 
-    @staticmethod
-    def _soften_execution_language(text: str) -> str:
-        """Safety net: tone down command-style execution phrasing to advisory phrasing."""
-        if not text:
-            return text
-        softened = str(text)
-        # GUARDRAIL: No execution instructions. Describe data only. Never tell user what to do.
-        replacements = [
-            (r'(?i)\bexit\s+100%\b', 'a close below the key level would weaken the technical thesis'),
-            (r'(?i)\breduce\s+to\s+50%\b', 'elevated concentration increases risk/reward asymmetry'),
-            (r'(?i)\binitiate\s+a\s+position\b', 'a confirmed close above the trigger level would strengthen the bull case'),
-            (r'(?i)\badd\s+the\s+remaining\s+tranche\b', 'a confirmed close above the trigger level would strengthen the bull case'),
-            (r'(?i)\bbuy\s+now\b', 'the current setup remains data-dependent and confirmation-sensitive'),
-            (r'(?i)do\s+\*\*?not\*\*?\s+chase[^.]*\.?', 'current price is elevated relative to the identified entry zone'),
-            (r'(?i)wait\s+for\s+a\s+pullback\s+before[^.]*\.?', 'a retracement toward the entry zone would improve the risk/reward profile'),
-            (r'(?i)before\s+initiating\s+a\s+position', 'relative to the defined risk parameters'),
-            (r'(?i)before\s+entering', 'relative to current risk parameters'),
-        ]
-        for pattern, repl in replacements:
-            softened = re.sub(pattern, repl, softened)
-        return softened
+    _soften_execution_language = staticmethod(_soften_execution_language)
 
-    @staticmethod
-    def _round_scenario_prices(text: str, currency_sym: str = "$") -> str:
-        """
-        Round exact decimal prices in scenario/valuation TABLE CELLS ONLY to ranges.
-        Targets only markdown table rows — never touches live price, SMA, RSI, etc.
-        Example: ﷼24.96 → ~24.5–25.5 ﷼
-        """
-        import re as _re
-        if not text:
-            return text
+    _round_scenario_prices = staticmethod(_round_scenario_prices)
 
-        def _to_range(m):
-            raw = m.group(0)
-            num_str = _re.search(r'[\d,]+\.?\d*', raw.replace(',', ''))
-            if not num_str:
-                return raw
-            try:
-                val = float(num_str.group().replace(',', ''))
-            except ValueError:
-                return raw
-
-            # Skip very small values (ratios/percentages) and very large values.
-            if val < 1 or val > 100_000:
-                return raw
-
-            # Round to nearest 0.5 and produce a small range.
-            step = max(0.5, round(val * 0.025 * 2) / 2)
-            lo = round((val - step) / step) * step
-            hi = round((val + step) / step) * step
-
-            if val >= 1000:
-                return f"~{lo:,.0f}–{hi:,.0f} {currency_sym}".strip()
-            if val >= 10:
-                return f"~{lo:.1f}–{hi:.1f} {currency_sym}".strip()
-            return f"~{lo:.2f}–{hi:.2f} {currency_sym}".strip()
-
-        lines = text.split('\n')
-        result = []
-        in_scenario_section = False
-
-        for line in lines:
-            if any(kw in line for kw in ['Scenario', 'Bear', 'Bull', 'Base', 'Impact', 'Expected Price', 'Implied Price']):
-                in_scenario_section = True
-
-            if in_scenario_section and line.startswith('|'):
-                # Prices like: $123.45, ﷼24.96, €12.20, £9.15, SAR 24.96
-                line = _re.sub(
-                    r'(?<!~)(?:[\$﷼€£]\s?\d{1,6}(?:,\d{3})*\.\d{2}|SAR\s?\d{1,6}(?:,\d{3})*\.\d{2})(?!\d)',
-                    _to_range,
-                    line,
-                )
-            elif in_scenario_section and not line.startswith('|') and line.strip() and not line.startswith('>'):
-                in_scenario_section = False
-
-            result.append(line)
-
-        return '\n'.join(result)
-
-    @staticmethod
-    def _fetch_onchain(ticker: str) -> dict:
-        """Fetch on-chain metrics for crypto assets. Free APIs only."""
-        import requests as _rq
-        out: dict = {}
-        if not (ticker.endswith('-USD') and any(c in ticker for c in ['BTC', 'ETH', 'SOL', 'XRP'])):
-            return out
-
-        # ── Map ticker to CoinGecko ID ──
-        _cg_map = {
-            'BTC-USD': 'bitcoin', 'ETH-USD': 'ethereum', 'SOL-USD': 'solana',
-            'XRP-USD': 'ripple', 'BNB-USD': 'binancecoin', 'DOGE-USD': 'dogecoin',
-            'ADA-USD': 'cardano', 'AVAX-USD': 'avalanche-2', 'LINK-USD': 'chainlink',
-            'DOT-USD': 'polkadot',
-        }
-        cg_id = _cg_map.get(ticker)
-
-        # ── 1. CoinGecko: ATH, supply, volume, rank ──
-        if cg_id:
-            try:
-                r = _rq.get(
-                    f"https://api.coingecko.com/api/v3/coins/{cg_id}",
-                    params={"localization": "false", "tickers": "false",
-                            "community_data": "false", "developer_data": "false"},
-                    timeout=8,
-                )
-                if r.status_code == 200:
-                    d = r.json()
-                    md = d.get('market_data', {})
-                    out['ath'] = md.get('ath', {}).get('usd') or 0
-                    out['ath_change_pct'] = md.get('ath_change_percentage', {}).get('usd') or 0
-                    out['ath_date'] = (md.get('ath_date', {}).get('usd', '') or '')[:10]
-                    out['circulating_supply'] = md.get('circulating_supply') or 0
-                    out['max_supply'] = md.get('max_supply') or 0
-                    out['total_volume_24h'] = md.get('total_volume', {}).get('usd') or 0
-                    out['mc_rank'] = d.get('market_cap_rank', 0)
-                    # Supply ratio
-                    if out['max_supply'] and out['circulating_supply']:
-                        out['supply_ratio'] = round(out['circulating_supply'] / out['max_supply'] * 100, 1)
-            except Exception as _e:
-                logger.warning(f"[OnChain] CoinGecko failed for {ticker}: {_e}")
-
-        # ── 2. Blockchain.com: Hash Rate + Active Addresses (BTC only) ──
-        if ticker == 'BTC-USD':
-            try:
-                r2 = _rq.get("https://api.blockchain.info/stats", timeout=8)
-                if r2.status_code == 200:
-                    bs = r2.json()
-                    out['hash_rate_eh'] = round(bs.get('hash_rate', 0) / 1e9, 1)  # EH/s
-                    out['n_tx_24h'] = bs.get('n_tx', 0)
-                    out['minutes_between_blocks'] = round(bs.get('minutes_between_blocks', 0), 1)
-            except Exception:
-                pass
-            try:
-                r3 = _rq.get("https://api.blockchain.info/charts/n-unique-addresses",
-                             params={"timespan": "1days", "format": "json"}, timeout=8)
-                if r3.status_code == 200:
-                    vals = r3.json().get('values', [])
-                    if vals:
-                        out['active_addresses'] = int(vals[-1].get('y', 0))
-            except Exception:
-                pass
-
-        return out
+    _fetch_onchain = staticmethod(_fetch_onchain)
 
     def _compute_rolling_beta(self, ticker: str) -> float:
         """Compute 90-day rolling beta vs SPY for any ticker. Returns float."""
@@ -5596,9 +5286,9 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 entry_price = sma200 * 0.98
                 stop_price  = _atr_stop(sma200, _atr_val, fallback_pct=0.08)
             else:
-                # Above SMA200
+                # Above SMA200 — stop from CURRENT PRICE (not SMA200), standard 2×ATR
                 entry_price = ep if ep else sma200 * 1.01
-                stop_price  = sp if sp else _atr_stop(sma200, _atr_val, mult=1.5, fallback_pct=0.05)
+                stop_price  = sp if sp else _atr_stop(_fp_ref, _atr_val, mult=2.0, fallback_pct=0.09)
         else:
             entry_price = ep if ep else (_fp_ref * 0.96 if _fp_ref else None)
             stop_price  = sp if sp else _atr_stop(_fp_ref, _atr_val, fallback_pct=0.09)
@@ -6147,8 +5837,12 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
 
                 _lines = [_verdict_display]
                 if _insight:
+                    # Strip accidental leading numbering (e.g. "1." "2.") from insight
+                    _insight = _re_qv.sub(r'^\d+\.\s*', '', _insight).strip()
                     _lines.append(f"💡 {_insight}")
                 if _top_risk:
+                    # Strip accidental leading numbering (e.g. "1." "2.") from risk
+                    _top_risk = _re_qv.sub(r'^\d+\.\s*', '', _top_risk).strip()
                     _lines.append(f"⚠️ Top Risk: {_top_risk}")
 
                 return (
