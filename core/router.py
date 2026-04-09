@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional
 
+from core.errors import handle_error
 from core.logger import StructuredLogger
+from core.metrics import track_performance
 from core.session_manager import SessionManager
 from core.intent_classifier import IntentClassifier
 from core.orchestrator import _orchestrator
@@ -21,6 +23,7 @@ class Router:
         self.orchestrator = orchestrator or _orchestrator
         self.classifier = IntentClassifier()
     
+    @track_performance
     def handle_request(self, 
                        session_id: str, 
                        text: str, 
@@ -72,11 +75,7 @@ class Router:
 
         except Exception as e:
             self.logger.error("Execution pipeline failed", error=str(e))
-            return {
-                "type": "error", 
-                "reply": "An internal error occurred processing your request.",
-                "data": {"error": str(e)}
-            }
+            return handle_error(e)
             
     def _normalize_reply(self, text: str) -> str:
         """

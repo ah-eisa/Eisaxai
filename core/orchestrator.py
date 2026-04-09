@@ -7,10 +7,20 @@ load_dotenv()
 import logging
 import re
 from typing import Dict, Optional
+from core.metrics import track_performance
 from core.session_manager import SessionManager
 from datetime import datetime as _dt
 
 logger = logging.getLogger(__name__)
+
+# ── LLM Fallback Chain (handles quota exhaustion) ──────────────────────────
+try:
+    from core.llm_fallback import generate_with_fallback, get_llm_health
+    LLM_FALLBACK_ENABLED = True
+    logger.info("[LLM] Fallback chain loaded: Kimi → DeepSeek → Cache")
+except Exception as _llm_e:
+    logger.warning("[LLM] Fallback chain unavailable (%s) — using direct calls", _llm_e)
+    LLM_FALLBACK_ENABLED = False
 
 # ── Admin Handler ─────────────────────────────────────────────────────────────
 try:
@@ -235,6 +245,62 @@ class MultiAgentOrchestrator:
             except Exception as e:
                 logger.warning("FinancialAgent init failed: %s", e)
         return self._financial_agent
+
+    def _detect_analysis_mode(self, message: str = "", instruction: str = "") -> str:
+        msg_lower = f"{message or ''} {instruction or ''}".lower()
+        quick_kws = ["بسرعة", "سريع", "ملخص", "مختصر", "quick", "brief", "summary", "short"]
+        cio_kws = ["cio memo", "memo", "مذكرة", "institutional", "مؤسسي"]
+        if any(keyword in msg_lower for keyword in quick_kws):
+            return "quick"
+        if any(keyword in msg_lower for keyword in cio_kws):
+            return "cio"
+        return "full"
+
+    def _resolve_analysis_ticker(self, message: str = "", instruction: str = "") -> str | None:
+        try:
+            try:
+                from core.ticker_resolver import resolve_ticker as _resolve
+            except Exception:
+                from core.tools.ticker_resolver import resolve_ticker as _resolve
+
+            resolved = _resolve(message) or _resolve(instruction or "")
+            if resolved:
+                return resolved
+        except Exception as exc:
+            logger.debug("[AnalysisCache] ticker resolver failed: %s", exc)
+
+        combined = f"{message or ''} {instruction or ''}".upper()
+        candidates = re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", combined)
+        skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
+        for ticker in candidates:
+            if ticker not in skip:
+                return ticker
+        return None
+
+    def build_analysis_cache_key(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        message: str = "",
+        instruction: str = "",
+        analysis_type: str | None = None,
+    ):
+        ticker = self._resolve_analysis_ticker(message, instruction)
+        if not ticker:
+            return None
+        try:
+            from core.analysis_cache import make_key as _make_cache_key
+
+            return _make_cache_key(
+                ticker,
+                analysis_type=analysis_type or self._detect_analysis_mode(message, instruction),
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logger.debug("[AnalysisCache] build key failed: %s", exc)
+            return None
 
     def _gemini_generate(self, contents: str, *, label: str = "") -> str:
         """
@@ -863,6 +929,7 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
             logger.warning("[Think] failed: %s", e)
             return {"intent": "general", "ticker": None, "confidence": 0.5}
 
+    @track_performance
     async def process_message(self, user_id: str, message: str, session_id: Optional[str] = None) -> Dict:
         """
         Main message dispatcher — thin coordinator that delegates to service modules.
@@ -1041,6 +1108,31 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     "scorecard", "verdict", "invest", "buy", "sell", "hold",
                     "سعر", "price", "target", "هدف", "توصية", "recommendation",
                 ]
+                _dfm_cache_key = None
+                if any(kw in message.lower() for kw in _analysis_kw):
+                    try:
+                        _dfm_cache_key = self.build_analysis_cache_key(
+                            user_id=user_id,
+                            session_id=session_id,
+                            message=message,
+                            instruction=instruction,
+                        )
+                        if _dfm_cache_key:
+                            from core.analysis_cache import get as _ac_get
+
+                            _cached = _ac_get(_dfm_cache_key)
+                            if _cached:
+                                _reply = _cached["reply"] + f"\n\n*ℹ️ تحليل محدّث (منذ {_cached['cache_age'] // 60} دقيقة)*"
+                                self.session_mgr.save_message(session_id, user_id, "user", message)
+                                self.session_mgr.save_message(session_id, user_id, "assistant", _reply)
+                                return {
+                                    "reply": _reply,
+                                    "session_id": session_id,
+                                    "agent_name": "EisaX Cache",
+                                    "model": _cached.get("model", "cache"),
+                                }
+                    except Exception as _dfm_cache_exc:
+                        logger.debug("[AnalysisCache] DFM cache lookup skipped: %s", _dfm_cache_exc)
                 if any(kw in message.lower() for kw in _analysis_kw) and self.financial_agent:
                     try:
                         import asyncio as _asyncio
@@ -1055,6 +1147,20 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                         if _rt and len(_rt) > 200:
                             self.session_mgr.save_message(session_id, user_id, "user", message)
                             self.session_mgr.save_message(session_id, user_id, "assistant", _rt)
+                            if _dfm_cache_key:
+                                try:
+                                    from core.analysis_cache import set as _ac_set
+
+                                    _ac_set(
+                                        _dfm_cache_key,
+                                        {
+                                            "reply": _rt,
+                                            "model": _result.get("model") or "DeepSeek + yfinance",
+                                        },
+                                        level="all",
+                                    )
+                                except Exception as _dfm_cache_exc:
+                                    logger.debug("[AnalysisCache] DFM FinancialAgent cache set skipped: %s", _dfm_cache_exc)
                             return {
                                 "reply": _rt, "session_id": session_id,
                                 "agent_name": "EisaX Financial Analyst", "model": "DeepSeek + yfinance",
@@ -1067,6 +1173,17 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                     reply_text = await self._handle_dfm_query(message, _dfm_ctx)
                     self.session_mgr.save_message(session_id, user_id, "user", message)
                     self.session_mgr.save_message(session_id, user_id, "assistant", reply_text)
+                    if _dfm_cache_key:
+                        try:
+                            from core.analysis_cache import set as _ac_set
+
+                            _ac_set(
+                                _dfm_cache_key,
+                                {"reply": reply_text, "model": "deepseek"},
+                                level="all",
+                            )
+                        except Exception as _dfm_cache_exc:
+                            logger.debug("[AnalysisCache] DFM handler cache set skipped: %s", _dfm_cache_exc)
                     return {"reply": reply_text, "session_id": session_id, "agent_name": "EisaX DFM"}
                 except Exception as _dfm_e:
                     logger.warning("[DFM handler] failed: %s", _dfm_e)

@@ -566,37 +566,57 @@ async def handle_stock_analysis(
     Run the full EisaX stock-analysis pipeline (FinancialAgent → Gemini fallback).
     """
     import asyncio
-    _resolved_ticker = None
+    _cache_key = None
 
     # ── Detect analysis mode ─────────────────────────────────────────────────
-    _msg_lower = (message or "").lower()
-    _analysis_mode = "full"  # default
-    _quick_kws = ["بسرعة", "سريع", "ملخص", "مختصر", "quick", "brief", "summary", "short"]
-    _cio_kws = ["cio memo", "memo", "مذكرة", "institutional", "مؤسسي"]
-    if any(k in _msg_lower for k in _quick_kws):
-        _analysis_mode = "quick"
-    elif any(k in _msg_lower for k in _cio_kws):
-        _analysis_mode = "cio"
+    if hasattr(orchestrator, "_detect_analysis_mode"):
+        _analysis_mode = orchestrator._detect_analysis_mode(message, instruction)
+    else:
+        _msg_lower = (message or "").lower()
+        _analysis_mode = "full"
+        _quick_kws = ["بسرعة", "سريع", "ملخص", "مختصر", "quick", "brief", "summary", "short"]
+        _cio_kws = ["cio memo", "memo", "مذكرة", "institutional", "مؤسسي"]
+        if any(k in _msg_lower for k in _quick_kws):
+            _analysis_mode = "quick"
+        elif any(k in _msg_lower for k in _cio_kws):
+            _analysis_mode = "cio"
 
     # ── Analysis Cache check ─────────────────────────────────────────────────
     try:
-        try:
-            from core.ticker_resolver import resolve_ticker as _resolve
-        except Exception:
-            from core.tools.ticker_resolver import resolve_ticker as _resolve
-        from core.analysis_cache import get as _ac_get
+        from core.analysis_cache import get as _ac_get, make_key as _ac_make_key
 
-        _resolved_ticker = _resolve(message) or _resolve(instruction or "")
-        if not _resolved_ticker:
-            _combined = f"{message} {instruction or ''}".upper()
-            _candidates = _re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", _combined)
-            _skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
-            for _tk in _candidates:
-                if _tk not in _skip:
-                    _resolved_ticker = _tk
-                    break
-        if _resolved_ticker:
-            _cached = _ac_get(_resolved_ticker, mode=_analysis_mode)
+        if hasattr(orchestrator, "build_analysis_cache_key"):
+            _cache_key = orchestrator.build_analysis_cache_key(
+                user_id=user_id,
+                session_id=session_id,
+                message=message,
+                instruction=instruction,
+                analysis_type=_analysis_mode,
+            )
+        else:
+            _resolved_ticker = None
+            try:
+                from core.ticker_resolver import resolve_ticker as _resolve
+            except Exception:
+                from core.tools.ticker_resolver import resolve_ticker as _resolve
+            _resolved_ticker = _resolve(message) or _resolve(instruction or "")
+            if not _resolved_ticker:
+                _combined = f"{message} {instruction or ''}".upper()
+                _candidates = _re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", _combined)
+                _skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
+                for _tk in _candidates:
+                    if _tk not in _skip:
+                        _resolved_ticker = _tk
+                        break
+            if _resolved_ticker:
+                _cache_key = _ac_make_key(
+                    _resolved_ticker,
+                    analysis_type=_analysis_mode,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+        if _cache_key:
+            _cached = _ac_get(_cache_key)
             if _cached:
                 age_min = _cached["cache_age"] // 60
                 reply = _cached["reply"]
@@ -612,7 +632,7 @@ async def handle_stock_analysis(
                 }
     except Exception as _ce:
         logger.debug(f"[AnalysisCache] cache check skipped: {_ce}")
-        _resolved_ticker = None
+        _cache_key = None
 
     try:
         # ── DFM screening inside STOCK_ANALYSIS ───────────────────────────────
@@ -657,6 +677,17 @@ async def handle_stock_analysis(
                     dfm_reply = await orchestrator._handle_dfm_query(message, dfm_ctx)
                     orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
                     orchestrator.session_mgr.save_message(session_id, user_id, "assistant", dfm_reply)
+                    if _cache_key:
+                        try:
+                            from core.analysis_cache import set as _ac_set
+
+                            _ac_set(
+                                _cache_key,
+                                {"reply": dfm_reply, "model": "deepseek"},
+                                level="all",
+                            )
+                        except Exception as _cache_exc:
+                            logger.debug("[AnalysisCache] DFM fast-path cache set skipped: %s", _cache_exc)
                     return {
                         "reply": dfm_reply, "session_id": session_id,
                         "agent_name": "EisaX DFM", "model": "deepseek",
@@ -676,6 +707,17 @@ async def handle_stock_analysis(
                     egx_reply = await orchestrator._handle_dfm_query(message, egx_ctx)
                     orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
                     orchestrator.session_mgr.save_message(session_id, user_id, "assistant", egx_reply)
+                    if _cache_key:
+                        try:
+                            from core.analysis_cache import set as _ac_set
+
+                            _ac_set(
+                                _cache_key,
+                                {"reply": egx_reply, "model": "deepseek"},
+                                level="all",
+                            )
+                        except Exception as _cache_exc:
+                            logger.debug("[AnalysisCache] EGX fast-path cache set skipped: %s", _cache_exc)
                     return {
                         "reply": egx_reply, "session_id": session_id,
                         "agent_name": "EisaX EGX", "model": "deepseek",
@@ -724,13 +766,15 @@ async def handle_stock_analysis(
                 _track_memory(orchestrator, user_id, message, instruction, reply_text)
                 # ── Save to analysis cache ───────────────────────────────────
                 try:
-                    if _resolved_ticker:
+                    if _cache_key:
                         from core.analysis_cache import set as _ac_set
                         _ac_set(
-                            _resolved_ticker,
-                            reply_text,
-                            result.get("model", "deepseek"),
-                            mode=_analysis_mode,
+                            _cache_key,
+                            {
+                                "reply": reply_text,
+                                "model": result.get("model") or "DeepSeek + yfinance",
+                            },
+                            level="all",
                         )
                 except Exception as _ce:
                     logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
@@ -750,13 +794,15 @@ async def handle_stock_analysis(
     result = await _stock_gemini_fallback(orchestrator, session_id, user_id, message, instruction)
     # ── Save to analysis cache ───────────────────────────────────────────────
     try:
-        if _resolved_ticker and isinstance(result, dict) and result.get("reply"):
+        if _cache_key and isinstance(result, dict) and result.get("reply"):
             from core.analysis_cache import set as _ac_set
             _ac_set(
-                _resolved_ticker,
-                result["reply"],
-                result.get("model", "deepseek"),
-                mode=_analysis_mode,
+                _cache_key,
+                {
+                    "reply": result["reply"],
+                    "model": result.get("model", "Gemini (fallback)"),
+                },
+                level="all",
             )
     except Exception as _ce:
         logger.debug(f"[AnalysisCache] cache set skipped: {_ce}")
