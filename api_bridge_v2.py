@@ -3728,3 +3728,117 @@ async def get_sentiment_trend(
     except Exception as exc:
         logger.error("[sentiment/trend] ticker=%s %s", ticker, exc)
         raise HTTPException(status_code=500, detail=f"Sentiment trend error: {exc}")
+
+
+class ScreenerRequest(BaseModel):
+    tickers: list[str] = Field(default_factory=list)
+    universe: str = "us_large_cap"  # 'us_large_cap'|'uae'|'egypt'|'saudi'|'custom'
+    pe_min: Optional[float] = None
+    pe_max: Optional[float] = None
+    roe_min: Optional[float] = None
+    roe_max: Optional[float] = None
+    market_cap_min: Optional[float] = None
+    market_cap_max: Optional[float] = None
+    volume_min: Optional[float] = None
+    rsi_min: Optional[float] = None
+    rsi_max: Optional[float] = None
+    price_above_sma200: Optional[bool] = None
+    dividend_yield_min: Optional[float] = None
+    revenue_growth_min: Optional[float] = None
+    sector: Optional[str] = None
+    max_results: int = 20
+
+
+@app.post("/v1/screener")
+@limiter.limit("5/minute")
+async def stock_screener(
+    request: Request,
+    body: ScreenerRequest,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(403, "Unauthorized")
+    try:
+        import asyncio
+
+        from core.screener import StockScreener, ScreenerFilter, DEFAULT_UNIVERSE
+
+        tickers = body.tickers if body.tickers else DEFAULT_UNIVERSE.get(body.universe, DEFAULT_UNIVERSE["us_large_cap"])
+        filters = ScreenerFilter(
+            pe_min=body.pe_min,
+            pe_max=body.pe_max,
+            roe_min=body.roe_min,
+            roe_max=body.roe_max,
+            market_cap_min=body.market_cap_min,
+            market_cap_max=body.market_cap_max,
+            volume_min=body.volume_min,
+            rsi_min=body.rsi_min,
+            rsi_max=body.rsi_max,
+            price_above_sma200=body.price_above_sma200,
+            dividend_yield_min=body.dividend_yield_min,
+            revenue_growth_min=body.revenue_growth_min,
+            sector=body.sector,
+        )
+        screener = StockScreener()
+        results = await asyncio.get_event_loop().run_in_executor(None, screener.screen, tickers, filters)
+        results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)[:body.max_results]
+        return {"count": len(results), "universe": body.universe, "results": results}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[screener] %s", exc)
+        raise HTTPException(500, f"Screener error: {exc}")
+
+
+class BacktestRequest(BaseModel):
+    ticker: str
+    strategy: str  # 'ma_crossover' | 'rsi' | 'macd'
+    start_date: str  # YYYY-MM-DD
+    end_date: str    # YYYY-MM-DD
+    initial_capital: float = 10000.0
+    short_window: int = 20
+    long_window: int = 50
+    rsi_period: int = 14
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
+
+
+@app.post('/v1/backtest')
+@limiter.limit('10/minute')
+async def run_backtest(
+    request: Request,
+    body: BacktestRequest,
+    access_token: str = Header(None, alias='X-API-Key'),
+    access_token_alt: str = Header(None, alias='access-token'),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(403, 'Unauthorized')
+    try:
+        import asyncio
+
+        from core.backtester import BacktestEngine, MACrossover, RSIStrategy, MACDStrategy
+
+        strategies = {
+            'ma_crossover': MACrossover(short=body.short_window, long=body.long_window),
+            'rsi': RSIStrategy(period=body.rsi_period, oversold=body.rsi_oversold, overbought=body.rsi_overbought),
+            'macd': MACDStrategy(),
+        }
+        if body.strategy not in strategies:
+            raise HTTPException(400, f'Unknown strategy. Choose: {list(strategies.keys())}')
+        engine = BacktestEngine()
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.run,
+            body.ticker,
+            strategies[body.strategy],
+            body.start_date,
+            body.end_date,
+            body.initial_capital,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('[backtest] %s', exc)
+        raise HTTPException(500, f'Backtest error: {exc}')
