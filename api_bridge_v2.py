@@ -3846,3 +3846,60 @@ async def stock_screener(
     except Exception as exc:
         logger.error("[screener] %s", exc)
         raise HTTPException(500, f"Screener error: {exc}")
+
+
+# ── H-4: Forex Pairs ──────────────────────────────────────────────────────────
+
+@app.get("/v1/forex")
+@limiter.limit("20/minute")
+async def get_forex(
+    request: Request,
+    category: str = "all",   # all | arab | major | em
+    use_cache: bool = True,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """Live FX rates — Arab pairs (AED/SAR/EGP/KWD/QAR/BHD) + major pairs."""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from core.forex import ForexFetcher
+        pairs = await asyncio.get_event_loop().run_in_executor(
+            None, ForexFetcher().fetch, use_cache
+        )
+        if category != "all":
+            pairs = [p for p in pairs if p.get("category") == category]
+        return {"count": len(pairs), "pairs": pairs}
+    except Exception as exc:
+        logger.error("[forex] %s", exc)
+        raise HTTPException(status_code=500, detail=f"Forex error: {exc}")
+
+
+@app.get("/v1/forex/{symbol}")
+@limiter.limit("30/minute")
+async def get_forex_pair(
+    request: Request,
+    symbol: str,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """Single FX pair — e.g. /v1/forex/USDAED=X or /v1/forex/EURUSD"""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from core.forex import ForexFetcher
+        # normalise: add =X suffix if missing
+        sym = symbol.upper()
+        if not sym.endswith("=X"):
+            sym += "=X"
+        pair = await asyncio.get_event_loop().run_in_executor(
+            None, ForexFetcher().get_pair, sym
+        )
+        if not pair:
+            raise HTTPException(status_code=404, detail=f"Pair {sym} not found")
+        return pair
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[forex/%s] %s", symbol, exc)
+        raise HTTPException(status_code=500, detail=f"Forex error: {exc}")
