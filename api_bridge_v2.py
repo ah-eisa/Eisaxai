@@ -3730,6 +3730,59 @@ async def get_sentiment_trend(
         raise HTTPException(status_code=500, detail=f"Sentiment trend error: {exc}")
 
 
+class BacktestRequest(BaseModel):
+    ticker: str
+    strategy: str  # 'ma_crossover' | 'rsi' | 'macd'
+    start_date: str  # YYYY-MM-DD
+    end_date: str    # YYYY-MM-DD
+    initial_capital: float = 10000.0
+    short_window: int = 20
+    long_window: int = 50
+    rsi_period: int = 14
+    rsi_oversold: float = 30.0
+    rsi_overbought: float = 70.0
+
+
+@app.post('/v1/backtest')
+@limiter.limit('10/minute')
+async def run_backtest(
+    request: Request,
+    body: BacktestRequest,
+    access_token: str = Header(None, alias='X-API-Key'),
+    access_token_alt: str = Header(None, alias='access-token'),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(403, 'Unauthorized')
+    try:
+        import asyncio
+
+        from core.backtester import BacktestEngine, MACrossover, RSIStrategy, MACDStrategy
+
+        strategies = {
+            'ma_crossover': MACrossover(short=body.short_window, long=body.long_window),
+            'rsi': RSIStrategy(period=body.rsi_period, oversold=body.rsi_oversold, overbought=body.rsi_overbought),
+            'macd': MACDStrategy(),
+        }
+        if body.strategy not in strategies:
+            raise HTTPException(400, f'Unknown strategy. Choose: {list(strategies.keys())}')
+        engine = BacktestEngine()
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine.run,
+            body.ticker,
+            strategies[body.strategy],
+            body.start_date,
+            body.end_date,
+            body.initial_capital,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error('[backtest] %s', exc)
+        raise HTTPException(500, f'Backtest error: {exc}')
+
+
 class ScreenerRequest(BaseModel):
     tickers: list[str] = Field(default_factory=list)
     universe: str = "us_large_cap"  # 'us_large_cap'|'uae'|'egypt'|'saudi'|'custom'
@@ -3789,56 +3842,3 @@ async def stock_screener(
     except Exception as exc:
         logger.error("[screener] %s", exc)
         raise HTTPException(500, f"Screener error: {exc}")
-
-
-class BacktestRequest(BaseModel):
-    ticker: str
-    strategy: str  # 'ma_crossover' | 'rsi' | 'macd'
-    start_date: str  # YYYY-MM-DD
-    end_date: str    # YYYY-MM-DD
-    initial_capital: float = 10000.0
-    short_window: int = 20
-    long_window: int = 50
-    rsi_period: int = 14
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 70.0
-
-
-@app.post('/v1/backtest')
-@limiter.limit('10/minute')
-async def run_backtest(
-    request: Request,
-    body: BacktestRequest,
-    access_token: str = Header(None, alias='X-API-Key'),
-    access_token_alt: str = Header(None, alias='access-token'),
-):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, 'Unauthorized')
-    try:
-        import asyncio
-
-        from core.backtester import BacktestEngine, MACrossover, RSIStrategy, MACDStrategy
-
-        strategies = {
-            'ma_crossover': MACrossover(short=body.short_window, long=body.long_window),
-            'rsi': RSIStrategy(period=body.rsi_period, oversold=body.rsi_oversold, overbought=body.rsi_overbought),
-            'macd': MACDStrategy(),
-        }
-        if body.strategy not in strategies:
-            raise HTTPException(400, f'Unknown strategy. Choose: {list(strategies.keys())}')
-        engine = BacktestEngine()
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            engine.run,
-            body.ticker,
-            strategies[body.strategy],
-            body.start_date,
-            body.end_date,
-            body.initial_capital,
-        )
-        return result
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error('[backtest] %s', exc)
-        raise HTTPException(500, f'Backtest error: {exc}')
