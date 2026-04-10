@@ -363,6 +363,66 @@ class SessionManager:
             logging.getLogger(__name__).debug("get_user_daily_usage error: %s", e)
             return {"used": 0, "limit": 0, "tier": "basic", "remaining": 999, "pct_used": 0.0}
 
+    def get_user_usage_stats(self, user_id: str, days: int = 30) -> dict:
+        """Return daily/monthly usage stats for a user."""
+        import datetime
+        import re as _re
+
+        today = datetime.date.today()
+        period_start = (today - datetime.timedelta(days=days)).isoformat()
+
+        try:
+            with db.get_cursor() as (conn, c):
+                total = c.execute(
+                    'SELECT COUNT(*) FROM chat_history WHERE user_id=? AND role="user" AND timestamp>=?',
+                    (user_id, period_start),
+                ).fetchone()[0]
+
+                daily = {}
+                for i in range(13, -1, -1):
+                    day = (today - datetime.timedelta(days=i)).isoformat()
+                    count = c.execute(
+                        'SELECT COUNT(*) FROM chat_history WHERE user_id=? AND role="user" AND DATE(timestamp)=?',
+                        (user_id, day),
+                    ).fetchone()[0]
+                    daily[day] = count
+
+                today_count = c.execute(
+                    'SELECT COUNT(*) FROM chat_history WHERE user_id=? AND role="user" AND DATE(timestamp)=?',
+                    (user_id, today.isoformat()),
+                ).fetchone()[0]
+
+                rows = c.execute(
+                    'SELECT content FROM chat_history WHERE user_id=? AND role="user" ORDER BY timestamp DESC LIMIT 200',
+                    (user_id,),
+                ).fetchall()
+                ticker_counts = {}
+                stopwords = {"I", "THE", "AND", "FOR", "OR", "BUT", "NOT", "NEW", "ALL", "USD"}
+                for (content,) in rows:
+                    for match in _re.findall(r"\b([A-Z]{2,5})\b", content or ""):
+                        if match not in stopwords:
+                            ticker_counts[match] = ticker_counts.get(match, 0) + 1
+                top_tickers = sorted(ticker_counts.items(), key=lambda item: -item[1])[:5]
+
+            profile = self.get_user_profile(user_id)
+            quota = self.get_user_daily_usage(user_id)
+
+            return {
+                "user_id": user_id,
+                "period_days": days,
+                "total_messages": total,
+                "today": today_count,
+                "daily_limit": quota["limit"],
+                "remaining_today": quota["remaining"],
+                "tier": profile.get("tier", "basic"),
+                "messages_per_day": daily,
+                "top_tickers": [{"ticker": key, "count": value} for key, value in top_tickers],
+                "avg_per_day": round(total / days, 1),
+            }
+        except Exception as e:
+            logging.getLogger(__name__).debug("get_user_usage_stats error: %s", e)
+            return {"user_id": user_id, "error": str(e)}
+
     def get_quota_header(self, user_id: str) -> dict:
         usage = self.get_user_daily_usage(user_id)
         return {

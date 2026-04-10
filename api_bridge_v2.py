@@ -3268,5 +3268,19 @@ async def admin_analytics_data(
     }
 
 
+@app.get("/v1/usage")
+@limiter.limit("30/minute")
+async def user_usage(
+    request: Request,
+    user_id: str = "anonymous",
+    days: int = 30,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    return orchestrator.session_mgr.get_user_usage_stats(user_id, days=min(days, 90))
+
+
 if __name__ == "__main__":
     uvicorn.run("api_bridge_v2:app", host="0.0.0.0", port=8000, workers=2)
