@@ -3629,3 +3629,102 @@ async def billing_portal(
     except Exception as exc:
         logger.error("[billing/portal] %s", exc)
         raise HTTPException(status_code=500, detail="Billing service error")
+
+
+# ── G-8: News Sentiment NLP ───────────────────────────────────────────────────
+
+@app.get("/v1/sentiment/{ticker}")
+@limiter.limit("20/minute")
+async def get_ticker_sentiment(
+    request: Request,
+    ticker: str,
+    use_cache: bool = True,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """VADER sentiment analysis on recent news for a single ticker."""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from core.sentiment import SentimentAnalyzer
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, SentimentAnalyzer().analyze_ticker, ticker.upper(), use_cache
+        )
+        return result
+    except Exception as exc:
+        logger.error("[sentiment] ticker=%s %s", ticker, exc)
+        raise HTTPException(status_code=500, detail=f"Sentiment error: {exc}")
+
+
+@app.post("/v1/sentiment/batch")
+@limiter.limit("5/minute")
+async def get_batch_sentiment(
+    request: Request,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """Analyze sentiment for multiple tickers at once (max 10)."""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    tickers   = [str(t).upper().strip() for t in body.get("tickers", []) if t][:10]
+    use_cache = bool(body.get("use_cache", True))
+    if not tickers:
+        raise HTTPException(status_code=400, detail="Provide 'tickers' list (max 10)")
+    try:
+        from core.sentiment import SentimentAnalyzer
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, SentimentAnalyzer().analyze_many, tickers, use_cache
+        )
+        return {"count": len(results), "results": results}
+    except Exception as exc:
+        logger.error("[sentiment/batch] %s", exc)
+        raise HTTPException(status_code=500, detail=f"Sentiment error: {exc}")
+
+
+@app.get("/v1/sentiment/market/overview")
+@limiter.limit("10/minute")
+async def get_market_sentiment(
+    request: Request,
+    use_cache: bool = True,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """Aggregate market sentiment from major ETF news (SPY/QQQ/DIA)."""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from core.sentiment import SentimentAnalyzer
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, SentimentAnalyzer().market_sentiment, use_cache
+        )
+        return result
+    except Exception as exc:
+        logger.error("[sentiment/market] %s", exc)
+        raise HTTPException(status_code=500, detail=f"Sentiment error: {exc}")
+
+
+@app.get("/v1/sentiment/{ticker}/trend")
+@limiter.limit("20/minute")
+async def get_sentiment_trend(
+    request: Request,
+    ticker: str,
+    hours: int = 48,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    """Historical sentiment trend (hourly buckets) from local DB."""
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        from core.sentiment import SentimentAnalyzer
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, SentimentAnalyzer().sentiment_trend, ticker.upper(), min(hours, 720)
+        )
+        return result
+    except Exception as exc:
+        logger.error("[sentiment/trend] ticker=%s %s", ticker, exc)
+        raise HTTPException(status_code=500, detail=f"Sentiment trend error: {exc}")
