@@ -406,6 +406,14 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
     except Exception:
         last_analysis_at = None
 
+    # ── Redis health ──────────────────────────────────────────────────────────
+    redis_status: dict = {}
+    try:
+        from core.redis_store import redis_info
+        redis_status = redis_info()
+    except Exception as exc:
+        redis_status = {"available": False, "error": str(exc)}
+
     return {
         "status": overall_status,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -414,6 +422,7 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
         "version": _VERSION,
         "last_analysis_at": last_analysis_at,
         "llm_providers": llm_providers,
+        "redis": redis_status,
         "services": services,
         "summary": summary,
     }

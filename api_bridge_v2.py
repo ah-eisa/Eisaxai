@@ -27,6 +27,30 @@ from core.export_engine import export as export_engine
 from contextlib import asynccontextmanager
 # learning_engine runs as a separate service (eisax-learning.service)
 
+
+def _resolve_auth(
+    x_api_key: str = Header(None, alias='X-API-Key'),
+    access_token: str = Header(None, alias='access-token'),
+    authorization: str = Header(None, alias='Authorization'),
+) -> dict:
+    token = x_api_key or access_token
+    bearer = (authorization or '').removeprefix('Bearer ').strip()
+    # 1. Personal API key (starts with eixa_)
+    if token and token.startswith('eixa_'):
+        from core.api_keys import validate_key
+        info = validate_key(token)
+        if info: return {'user_id': info['user_id'], 'tier': info['tier'], 'method': 'api_key'}
+        raise HTTPException(401, 'Invalid API key')
+    if bearer and bearer.startswith('eixa_'):
+        from core.api_keys import validate_key
+        info = validate_key(bearer)
+        if info: return {'user_id': info['user_id'], 'tier': info['tier'], 'method': 'api_key'}
+        raise HTTPException(401, 'Invalid API key')
+    # 2. Legacy SECURE_TOKEN
+    if SECURE_TOKEN and (token == SECURE_TOKEN or bearer == SECURE_TOKEN):
+        return {'user_id': 'admin', 'tier': 'vip', 'method': 'secure_token'}
+    raise HTTPException(403, 'Unauthorized')
+
 # ── Logging with rotation (max 10MB per file, keep 3 backups) ──────────────
 _log_handler = RotatingFileHandler(
     str(BACKEND_LOG),
@@ -2960,6 +2984,34 @@ def _require_admin(payload: dict = Depends(_require_jwt)) -> dict:
     return payload
 
 
+def _resolve_user_context(
+    access_token: Optional[str] = None,
+    access_token_alt: Optional[str] = None,
+    authorization: Optional[str] = None,
+) -> dict:
+    bearer = (authorization or "").removeprefix("Bearer ").strip()
+    if bearer and not bearer.startswith("eixa_") and bearer != SECURE_TOKEN:
+        try:
+            payload = decode_token(bearer)
+        except _jwt.ExpiredSignatureError:
+            raise HTTPException(status_code=401, detail="Token expired")
+        except _jwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {
+            "user_id": payload["sub"],
+            "tier": "jwt",
+            "method": "jwt",
+            "role": payload.get("role", "user"),
+        }
+    auth = _resolve_auth(
+        x_api_key=access_token,
+        access_token=access_token_alt,
+        authorization=authorization,
+    )
+    auth["role"] = "admin" if auth["user_id"] == "admin" else "user"
+    return auth
+
+
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
     email:    str
@@ -2978,6 +3030,16 @@ class UpdateUserRequest(BaseModel):
     name:      Optional[str] = None
     role:      Optional[str] = None
     is_active: Optional[int] = None
+
+
+class APIKeyCreateRequest(BaseModel):
+    name: str = "Default"
+    tier: str = "basic"
+    daily_limit: int = 0
+
+
+class APIKeyValidateRequest(BaseModel):
+    key: Optional[str] = None
 
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
@@ -3030,6 +3092,80 @@ async def auth_me(request: Request, payload: dict = Depends(_require_jwt)):
         "name":  user["name"],
         "role":  user["role"],
     }
+
+
+@app.post("/v1/keys")
+@limiter.limit("20/minute")
+async def create_api_key(
+    request: Request,
+    body: APIKeyCreateRequest,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    authorization: str = Header(None, alias="Authorization"),
+):
+    from core.api_keys import generate_key
+
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
+    raw_key = generate_key(str(auth["user_id"]), body.name, body.tier, body.daily_limit)
+    return {
+        "key": raw_key,
+        "key_prefix": raw_key[:12],
+        "user_id": str(auth["user_id"]),
+        "name": body.name,
+        "tier": body.tier,
+        "daily_limit": body.daily_limit,
+        "method": auth["method"],
+    }
+
+
+@app.get("/v1/keys")
+@limiter.limit("20/minute")
+async def get_api_keys(
+    request: Request,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    authorization: str = Header(None, alias="Authorization"),
+):
+    from core.api_keys import list_user_keys
+
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
+    return {
+        "user_id": str(auth["user_id"]),
+        "keys": list_user_keys(str(auth["user_id"])),
+    }
+
+
+@app.delete("/v1/keys/{key_id}")
+@limiter.limit("20/minute")
+async def delete_api_key(
+    request: Request,
+    key_id: int,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    authorization: str = Header(None, alias="Authorization"),
+):
+    from core.api_keys import revoke_key
+
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
+    revoke_key(key_id, str(auth["user_id"]))
+    return {"ok": True, "key_id": key_id}
+
+
+@app.post("/v1/keys/validate")
+@limiter.limit("20/minute")
+async def validate_api_key_endpoint(
+    request: Request,
+    body: Optional[APIKeyValidateRequest] = None,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    authorization: str = Header(None, alias="Authorization"),
+):
+    resolved = _resolve_auth(
+        x_api_key=(body.key if body else None) or access_token,
+        access_token=access_token_alt,
+        authorization=authorization,
+    )
+    return {"valid": True, **resolved}
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────
@@ -3284,3 +3420,136 @@ async def user_usage(
 
 if __name__ == "__main__":
     uvicorn.run("api_bridge_v2:app", host="0.0.0.0", port=8000, workers=2)
+
+
+# ── F-5: Redis Health ─────────────────────────────────────────────────────────
+
+@app.get("/v1/redis/health")
+@limiter.limit("30/minute")
+async def redis_health(
+    request: Request,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from core.redis_store import redis_info
+    return redis_info()
+
+
+# ── F-6: Referral System ──────────────────────────────────────────────────────
+
+@app.get("/v1/referral")
+@limiter.limit("30/minute")
+async def get_referral(
+    request: Request,
+    user_id:          str = "anonymous",
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from core.referrals import get_referral_stats
+    return get_referral_stats(user_id)
+
+
+@app.post("/v1/referral/apply")
+@limiter.limit("5/minute")
+async def apply_referral_code(
+    request: Request,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    user_id = str(body.get("user_id", "")).strip()
+    code    = str(body.get("code", "")).strip()
+    if not user_id or not code:
+        raise HTTPException(status_code=400, detail="Required: user_id, code")
+    from core.referrals import apply_referral
+    result = apply_referral(user_id, code)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+# ── F-7: Outbound Webhooks ────────────────────────────────────────────────────
+
+class WebhookConfig(BaseModel):
+    user_id:  str
+    url:      str
+    events:   list = Field(default_factory=lambda: ["analysis_complete"])
+    secret:   str = ""
+
+
+@app.post("/v1/webhooks")
+@limiter.limit("10/minute")
+async def register_webhook(
+    request: Request,
+    body: WebhookConfig,
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    import sqlite3 as _sl2
+    conn = _sl2.connect(str(APP_DB))
+    conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL, url TEXT NOT NULL,
+        events TEXT NOT NULL DEFAULT '[]',
+        secret TEXT NOT NULL DEFAULT '',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
+    cur = conn.execute(
+        "INSERT INTO webhooks(user_id,url,events,secret) VALUES(?,?,?,?)",
+        (body.user_id, body.url, _json.dumps(body.events), body.secret))
+    wid = cur.lastrowid; conn.commit(); conn.close()
+    logger.info("[webhooks] registered %d for %s → %s", wid, body.user_id, body.url)
+    return {"webhook_id": wid, "status": "registered", "url": body.url}
+
+
+@app.get("/v1/webhooks")
+@limiter.limit("30/minute")
+async def list_webhooks(
+    request: Request,
+    user_id:          str = "anonymous",
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    import sqlite3 as _sl2
+    conn = _sl2.connect(str(APP_DB)); conn.row_factory = _sl2.Row
+    try:
+        rows = conn.execute(
+            "SELECT id,url,events,active,created_at FROM webhooks WHERE user_id=? ORDER BY created_at DESC",
+            (user_id,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+@app.delete("/v1/webhooks/{webhook_id}")
+@limiter.limit("20/minute")
+async def delete_webhook(
+    request: Request,
+    webhook_id: int,
+    user_id:          str = "anonymous",
+    access_token:     str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    if (access_token or access_token_alt) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    import sqlite3 as _sl2
+    conn = _sl2.connect(str(APP_DB))
+    conn.execute("CREATE TABLE IF NOT EXISTS webhooks (id INTEGER PRIMARY KEY, user_id TEXT, active INTEGER)")
+    conn.execute("UPDATE webhooks SET active=0 WHERE id=? AND user_id=?", (webhook_id, user_id))
+    conn.commit(); conn.close()
+    return {"status": "deleted", "webhook_id": webhook_id}
