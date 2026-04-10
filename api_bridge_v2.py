@@ -39,6 +39,21 @@ logging.basicConfig(level=logging.INFO, handlers=[_log_handler, logging.StreamHa
 logger = logging.getLogger("api_bridge")
 
 limiter = Limiter(key_func=get_remote_address)
+import subprocess as _subprocess
+_GIT_SHA = 'unknown'
+try:
+    _GIT_SHA = _subprocess.check_output(
+        ['git', 'rev-parse', '--short', 'HEAD'],
+        cwd='/home/ubuntu/investwise',
+        text=True,
+    ).strip()
+except Exception:
+    pass
+_APP_VERSION = '2.0.0'
+try:
+    _APP_VERSION = open('/home/ubuntu/investwise/version.txt').read().strip()
+except Exception:
+    pass
 
 @asynccontextmanager
 async def lifespan(app):
@@ -2448,8 +2463,9 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
 
             combined = "\n\n".join(m.get("content", "") for m in smart)
 
-            generate_cio_pdf(combined, out_path, ticker=ticker, title=title, lang=_lang)
-            result = {"success": True, "filename": filename}
+            pdf_result = generate_cio_pdf(combined, out_path, ticker=ticker, title=title, lang=_lang)
+            report_id = pdf_result[1] if isinstance(pdf_result, tuple) and len(pdf_result) > 1 else None
+            result = {"success": True, "filename": filename, "report_id": report_id}
 
         elif fmt in ("docx", "word"):
             from core.cio_docx import generate_cio_docx
@@ -2463,8 +2479,9 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
 
             combined = "\n\n".join(m.get("content", "") for m in smart)
 
-            generate_cio_docx(combined, out_path, ticker=ticker, title=title)
-            result = {"success": True, "filename": filename}
+            docx_result = generate_cio_docx(combined, out_path, ticker=ticker, title=title)
+            report_id = docx_result[1] if isinstance(docx_result, tuple) and len(docx_result) > 1 else None
+            result = {"success": True, "filename": filename, "report_id": report_id}
         else:
             result = export_engine(fmt, smart, title)
         if not result.get("success"):
@@ -2474,7 +2491,14 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
         dst = os.path.join(export_dir, filename)
         if src and os.path.exists(src) and src != dst:
             shutil.copy2(src, dst)
-        return {"success": True, "filename": filename, "download_url": f"/v1/download/{filename}", "title": title, "format": fmt}
+        return {
+            "success": True,
+            "filename": filename,
+            "download_url": f"/v1/download/{filename}",
+            "title": title,
+            "format": fmt,
+            "report_id": result.get("report_id"),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -2530,6 +2554,12 @@ async def brain_wisdom(request: Request, access_token: str = Header(None, alias=
         "lessons": [dict(r) for r in lessons],
         "engine_stats": engine._stats
     }
+
+@app.get('/v1/version')
+@limiter.limit('60/minute')
+async def app_version(request: Request):
+    return {'version': _APP_VERSION, 'git_sha': _GIT_SHA, 'build_date': '2026-04-10', 'env': 'production'}
+
 if __name__ == "__main__":
     uvicorn.run("api_bridge_v2:app", host="0.0.0.0", port=8000, workers=2)
 
