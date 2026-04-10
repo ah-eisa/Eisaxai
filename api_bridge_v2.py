@@ -8,7 +8,7 @@ from core.config import (
 )
 from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Form, Request, Depends
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -1937,14 +1937,19 @@ async def unified_chat(
         orchestrator.session_mgr.mark_admin_messages_delivered(payload.user_id)
         combined = "\n\n".join(f"📢 {m['content']}" for m in pending)
         orchestrator.session_mgr.save_message(session_id, payload.user_id, "assistant", combined)
-        return {
+        response_body = {
             "reply": combined,
             "session_id": session_id,
             "agent": "Admin",
             "model": None,
             "download_url": None,
             "format": None,
+            "quota": orchestrator.session_mgr.get_user_daily_usage(payload.user_id),
         }
+        return JSONResponse(
+            content=response_body,
+            headers=orchestrator.session_mgr.get_quota_header(payload.user_id),
+        )
 
     message = payload.message
 
@@ -1988,15 +1993,20 @@ async def unified_chat(
         message=message,
         session_id=session_id
     )
-    
-    return {
+    quota = orchestrator.session_mgr.get_user_daily_usage(payload.user_id)
+    response_body = {
         "reply": result.get("reply") or result.get("response") or "",
         "session_id": session_id,
         "agent": result.get("agent_name", "EisaX"),
         "model": result.get("model"),
         "download_url": result.get("download_url"),
-        "format": result.get("format")
+        "format": result.get("format"),
+        "quota": quota,
     }
+    return JSONResponse(
+        content=response_body,
+        headers=orchestrator.session_mgr.get_quota_header(payload.user_id),
+    )
 
 # Backward-compatible aliases used by older UI pages (/chat and /api/chat).
 @app.post("/chat")
