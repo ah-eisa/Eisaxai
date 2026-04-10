@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InvestWise Admin Analytics</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f0f1a;
+      --bg-soft: #161726;
+      --panel: rgba(24, 26, 42, 0.94);
+      --panel-strong: #1c1f33;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f5f7ff;
+      --muted: #98a2bd;
+      --accent: #00d4aa;
+      --accent-soft: rgba(0, 212, 170, 0.15);
+      --accent-2: #24a0ff;
+      --danger: #ff6b8b;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at top right, rgba(36, 160, 255, 0.14), transparent 26%),
+        radial-gradient(circle at top left, rgba(0, 212, 170, 0.16), transparent 30%),
+        linear-gradient(180deg, #10111d 0%, var(--bg) 55%, #0b0c14 100%);
+      color: var(--text);
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+
+    body {
+      padding: 24px;
+    }
+
+    .shell {
+      max-width: 1380px;
+      margin: 0 auto;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 22px;
+    }
+
+    .headline h1 {
+      margin: 0 0 6px;
+      font-size: clamp(28px, 4vw, 42px);
+      letter-spacing: -0.03em;
+    }
+
+    .headline p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--muted);
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+
+    button {
+      border: 1px solid rgba(0, 212, 170, 0.24);
+      background: linear-gradient(180deg, rgba(0, 212, 170, 0.2), rgba(0, 212, 170, 0.08));
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+      transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(0, 212, 170, 0.5);
+      background: linear-gradient(180deg, rgba(0, 212, 170, 0.28), rgba(0, 212, 170, 0.12));
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .card,
+    .panel {
+      border: 1px solid var(--border);
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.02));
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow);
+      border-radius: 22px;
+    }
+
+    .card {
+      padding: 18px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card::after {
+      content: "";
+      position: absolute;
+      inset: auto -30px -30px auto;
+      width: 90px;
+      height: 90px;
+      background: radial-gradient(circle, rgba(0, 212, 170, 0.18), transparent 70%);
+      pointer-events: none;
+    }
+
+    .card label {
+      display: block;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+
+    .card strong {
+      display: block;
+      font-size: clamp(26px, 3vw, 38px);
+      letter-spacing: -0.04em;
+      margin-bottom: 8px;
+    }
+
+    .card span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 18px;
+    }
+
+    .panel {
+      padding: 18px 18px 16px;
+    }
+
+    .panel h2 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .panel p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .panel canvas {
+      width: 100% !important;
+      height: 320px !important;
+    }
+
+    .panel.full {
+      margin-top: 18px;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 680px;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      text-align: left;
+      font-size: 13px;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 11px;
+      background: rgba(255, 255, 255, 0.03);
+      position: sticky;
+      top: 0;
+    }
+
+    tbody tr:hover {
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .user-chip {
+      display: inline-block;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: rgba(36, 160, 255, 0.14);
+      color: #87c9ff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .preview {
+      max-width: 760px;
+      color: #d8def2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .empty,
+    .error {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px dashed var(--border);
+      color: var(--muted);
+      text-align: center;
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .error {
+      color: #ffc4cf;
+      border-color: rgba(255, 107, 139, 0.28);
+      background: rgba(255, 107, 139, 0.08);
+    }
+
+    @media (max-width: 1100px) {
+      .stats,
+      .grid {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 16px;
+      }
+
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .stats,
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .panel canvas {
+        height: 280px !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topbar">
+      <div class="headline">
+        <h1>Admin Analytics</h1>
+        <p>Usage telemetry across chats, sessions, profiles, and extracted ticker mentions.</p>
+      </div>
+      <div class="actions">
+        <div class="pill"><span class="dot"></span><span id="statusText">Waiting for token</span></div>
+        <div class="pill" id="refreshStamp">Not loaded yet</div>
+        <button id="refreshBtn" type="button">Refresh</button>
+        <button id="tokenBtn" type="button">Change Token</button>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="card">
+        <label>Total Users</label>
+        <strong id="totalUsers">-</strong>
+        <span>Distinct users from stored sessions.</span>
+      </div>
+      <div class="card">
+        <label>Messages Today</label>
+        <strong id="messagesToday">-</strong>
+        <span>All chat rows stamped on the current UTC date.</span>
+      </div>
+      <div class="card">
+        <label>Active Sessions (24h)</label>
+        <strong id="activeSessions">-</strong>
+        <span>Unique chat participants seen in the last 24 hours.</span>
+      </div>
+      <div class="card">
+        <label>Top Ticker</label>
+        <strong id="topTicker">-</strong>
+        <span>Most frequent ticker mention in recent chat history.</span>
+      </div>
+    </div>
+
+    <div id="messageBox" class="empty">Provide an admin token to load analytics.</div>
+
+    <div id="dashboard" hidden>
+      <div class="grid">
+        <section class="panel">
+          <h2>Messages Per Day</h2>
+          <p>Last 14 UTC calendar days of chat volume.</p>
+          <canvas id="messagesChart"></canvas>
+        </section>
+
+        <section class="panel">
+          <h2>Tier Distribution</h2>
+          <p>User profile breakdown by assigned tier.</p>
+          <canvas id="tiersChart"></canvas>
+        </section>
+
+        <section class="panel" style="grid-column: 1 / -1;">
+          <h2>Top Mentioned Tickers</h2>
+          <p>Top 10 recent ticker symbols extracted with <code>[A-Z]{2,5}</code>.</p>
+          <canvas id="tickersChart"></canvas>
+        </section>
+      </div>
+
+      <section class="panel full">
+        <h2>Recent Messages</h2>
+        <p>Last 20 chat entries with shortened user IDs and content previews.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>User</th>
+                <th>Preview</th>
+              </tr>
+            </thead>
+            <tbody id="recentTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const TOKEN_KEY = "admin_analytics_token";
+      const charts = {};
+
+      const statusText = document.getElementById("statusText");
+      const refreshStamp = document.getElementById("refreshStamp");
+      const messageBox = document.getElementById("messageBox");
+      const dashboard = document.getElementById("dashboard");
+      const recentTableBody = document.getElementById("recentTableBody");
+
+      const summaryEls = {
+        totalUsers: document.getElementById("totalUsers"),
+        messagesToday: document.getElementById("messagesToday"),
+        activeSessions: document.getElementById("activeSessions"),
+        topTicker: document.getElementById("topTicker"),
+      };
+
+      function numberFormat(value) {
+        return new Intl.NumberFormat().format(Number(value || 0));
+      }
+
+      function escapeHtml(value) {
+        return String(value || "").replace(/[&<>"']/g, (ch) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        }[ch]));
+      }
+
+      function getTokenFromUrl() {
+        return new URLSearchParams(window.location.search).get("token") || "";
+      }
+
+      function setTokenInUrl(token) {
+        const url = new URL(window.location.href);
+        if (token) {
+          url.searchParams.set("token", token);
+        } else {
+          url.searchParams.delete("token");
+        }
+        window.history.replaceState({}, "", url.toString());
+      }
+
+      function getToken() {
+        return getTokenFromUrl() || localStorage.getItem(TOKEN_KEY) || "";
+      }
+
+      function saveToken(token) {
+        if (token) {
+          localStorage.setItem(TOKEN_KEY, token);
+          setTokenInUrl(token);
+        } else {
+          localStorage.removeItem(TOKEN_KEY);
+          setTokenInUrl("");
+        }
+      }
+
+      function promptForToken(forcePrompt) {
+        const existing = forcePrompt ? "" : getToken();
+        const token = window.prompt("Enter admin access token", existing);
+        if (token === null) {
+          return "";
+        }
+        const cleaned = token.trim();
+        saveToken(cleaned);
+        return cleaned;
+      }
+
+      function setMessage(text, kind) {
+        messageBox.className = kind || "empty";
+        messageBox.textContent = text;
+      }
+
+      function setSummary(summary) {
+        summaryEls.totalUsers.textContent = numberFormat(summary.total_users);
+        summaryEls.messagesToday.textContent = numberFormat(summary.messages_today);
+        summaryEls.activeSessions.textContent = numberFormat(summary.active_sessions_24h);
+        summaryEls.topTicker.textContent = summary.top_ticker || "N/A";
+      }
+
+      function destroyChart(key) {
+        if (charts[key]) {
+          charts[key].destroy();
+        }
+      }
+
+      function buildMessagesChart(messagesPerDay) {
+        destroyChart("messages");
+        const labels = Object.keys(messagesPerDay);
+        const values = Object.values(messagesPerDay);
+        charts.messages = new Chart(document.getElementById("messagesChart"), {
+          type: "line",
+          data: {
+            labels,
+            datasets: [{
+              label: "Messages",
+              data: values,
+              borderColor: "#00d4aa",
+              backgroundColor: "rgba(0, 212, 170, 0.18)",
+              fill: true,
+              pointRadius: 3,
+              pointHoverRadius: 5,
+              tension: 0.32,
+            }],
+          },
+          options: baseOptions({
+            scales: {
+              x: { ticks: { color: "#98a2bd" }, grid: { color: "rgba(255,255,255,0.04)" } },
+              y: { ticks: { color: "#98a2bd", precision: 0 }, grid: { color: "rgba(255,255,255,0.05)" } },
+            },
+          }),
+        });
+      }
+
+      function buildTiersChart(tierDistribution) {
+        destroyChart("tiers");
+        const labels = Object.keys(tierDistribution);
+        const values = Object.values(tierDistribution);
+        charts.tiers = new Chart(document.getElementById("tiersChart"), {
+          type: "doughnut",
+          data: {
+            labels: labels.length ? labels : ["No tiers"],
+            datasets: [{
+              data: values.length ? values : [1],
+              backgroundColor: values.length
+                ? ["#00d4aa", "#24a0ff", "#ffb84d", "#ff6b8b", "#8a7dff", "#59e3ff"]
+                : ["rgba(255,255,255,0.12)"],
+              borderColor: "#10111d",
+              borderWidth: 2,
+            }],
+          },
+          options: baseOptions({
+            plugins: {
+              legend: { position: "bottom", labels: { color: "#dbe2f5", padding: 18 } },
+            },
+          }),
+        });
+      }
+
+      function buildTickersChart(topTickers) {
+        destroyChart("tickers");
+        charts.tickers = new Chart(document.getElementById("tickersChart"), {
+          type: "bar",
+          data: {
+            labels: topTickers.map((item) => item.ticker),
+            datasets: [{
+              label: "Mentions",
+              data: topTickers.map((item) => item.count),
+              borderRadius: 10,
+              backgroundColor: [
+                "#00d4aa", "#11cfae", "#22c9b2", "#33c4b6", "#45bfba",
+                "#57b9be", "#69b4c2", "#7aaec6", "#8ca9ca", "#9ea3ce"
+              ],
+            }],
+          },
+          options: baseOptions({
+            indexAxis: "y",
+            scales: {
+              x: { ticks: { color: "#98a2bd", precision: 0 }, grid: { color: "rgba(255,255,255,0.05)" } },
+              y: { ticks: { color: "#dbe2f5" }, grid: { display: false } },
+            },
+            plugins: {
+              legend: { display: false },
+            },
+          }),
+        });
+      }
+
+      function baseOptions(extra) {
+        return Object.assign({
+          maintainAspectRatio: false,
+          responsive: true,
+          plugins: {
+            legend: { labels: { color: "#dbe2f5" } },
+            tooltip: {
+              backgroundColor: "#171a2b",
+              borderColor: "rgba(255,255,255,0.12)",
+              borderWidth: 1,
+              titleColor: "#ffffff",
+              bodyColor: "#d8def2",
+            },
+          },
+        }, extra || {});
+      }
+
+      function fillRecentTable(rows) {
+        recentTableBody.innerHTML = "";
+        if (!rows.length) {
+          recentTableBody.innerHTML = '<tr><td colspan="3" style="text-align:center;color:#98a2bd;">No recent messages found.</td></tr>';
+          return;
+        }
+
+        recentTableBody.innerHTML = rows.map((row) => `
+          <tr>
+            <td>${escapeHtml(row.ts || "-")}</td>
+            <td><span class="user-chip">${escapeHtml(row.user_id || "-")}</span></td>
+            <td><div class="preview">${escapeHtml(row.preview || "")}</div></td>
+          </tr>
+        `).join("");
+      }
+
+      async function loadData(forcePrompt) {
+        let token = getToken();
+        if (!token || forcePrompt) {
+          token = promptForToken(!!forcePrompt);
+        }
+        if (!token) {
+          statusText.textContent = "Token required";
+          dashboard.hidden = true;
+          setMessage("Provide an admin token to load analytics.", "empty");
+          return;
+        }
+
+        statusText.textContent = "Loading analytics";
+        setMessage("Loading dashboard data...", "empty");
+
+        try {
+          const response = await fetch(`/admin/analytics/data?token=${encodeURIComponent(token)}`, {
+            cache: "no-store",
+          });
+
+          if (response.status === 403) {
+            saveToken("");
+            statusText.textContent = "Unauthorized";
+            dashboard.hidden = true;
+            setMessage("Token rejected. Enter a valid admin token.", "error");
+            return;
+          }
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const payload = await response.json();
+          setSummary(payload.summary || {});
+          buildMessagesChart(payload.messages_per_day || {});
+          buildTiersChart(payload.tier_distribution || {});
+          buildTickersChart(payload.top_tickers || []);
+          fillRecentTable(payload.recent_activity || []);
+
+          dashboard.hidden = false;
+          statusText.textContent = "Live data loaded";
+          refreshStamp.textContent = `Updated ${new Date().toLocaleString()}`;
+          setMessage("Dashboard loaded successfully.", "empty");
+        } catch (error) {
+          dashboard.hidden = true;
+          statusText.textContent = "Load failed";
+          setMessage(`Failed to load analytics: ${error.message}`, "error");
+        }
+      }
+
+      document.getElementById("refreshBtn").addEventListener("click", () => loadData(false));
+      document.getElementById("tokenBtn").addEventListener("click", () => loadData(true));
+
+      if (getTokenFromUrl()) {
+        saveToken(getTokenFromUrl());
+      }
+
+      loadData(false);
+      window.setInterval(() => {
+        if (getToken()) {
+          loadData(false);
+        }
+      }, 60000);
+    })();
+  </script>
+</body>
+</html>

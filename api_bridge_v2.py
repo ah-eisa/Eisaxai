@@ -2555,13 +2555,34 @@ async def brain_wisdom(request: Request, access_token: str = Header(None, alias=
         "engine_stats": engine._stats
     }
 
+@app.post("/v1/alerts")
+@limiter.limit("20/minute")
+async def create_alert(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+    if (access_token or access_token_alt) != SECURE_TOKEN: raise HTTPException(403, "Unauthorized")
+    body = await request.json()
+    from core.price_alerts import add_alert
+    alert_id = add_alert(body.get('user_id','anonymous'), body['ticker'], body['condition'], body['threshold'])
+    return {'alert_id': alert_id, 'status': 'created'}
+
+@app.get("/v1/alerts")
+@limiter.limit("30/minute")
+async def list_alerts(request: Request, user_id: str = 'anonymous', access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+    if (access_token or access_token_alt) != SECURE_TOKEN: raise HTTPException(403, "Unauthorized")
+    from core.price_alerts import get_user_alerts
+    return get_user_alerts(user_id)
+
+@app.delete("/v1/alerts/{alert_id}")
+@limiter.limit("20/minute")
+async def remove_alert(request: Request, alert_id: int, user_id: str = 'anonymous', access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+    if (access_token or access_token_alt) != SECURE_TOKEN: raise HTTPException(403, "Unauthorized")
+    from core.price_alerts import delete_alert
+    delete_alert(alert_id, user_id)
+    return {'status': 'deleted'}
+
 @app.get('/v1/version')
 @limiter.limit('60/minute')
 async def app_version(request: Request):
     return {'version': _APP_VERSION, 'git_sha': _GIT_SHA, 'build_date': '2026-04-10', 'env': 'production'}
-
-if __name__ == "__main__":
-    uvicorn.run("api_bridge_v2:app", host="0.0.0.0", port=8000, workers=2)
 
 # ── HTML → PDF Export ──
 class HtmlExportPayload(BaseModel):
@@ -3146,3 +3167,106 @@ async def admin_logs_stream(request: Request, token: str = ""):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Analytics Dashboard ───────────────────────────────────────────────────────
+
+@app.get("/admin/analytics")
+@limiter.limit("30/minute")
+async def admin_analytics_page(
+    request: Request,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    token: str = "",
+):
+    if (access_token or access_token_alt or token) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    from fastapi.responses import FileResponse
+    return FileResponse(str(STATIC_DIR / "admin_analytics.html"))
+
+
+@app.get("/admin/analytics/data")
+@limiter.limit("30/minute")
+async def admin_analytics_data(
+    request: Request,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+    token: str = "",
+):
+    if (access_token or access_token_alt or token) != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    import sqlite3
+    import re as _re2
+    from datetime import datetime, timedelta, timezone
+    from core.config import APP_DB
+
+    conn = sqlite3.connect(str(APP_DB))
+    try:
+        today = datetime.now(timezone.utc).date()
+        days = [(today - timedelta(days=i)).isoformat() for i in range(13, -1, -1)]
+
+        msgs_per_day = {}
+        for day in days:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM chat_history WHERE DATE(timestamp)=?",
+                (day,),
+            ).fetchone()
+            msgs_per_day[day] = row[0] if row else 0
+
+        tiers = {}
+        for row in conn.execute(
+            "SELECT tier, COUNT(*) FROM user_profiles GROUP BY tier"
+        ).fetchall():
+            tiers[row[0] or "basic"] = row[1]
+
+        rows = conn.execute(
+            "SELECT content FROM chat_history ORDER BY timestamp DESC LIMIT 500"
+        ).fetchall()
+        ticker_counts = {}
+        for row in rows:
+            for match in _re2.findall(r"\b([A-Z]{2,5})\b", row[0] or ""):
+                if match not in ("I", "THE", "AND", "FOR", "OR", "BUT", "NOT", "NEW", "ALL", "USD", "ETF"):
+                    ticker_counts[match] = ticker_counts.get(match, 0) + 1
+        top_tickers = sorted(ticker_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+
+        total_users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM sessions"
+        ).fetchone()[0]
+        msgs_today = conn.execute(
+            "SELECT COUNT(*) FROM chat_history WHERE DATE(timestamp)=?",
+            (today.isoformat(),),
+        ).fetchone()[0]
+        active_24h = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM chat_history WHERE timestamp >= datetime('now','-24 hours')"
+        ).fetchone()[0]
+
+        recent = [
+            {
+                "user_id": f"{str(row[0] or 'unknown')[:12]}...",
+                "preview": (row[1] or "")[:60],
+                "ts": row[2],
+            }
+            for row in conn.execute(
+                "SELECT user_id, content, timestamp FROM chat_history ORDER BY timestamp DESC LIMIT 20"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+
+    return {
+        "messages_per_day": msgs_per_day,
+        "tier_distribution": tiers,
+        "top_tickers": [{"ticker": key, "count": value} for key, value in top_tickers],
+        "summary": {
+            "total_users": total_users,
+            "messages_today": msgs_today,
+            "active_sessions_24h": active_24h,
+            "top_ticker": top_tickers[0][0] if top_tickers else "N/A",
+        },
+        "recent_activity": recent,
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run("api_bridge_v2:app", host="0.0.0.0", port=8000, workers=2)
