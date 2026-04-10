@@ -88,7 +88,13 @@ def _compute_rsi(closes: pd.Series, period: int = 14) -> float | None:
 
 
 class StockScreener:
-    def screen(self, tickers: list[str], filters: ScreenerFilter, max_workers: int = 8) -> list[dict]:
+    def screen(
+        self,
+        tickers: list[str],
+        filters: ScreenerFilter,
+        max_workers: int = 8,
+        include_sentiment: bool = False,
+    ) -> list[dict]:
         universe = self._normalize_tickers(tickers)
         if not universe:
             return []
@@ -106,6 +112,27 @@ class StockScreener:
                 except Exception as exc:
                     logger.warning("Screener fetch failed for %s: %s", ticker, exc)
                     results.append(self._empty_result(ticker))
+
+        # G-9-A: enrich with sentiment (sequential, uses Redis cache)
+        if include_sentiment and results:
+            try:
+                from core.sentiment import SentimentAnalyzer
+                _sa = SentimentAnalyzer()
+                for row in results:
+                    try:
+                        sent = _sa.analyze_ticker(row["ticker"], use_cache=True)
+                        row["sentiment_score"]      = sent.get("score")
+                        row["sentiment_label"]      = sent.get("label")
+                        row["sentiment_confidence"] = sent.get("confidence")
+                        row["sentiment_freshness"]  = sent.get("freshness")
+                        row["sentiment_articles"]   = sent.get("article_count", 0)
+                    except Exception as _se:
+                        logger.debug("[screener] sentiment failed for %s: %s", row["ticker"], _se)
+                        row["sentiment_score"] = None
+                        row["sentiment_label"] = None
+            except Exception as exc:
+                logger.warning("[screener] sentiment enrichment failed: %s", exc)
+
         return results
 
     def _normalize_tickers(self, tickers: list[str]) -> list[str]:

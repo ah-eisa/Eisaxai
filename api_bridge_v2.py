@@ -3800,6 +3800,7 @@ class ScreenerRequest(BaseModel):
     revenue_growth_min: Optional[float] = None
     sector: Optional[str] = None
     max_results: int = 20
+    include_sentiment: bool = False   # G-9-A: enrich each result with news sentiment
 
 
 @app.post("/v1/screener")
@@ -3834,9 +3835,12 @@ async def stock_screener(
             sector=body.sector,
         )
         screener = StockScreener()
-        results = await asyncio.get_event_loop().run_in_executor(None, screener.screen, tickers, filters)
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, screener.screen, tickers, filters, 8, body.include_sentiment
+        )
         results = sorted(results, key=lambda x: x.get("score", 0), reverse=True)[:body.max_results]
-        return {"count": len(results), "universe": body.universe, "results": results}
+        return {"count": len(results), "universe": body.universe,
+                "sentiment_enriched": body.include_sentiment, "results": results}
     except HTTPException:
         raise
     except Exception as exc:

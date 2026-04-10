@@ -263,6 +263,220 @@
       background: rgba(255, 107, 139, 0.08);
     }
 
+    /* ── Sentiment Card ──────────────────────────────────────────────── */
+    .sentiment-section {
+      margin-bottom: 18px;
+    }
+
+    .sentiment-section .panel {
+      padding: 20px 22px 22px;
+    }
+
+    .sentiment-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .sentiment-header h2 {
+      margin: 0;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .sentiment-header-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .sentiment-timestamp {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .btn-sentiment-refresh {
+      padding: 7px 12px;
+      font-size: 12px;
+      border-radius: 10px;
+    }
+
+    .sentiment-pills {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 18px;
+    }
+
+    .sentiment-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid transparent;
+    }
+
+    .sentiment-pill.bullish {
+      background: rgba(0, 212, 170, 0.12);
+      border-color: rgba(0, 212, 170, 0.3);
+      color: #00d4aa;
+    }
+
+    .sentiment-pill.bearish {
+      background: rgba(255, 107, 139, 0.12);
+      border-color: rgba(255, 107, 139, 0.3);
+      color: #ff6b8b;
+    }
+
+    .sentiment-pill.neutral {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.14);
+      color: var(--muted);
+    }
+
+    .sentiment-pill .pill-count {
+      font-weight: 700;
+      font-size: 15px;
+    }
+
+    .sentiment-score-row {
+      margin-bottom: 20px;
+    }
+
+    .sentiment-score-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .sentiment-score-value {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .sentiment-bar-track {
+      position: relative;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.07);
+      overflow: visible;
+    }
+
+    /* centre tick mark */
+    .sentiment-bar-track::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: 2px;
+      height: 16px;
+      background: rgba(255, 255, 255, 0.18);
+      border-radius: 2px;
+    }
+
+    .sentiment-bar-fill {
+      position: absolute;
+      top: 0;
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.5s ease, left 0.5s ease, background 0.5s ease;
+    }
+
+    .sentiment-tickers-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .sentiment-ticker-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .sentiment-ticker-table th,
+    .sentiment-ticker-table td {
+      padding: 8px 10px;
+      font-size: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      text-align: left;
+      min-width: 0;
+    }
+
+    .sentiment-ticker-table th {
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-size: 11px;
+      color: var(--muted);
+      background: transparent;
+      position: static;
+    }
+
+    .sentiment-ticker-table tbody tr:last-child td {
+      border-bottom: none;
+    }
+
+    .sentiment-ticker-table tbody tr:hover {
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .sentiment-mini-bar {
+      display: inline-block;
+      height: 6px;
+      border-radius: 999px;
+      vertical-align: middle;
+      min-width: 4px;
+      transition: width 0.4s ease;
+    }
+
+    .sentiment-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .sentiment-badge.pos {
+      background: rgba(0, 212, 170, 0.14);
+      color: #00d4aa;
+    }
+
+    .sentiment-badge.neg {
+      background: rgba(255, 107, 139, 0.14);
+      color: #ff6b8b;
+    }
+
+    .sentiment-badge.neu {
+      background: rgba(255, 255, 255, 0.07);
+      color: var(--muted);
+    }
+
+    .sentiment-unavailable {
+      color: #ffc4cf;
+      border-color: rgba(255, 107, 139, 0.28);
+      background: rgba(255, 107, 139, 0.08);
+      padding: 16px;
+      border-radius: 14px;
+      border: 1px dashed rgba(255, 107, 139, 0.3);
+      text-align: center;
+      font-size: 13px;
+    }
+
     @media (max-width: 1100px) {
       .stats,
       .grid {
@@ -327,6 +541,70 @@
         <strong id="topTicker">-</strong>
         <span>Most frequent ticker mention in recent chat history.</span>
       </div>
+    </div>
+
+    <!-- ── Market Sentiment ──────────────────────────────────────────── -->
+    <div class="sentiment-section">
+      <section class="panel">
+        <div class="sentiment-header">
+          <h2>Market Sentiment</h2>
+          <div class="sentiment-header-meta">
+            <span class="sentiment-timestamp" id="sentimentTimestamp">Not loaded</span>
+            <button class="btn-sentiment-refresh" id="sentimentRefreshBtn" type="button">Refresh Sentiment</button>
+          </div>
+        </div>
+        <div id="sentimentBody">
+          <!-- Pills row -->
+          <div class="sentiment-pills">
+            <span class="sentiment-pill bullish">
+              <span>🟢 Bullish</span>
+              <span class="pill-count" id="sentimentBullish">-</span>
+            </span>
+            <span class="sentiment-pill bearish">
+              <span>🔴 Bearish</span>
+              <span class="pill-count" id="sentimentBearish">-</span>
+            </span>
+            <span class="sentiment-pill neutral">
+              <span>⚪ Neutral</span>
+              <span class="pill-count" id="sentimentNeutral">-</span>
+            </span>
+          </div>
+
+          <!-- Compound score bar -->
+          <div class="sentiment-score-row">
+            <div class="sentiment-score-label">
+              <span>Compound Score</span>
+              <span class="sentiment-score-value" id="sentimentScoreValue">-</span>
+            </div>
+            <div class="sentiment-bar-track" aria-label="Compound sentiment score bar">
+              <div class="sentiment-bar-fill" id="sentimentBarFill"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:11px;color:var(--muted);">
+              <span>-1.0</span>
+              <span>0</span>
+              <span>+1.0</span>
+            </div>
+          </div>
+
+          <!-- Top 5 ticker table -->
+          <div class="sentiment-tickers-title">Top 5 Tickers by Sentiment</div>
+          <table class="sentiment-ticker-table">
+            <thead>
+              <tr>
+                <th>Ticker</th>
+                <th>Score</th>
+                <th>Signal</th>
+                <th style="width:120px;">Bar</th>
+              </tr>
+            </thead>
+            <tbody id="sentimentTickerBody">
+              <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px 0;">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <!-- Error state (hidden by default) -->
+        <div id="sentimentError" class="sentiment-unavailable" hidden>Sentiment data unavailable</div>
+      </section>
     </div>
 
     <div id="messageBox" class="empty">Provide an admin token to load analytics.</div>
@@ -630,16 +908,109 @@
       document.getElementById("refreshBtn").addEventListener("click", () => loadData(false));
       document.getElementById("tokenBtn").addEventListener("click", () => loadData(true));
 
+      // ── G-9-D: Sentiment Card ─────────────────────────────────────────────
+      const SENTIMENT_TICKERS = ["AAPL", "MSFT", "TSLA", "NVDA", "META"];
+
+      function renderSentimentBar(score) {
+        const fill = document.getElementById("sentimentBarFill");
+        if (!fill) return;
+        // map score [-1,1] → [0%,100%]
+        const pct = ((score + 1) / 2) * 100;
+        fill.style.width = pct.toFixed(1) + "%";
+        fill.style.background = score >= 0.1 ? "var(--accent)" : score <= -0.1 ? "#ef4444" : "#94a3b8";
+      }
+
+      function renderSentimentTickers(tickerResults) {
+        const tbody = document.getElementById("sentimentTickerBody");
+        if (!tbody) return;
+        if (!tickerResults || !tickerResults.length) {
+          tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:14px 0;">No data</td></tr>`;
+          return;
+        }
+        tbody.innerHTML = tickerResults.map(t => {
+          const score = (t.score ?? 0).toFixed(3);
+          const sign  = t.score >= 0 ? "+" : "";
+          const emoji = t.label === "bullish" ? "🟢" : t.label === "bearish" ? "🔴" : "⚪";
+          const barPct = (((t.score ?? 0) + 1) / 2 * 100).toFixed(1);
+          const barClr = (t.score ?? 0) >= 0.1 ? "var(--accent)" : (t.score ?? 0) <= -0.1 ? "#ef4444" : "#94a3b8";
+          const artCount = t.article_count ?? 0;
+          return `
+            <tr>
+              <td><strong>${escapeHtml(t.ticker)}</strong></td>
+              <td style="font-variant-numeric:tabular-nums">${sign}${score}</td>
+              <td>${emoji} <span style="color:var(--muted);font-size:12px">${artCount} art.</span></td>
+              <td>
+                <div style="background:rgba(255,255,255,0.06);border-radius:4px;height:6px;overflow:hidden">
+                  <div style="width:${barPct}%;height:100%;background:${barClr};border-radius:4px;transition:width .4s"></div>
+                </div>
+              </td>
+            </tr>`;
+        }).join("");
+      }
+
+      async function loadSentiment() {
+        const token = getToken();
+        if (!token) return;
+
+        const tsEl    = document.getElementById("sentimentTimestamp");
+        const errEl   = document.getElementById("sentimentError");
+        const bodyEl  = document.getElementById("sentimentBody");
+
+        try {
+          // 1 — Market overview
+          const mktResp = await fetch("/v1/sentiment/market/overview?use_cache=true", {
+            headers: { "X-API-Key": token },
+            cache: "no-store",
+          });
+          if (!mktResp.ok) throw new Error(`market overview: HTTP ${mktResp.status}`);
+          const mkt = await mktResp.json();
+
+          document.getElementById("sentimentBullish").textContent = mkt.bullish_count ?? "-";
+          document.getElementById("sentimentBearish").textContent = mkt.bearish_count ?? "-";
+          document.getElementById("sentimentNeutral").textContent = mkt.neutral_count ?? "-";
+          const scoreVal = document.getElementById("sentimentScoreValue");
+          const s = mkt.score ?? 0;
+          scoreVal.textContent = (s >= 0 ? "+" : "") + s.toFixed(3);
+          scoreVal.style.color = s >= 0.1 ? "var(--accent)" : s <= -0.1 ? "#ef4444" : "#94a3b8";
+          renderSentimentBar(s);
+
+          // 2 — Batch tickers
+          const batchResp = await fetch("/v1/sentiment/batch", {
+            method: "POST",
+            headers: { "X-API-Key": token, "Content-Type": "application/json" },
+            body: JSON.stringify({ tickers: SENTIMENT_TICKERS, use_cache: true }),
+          });
+          if (batchResp.ok) {
+            const batch = await batchResp.json();
+            const sorted = (batch.results || []).sort((a, b) => Math.abs(b.score ?? 0) - Math.abs(a.score ?? 0));
+            renderSentimentTickers(sorted.slice(0, 5));
+          }
+
+          if (errEl) errEl.hidden = true;
+          if (bodyEl) bodyEl.hidden = false;
+          if (tsEl)   tsEl.textContent = "Updated " + new Date().toLocaleTimeString();
+        } catch (err) {
+          if (errEl) { errEl.hidden = false; errEl.textContent = "Sentiment data unavailable: " + err.message; }
+          if (bodyEl) bodyEl.hidden = true;
+        }
+      }
+
+      const sentRefreshBtn = document.getElementById("sentimentRefreshBtn");
+      if (sentRefreshBtn) sentRefreshBtn.addEventListener("click", loadSentiment);
+
       if (getTokenFromUrl()) {
         saveToken(getTokenFromUrl());
       }
 
       loadData(false);
+      loadSentiment();
       window.setInterval(() => {
         if (getToken()) {
           loadData(false);
         }
       }, 60000);
+      // refresh sentiment every 5 minutes
+      window.setInterval(() => { if (getToken()) loadSentiment(); }, 300000);
     })();
   </script>
 </body>

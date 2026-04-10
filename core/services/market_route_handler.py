@@ -1,4 +1,4 @@
-﻿"""
+"""
 core/services/market_route_handler.py
 ───────────────────────────────────────
 Route handlers for STOCK_ANALYSIS, FINANCIAL (CIO/PORTFOLIO_OPTIMIZE),
@@ -734,6 +734,37 @@ async def handle_stock_analysis(
         _clean_instruction = instruction
         for _ms in _mode_strip:
             _clean_instruction = _re.sub(rf"(?i)\b{_re.escape(_ms.strip())}\b\s*", "", _clean_instruction).strip()
+
+        # ── G-9-B: Inject live sentiment context before LLM call ─────────────
+        try:
+            from core.sentiment import SentimentAnalyzer as _SA
+            _sent_ticker = None
+            try:
+                from core.ticker_resolver import resolve_ticker as _rt
+            except Exception:
+                try:
+                    from core.tools.ticker_resolver import resolve_ticker as _rt
+                except Exception:
+                    _rt = None
+            if _rt:
+                _sent_ticker = _rt(_clean_instruction) or _rt(message or "")
+            if _sent_ticker and _sent_ticker != "UNKNOWN":
+                _sent = _SA().analyze_ticker(_sent_ticker, use_cache=True)
+                if _sent.get("article_count", 0) > 0:
+                    _emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(_sent["label"], "⚪")
+                    _conf  = f"{int(_sent.get('confidence',0)*100)}%"
+                    _fresh = _sent.get("freshness", "unknown")
+                    _sentiment_ctx = (
+                        f"\n\n[📰 Real-time News Sentiment for {_sent_ticker}: "
+                        f"{_emoji} {_sent['label'].upper()} | score={_sent['score']:+.2f} | "
+                        f"confidence={_conf} | freshness={_fresh} | "
+                        f"based on {_sent['article_count']} articles | "
+                        f"bullish={_sent['bullish_count']} bearish={_sent['bearish_count']} neutral={_sent['neutral_count']}]"
+                    )
+                    _clean_instruction = _clean_instruction + _sentiment_ctx
+                    logger.info("[sentiment] injected %s context: %s score=%.2f", _sent_ticker, _sent["label"], _sent["score"])
+        except Exception as _sent_exc:
+            logger.debug("[sentiment] context injection skipped: %s", _sent_exc)
 
         agent = orchestrator.financial_agent
         if agent:

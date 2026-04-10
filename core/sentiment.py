@@ -115,6 +115,58 @@ class SentimentScorer:
 
 # ── News fetcher ──────────────────────────────────────────────────────────────
 
+def _parse_pub_dt(pub: str | int | float) -> Optional[datetime]:
+    """Try to parse a publication timestamp into a timezone-aware datetime."""
+    if not pub:
+        return None
+    if isinstance(pub, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(pub), tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(pub, str):
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(pub[:25], fmt)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def _freshness_label(articles: list[dict]) -> str:
+    """
+    Derive freshness from the newest article's publish time.
+    fresh   < 2 hours
+    recent  < 12 hours
+    stale   ≥ 12 hours (or no timestamps)
+    """
+    now = datetime.now(timezone.utc)
+    best: Optional[datetime] = None
+    for a in articles:
+        dt = _parse_pub_dt(a.get("published"))
+        if dt and (best is None or dt > best):
+            best = dt
+    if best is None:
+        return "unknown"
+    age_h = (now - best).total_seconds() / 3600
+    if age_h < 2:
+        return "fresh"
+    if age_h < 12:
+        return "recent"
+    return "stale"
+
+
+def _confidence_score(article_count: int, freshness: str) -> float:
+    """
+    0.0 – 1.0 confidence.
+    Based on article count (10 = max) and freshness.
+    """
+    base = min(1.0, article_count / 10.0)
+    freshness_mult = {"fresh": 1.0, "recent": 0.85, "stale": 0.65, "unknown": 0.5}
+    return round(base * freshness_mult.get(freshness, 0.5), 3)
+
+
 def _fetch_news_for_ticker(ticker: str, max_items: int = 20) -> list[dict]:
     """
     Fetch recent news headlines for a ticker.
@@ -139,14 +191,12 @@ def _fetch_news_for_ticker(ticker: str, max_items: int = 20) -> list[dict]:
                 title  = item.get("title", "") or ""
                 source = item.get("publisher", "") or ""
                 pub    = item.get("providerPublishTime", "") or ""
-                if isinstance(pub, (int, float)):
-                    pub = datetime.fromtimestamp(pub, tz=timezone.utc).isoformat()
 
             if title:
                 articles.append({
                     "headline":  title,
                     "source":    str(source),
-                    "published": str(pub),
+                    "published": str(pub) if pub else "",
                 })
     except Exception as exc:
         logger.debug("[sentiment] yfinance news fetch failed for %s: %s", ticker, exc)
@@ -317,13 +367,16 @@ class SentimentAnalyzer:
         for a in articles:
             s = self._scorer.score(a["headline"])
             scored.append({
-                "headline": a["headline"],
-                "source":   a.get("source", ""),
-                "score":    s["compound"],
-                "label":    s["label"],
+                "headline":  a["headline"],
+                "source":    a.get("source", ""),
+                "published": a.get("published", ""),
+                "score":     s["compound"],
+                "label":     s["label"],
             })
 
-        agg = _aggregate(scored)
+        agg        = _aggregate(scored)
+        freshness  = _freshness_label(scored)
+        confidence = _confidence_score(len(scored), freshness)
 
         result = {
             "ticker":        ticker,
@@ -333,8 +386,10 @@ class SentimentAnalyzer:
             "bearish_count": agg["bearish"],
             "neutral_count": agg["neutral"],
             "article_count": len(scored),
+            "confidence":    confidence,          # G-9-C
+            "freshness":     freshness,           # G-9-C
             "cached":        False,
-            "articles":      scored[:10],   # top 10 in response
+            "articles":      scored[:10],
             "timestamp":     datetime.now(timezone.utc).isoformat(),
         }
 
