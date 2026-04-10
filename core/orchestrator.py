@@ -986,6 +986,67 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
             if not session_id:
                 session_id = self.session_mgr.get_or_create_session(user_id)
 
+            # Daily quota check
+            usage = self.session_mgr.get_user_daily_usage(user_id)
+            if usage["limit"] > 0 and usage["used"] >= usage["limit"]:
+                logger.info(
+                    "[quota] user %s hit daily limit (%d/%d tier=%s)",
+                    user_id,
+                    usage["used"],
+                    usage["limit"],
+                    usage["tier"],
+                )
+                return {
+                    "reply": (
+                        f"⚠️ You have reached your daily limit of {usage['limit']} messages. "
+                        f"Your current plan: **{usage['tier']}**. "
+                        f"Upgrade your plan or contact support to continue."
+                    ),
+                    "session_id": session_id,
+                    "agent_name": "QuotaEnforcer",
+                    "model": None,
+                }
+
+            # ── Onboarding welcome (first-ever message) ────────────────────────
+            if self.session_mgr.is_first_session(user_id):
+                _lang = "ar" if any(
+                    "\u0600" <= ch <= "\u06ff" for ch in message
+                ) else "en"
+                _suggestions = self.session_mgr.get_suggested_prompts(_lang)
+                _bullet = "\n".join(f"  • {s}" for s in _suggestions)
+                if _lang == "ar":
+                    _welcome = (
+                        "👋 **أهلاً وسهلاً في EisaX AI!**\n\n"
+                        "أنا محللك المالي الذكي — متخصص في الأسواق الخليجية والأمريكية والعالمية.\n\n"
+                        "يمكنني مساعدتك في:\n"
+                        "📊 تحليل الأسهم والعملات الرقمية\n"
+                        "📁 تقييم المحافظ الاستثمارية (ارفع ملف CSV/Excel)\n"
+                        "🌍 التخصيص الأمثل عبر الأسواق\n"
+                        "📰 تحليل الأخبار والتأثير على الأسهم\n\n"
+                        f"**جرّب أحد هذه الأسئلة:**\n{_bullet}"
+                    )
+                else:
+                    _welcome = (
+                        "👋 **Welcome to EisaX AI!**\n\n"
+                        "I'm your AI-powered financial analyst — specialized in GCC, US, and global markets.\n\n"
+                        "I can help you with:\n"
+                        "📊 Deep stock & crypto analysis with buy/sell verdicts\n"
+                        "📁 Portfolio risk assessment (upload CSV or Excel)\n"
+                        "🌍 Cross-market optimal allocation\n"
+                        "📰 News impact analysis on specific equities\n\n"
+                        f"**Try one of these to get started:**\n{_bullet}"
+                    )
+                logger.info("[onboarding] first session welcome sent to user %s", user_id)
+                self.session_mgr.save_message(session_id, user_id, "assistant", _welcome)
+                return {
+                    "reply": _welcome,
+                    "session_id": session_id,
+                    "agent_name": "EisaX Onboarding",
+                    "model": None,
+                    "onboarding": True,
+                    "suggested_prompts": _suggestions,
+                }
+
             # ── 1. Admin Mode ──────────────────────────────────────────────────
             if ADMIN_ENABLED:
                 _adm_resp = await _handle_admin(self, session_id, user_id, message)

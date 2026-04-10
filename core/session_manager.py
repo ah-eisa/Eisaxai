@@ -182,6 +182,40 @@ class SessionManager:
             c.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
             c.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
 
+    # ── Onboarding / First Session ──────────────────────────────────────────
+
+    def is_first_session(self, user_id: str) -> bool:
+        """Return True if this user has sent zero messages before — triggers onboarding."""
+        try:
+            with db.get_cursor() as (conn, c):
+                c.execute(
+                    "SELECT COUNT(*) FROM chat_history WHERE user_id=? AND role='user'",
+                    (user_id,)
+                )
+                row = c.fetchone()
+            return (row[0] if row else 0) == 0
+        except Exception as e:
+            logger.debug("is_first_session error: %s", e)
+            return False
+
+    def get_suggested_prompts(self, lang: str = "en") -> list:
+        """Return locale-appropriate starter prompt suggestions for new users."""
+        if lang == "ar":
+            return [
+                "حلل سهم أرامكو السعودية (2222.SR) وأعطني توصية",
+                "ما هو تحليل مخاطر محفظتي؟ أرسل ملف Excel أو CSV",
+                "كيف يمكنني توزيع $100,000 بين الأسواق الخليجية والأمريكية؟",
+                "تحليل البيتكوين مع مؤشرات On-chain",
+                "قارن بين سهم مايكروسوفت وآبل لهذا الربع",
+            ]
+        return [
+            "Analyze Saudi Aramco (2222.SR) and give me a buy/sell recommendation",
+            "Analyze my portfolio risk — upload a CSV or Excel file",
+            "How should I allocate $100,000 across US + GCC markets?",
+            "Give me a full Bitcoin analysis with on-chain signals",
+            "Compare Microsoft vs Apple for this quarter",
+        ]
+
     # ── Block / Unblock ─────────────────────────────────────────────────────
 
     def is_user_blocked(self, user_id: str) -> bool:
@@ -301,6 +335,41 @@ class SessionManager:
         if row:
             return {"daily_limit": row[0] or 0, "note": row[1] or "", "tier": row[2] or "basic"}
         return {"daily_limit": 0, "note": "", "tier": "basic"}
+
+    def get_user_daily_usage(self, user_id: str) -> dict:
+        """Return today's message count vs daily limit for a user."""
+        import datetime
+
+        today = datetime.date.today().isoformat()
+        try:
+            with db.get_cursor() as (conn, c):
+                used = c.execute(
+                    """SELECT COUNT(*) FROM chat_history
+                       WHERE user_id = ? AND role = 'user' AND DATE(timestamp) = ?""",
+                    (user_id, today),
+                ).fetchone()[0]
+            profile = self.get_user_profile(user_id)
+            limit = int(profile.get("daily_limit") or 0)
+            tier = profile.get("tier", "basic")
+            remaining = max(0, limit - used) if limit > 0 else 999
+            return {
+                "used": used,
+                "limit": limit,
+                "tier": tier,
+                "remaining": remaining,
+                "pct_used": round(used / limit * 100, 1) if limit > 0 else 0.0,
+            }
+        except Exception as e:
+            logging.getLogger(__name__).debug("get_user_daily_usage error: %s", e)
+            return {"used": 0, "limit": 0, "tier": "basic", "remaining": 999, "pct_used": 0.0}
+
+    def get_quota_header(self, user_id: str) -> dict:
+        usage = self.get_user_daily_usage(user_id)
+        return {
+            "X-Quota-Used": str(usage["used"]),
+            "X-Quota-Limit": str(usage["limit"]),
+            "X-Quota-Tier": usage["tier"],
+        }
 
     def set_user_profile(self, user_id: str, daily_limit: int = None, note: str = None, tier: str = None):
         with db.get_cursor() as (conn, c):
