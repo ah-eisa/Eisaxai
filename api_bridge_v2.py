@@ -3557,8 +3557,12 @@ async def delete_webhook(
 
 class CheckoutRequest(BaseModel):
     user_id: str
-    email: str
-    tier: str  # 'pro' or 'vip'
+    email:   str
+    tier:    str   # "pro" | "vip"
+
+
+class PortalRequest(BaseModel):
+    user_id: str
 
 
 @app.post("/v1/billing/checkout")
@@ -3571,41 +3575,57 @@ async def create_checkout(
 ):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(403, "Unauthorized")
-    from core.billing import StripeBilling
-
-    b = StripeBilling()
-    url = b.create_checkout_session(body.user_id, body.email, body.tier)
-    return {"checkout_url": url}
+    try:
+        from core.billing import StripeBilling
+        url = StripeBilling().create_checkout_session(body.user_id, body.email, body.tier)
+        return {"checkout_url": url}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.error("[billing/checkout] %s", exc)
+        raise HTTPException(status_code=500, detail="Billing service error")
 
 
 @app.post("/v1/billing/webhook")
 async def stripe_webhook(request: Request):
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
-    from core.billing import StripeBilling
+    try:
+        from core.billing import StripeBilling
+        result = StripeBilling().handle_webhook(payload, sig)
+        if result.get("tier") and result.get("user_id"):
+            orchestrator.session_mgr.set_user_profile(result["user_id"], tier=result["tier"])
+            logger.info("[billing] upgraded user %s to tier %s", result["user_id"], result["tier"])
+        return {"received": True, "event": result.get("event")}
+    except Exception as exc:
+        logger.error("[billing/webhook] %s", exc)
+        raise HTTPException(status_code=400, detail=f"Webhook error: {exc}")
 
-    result = StripeBilling().handle_webhook(payload, sig)
-    if result.get("tier") and result.get("user_id"):
-        orchestrator.session_mgr.set_user_profile(result["user_id"], tier=result["tier"])
-        logger.info("[billing] upgraded user %s to tier %s", result["user_id"], result["tier"])
-    return {"received": True}
 
-
-@app.get("/v1/billing/portal")
+@app.post("/v1/billing/portal")
 @limiter.limit("10/minute")
 async def billing_portal(
     request: Request,
-    user_id: str,
+    body: PortalRequest,
     access_token: str = Header(None, alias="X-API-Key"),
     access_token_alt: str = Header(None, alias="access-token"),
 ):
     if (access_token or access_token_alt) != SECURE_TOKEN:
         raise HTTPException(403, "Unauthorized")
-    from core.billing import StripeBilling
-
-    billing = StripeBilling()
-    cid = billing.get_customer_id(user_id)
-    if not cid:
-        raise HTTPException(404, "No billing record found")
-    url = billing.create_portal_session(cid)
-    return {"portal_url": url}
+    try:
+        from core.billing import StripeBilling
+        billing = StripeBilling()
+        cid = billing.get_customer_id(body.user_id)
+        if not cid:
+            raise HTTPException(status_code=404, detail="No billing record found for this user")
+        url = billing.create_portal_session(cid)
+        return {"portal_url": url}
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        logger.error("[billing/portal] %s", exc)
+        raise HTTPException(status_code=500, detail="Billing service error")
