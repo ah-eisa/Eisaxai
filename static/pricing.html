@@ -1,0 +1,705 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EisaX Pricing</title>
+  <style>
+    :root {
+      --bg: #0f0f1a;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f5f7ff;
+      --muted: #98a2bd;
+      --accent: #00d4aa;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+      --danger: #ff7a90;
+      --warn: #ffc861;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      background:
+        radial-gradient(circle at top right, rgba(36, 160, 255, 0.16), transparent 28%),
+        radial-gradient(circle at top left, rgba(0, 212, 170, 0.14), transparent 30%),
+        linear-gradient(180deg, #10111d 0%, var(--bg) 55%, #0b0c14 100%);
+      color: var(--text);
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    }
+
+    body {
+      padding: 24px;
+    }
+
+    .shell {
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 24px;
+      align-items: start;
+      margin-bottom: 22px;
+    }
+
+    .hero-copy,
+    .account-panel,
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow);
+    }
+
+    .hero-copy {
+      padding: 28px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-copy::after {
+      content: "";
+      position: absolute;
+      inset: auto -30px -30px auto;
+      width: 180px;
+      height: 180px;
+      background: radial-gradient(circle, rgba(0, 212, 170, 0.24), transparent 72%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(0, 212, 170, 0.26);
+      background: rgba(0, 212, 170, 0.08);
+      color: var(--accent);
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }
+
+    .hero-copy p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.7;
+      max-width: 56ch;
+    }
+
+    .account-panel {
+      padding: 22px;
+    }
+
+    .panel-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .panel-top h2 {
+      margin: 0;
+      font-size: 20px;
+      letter-spacing: -0.02em;
+    }
+
+    .rtl-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .rtl-toggle input {
+      accent-color: var(--accent);
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      border-radius: 14px;
+      padding: 13px 14px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    input:focus {
+      border-color: rgba(0, 212, 170, 0.45);
+      box-shadow: 0 0 0 4px rgba(0, 212, 170, 0.12);
+    }
+
+    .help {
+      margin: 12px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .token-row {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .token-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 9px 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .token-pill strong {
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      padding: 22px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .card.featured {
+      border-color: rgba(0, 212, 170, 0.28);
+      box-shadow: 0 24px 80px rgba(0, 212, 170, 0.08);
+    }
+
+    .badge {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: #0f0f1a;
+      background: linear-gradient(180deg, #7af6df, var(--accent));
+    }
+
+    .tier {
+      margin: 0 0 8px;
+      font-size: 24px;
+      letter-spacing: -0.03em;
+    }
+
+    .price {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-bottom: 16px;
+    }
+
+    .price strong {
+      font-size: 46px;
+      letter-spacing: -0.05em;
+    }
+
+    .price span {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .summary {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 48px;
+      margin-bottom: 16px;
+    }
+
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0 0 22px;
+      display: grid;
+      gap: 12px;
+    }
+
+    li {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      color: #d8def0;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    li::before {
+      content: "";
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-top: 5px;
+      background: radial-gradient(circle, #83ffe9 0%, var(--accent) 62%, rgba(0, 212, 170, 0.15) 100%);
+      box-shadow: 0 0 10px rgba(0, 212, 170, 0.35);
+      flex: 0 0 auto;
+    }
+
+    .card button,
+    .mini-button {
+      border: 1px solid rgba(0, 212, 170, 0.24);
+      background: linear-gradient(180deg, rgba(0, 212, 170, 0.2), rgba(0, 212, 170, 0.08));
+      color: var(--text);
+      width: 100%;
+      padding: 13px 14px;
+      border-radius: 14px;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+    }
+
+    .card button:hover,
+    .mini-button:hover {
+      transform: translateY(-1px);
+      border-color: rgba(0, 212, 170, 0.5);
+      background: linear-gradient(180deg, rgba(0, 212, 170, 0.28), rgba(0, 212, 170, 0.12));
+    }
+
+    .card button[disabled] {
+      opacity: 0.5;
+      cursor: default;
+      transform: none;
+    }
+
+    .footer-row {
+      margin-top: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+
+    .status {
+      min-height: 24px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    .status.ok {
+      color: var(--accent);
+    }
+
+    .status.warn {
+      color: var(--warn);
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .portal-link {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
+      padding-inline: 16px;
+    }
+
+    [dir="rtl"] body,
+    [dir="rtl"] input {
+      text-align: right;
+    }
+
+    [dir="rtl"] .badge {
+      right: auto;
+      left: 18px;
+    }
+
+    @media (max-width: 980px) {
+      .hero,
+      .cards {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 640px) {
+      body {
+        padding: 16px;
+      }
+
+      .field-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .token-row,
+      .footer-row,
+      .panel-top {
+        flex-direction: column;
+        align-items: stretch;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="hero-copy">
+        <div class="eyebrow" data-i18n="eyebrow">EisaX Billing</div>
+        <h1 data-i18n="headline">Upgrade the way you work with markets.</h1>
+        <p data-i18n="subhead">
+          Choose the plan that matches your workflow, then jump into a secure Stripe checkout.
+          Pro adds more room and exports. VIP removes ceilings and moves you to the front of the queue.
+        </p>
+      </div>
+
+      <aside class="account-panel">
+        <div class="panel-top">
+          <h2 data-i18n="details_title">Billing Details</h2>
+          <label class="rtl-toggle">
+            <input id="rtlToggle" type="checkbox" />
+            <span data-i18n="arabic_toggle">Arabic RTL</span>
+          </label>
+        </div>
+
+        <div class="field-grid">
+          <div>
+            <label for="userId" data-i18n="user_id">User ID</label>
+            <input id="userId" type="text" placeholder="user_123" autocomplete="username" />
+          </div>
+          <div>
+            <label for="email" data-i18n="email">Email</label>
+            <input id="email" type="email" placeholder="name@example.com" autocomplete="email" />
+          </div>
+        </div>
+
+        <p class="help" data-i18n="details_help">
+          This page reads the API token from localStorage.eisax_token. Enter the same user ID and email
+          you want to bind to the Stripe customer record.
+        </p>
+
+        <div class="token-row">
+          <div class="token-pill">
+            <span data-i18n="token_label">API token:</span>
+            <strong id="tokenState">Checking...</strong>
+          </div>
+          <button class="mini-button portal-link" id="portalButton" type="button" data-i18n="manage_billing">
+            Manage Billing
+          </button>
+        </div>
+      </aside>
+    </section>
+
+    <section class="cards">
+      <article class="card">
+        <h2 class="tier" data-i18n="basic_name">Basic</h2>
+        <div class="price">
+          <strong data-i18n="basic_price">Free</strong>
+          <span data-i18n="basic_term">forever</span>
+        </div>
+        <p class="summary" data-i18n="basic_summary">For light usage and quick questions.</p>
+        <ul>
+          <li data-i18n="basic_feat_1">20 messages per day</li>
+          <li data-i18n="basic_feat_2">Core chat access</li>
+          <li data-i18n="basic_feat_3">Standard response priority</li>
+        </ul>
+        <button type="button" disabled data-i18n="basic_button">Included</button>
+      </article>
+
+      <article class="card featured">
+        <span class="badge" data-i18n="pro_badge">Most Popular</span>
+        <h2 class="tier" data-i18n="pro_name">Pro</h2>
+        <div class="price">
+          <strong>$29</strong>
+          <span data-i18n="monthly">/mo</span>
+        </div>
+        <p class="summary" data-i18n="pro_summary">For active users who need more capacity and exports.</p>
+        <ul>
+          <li data-i18n="pro_feat_1">200 messages per day</li>
+          <li data-i18n="pro_feat_2">PDF export</li>
+          <li data-i18n="pro_feat_3">Faster workflow for recurring analysis</li>
+        </ul>
+        <button type="button" data-tier="pro" class="subscribe-button" data-i18n="subscribe">Subscribe</button>
+      </article>
+
+      <article class="card">
+        <h2 class="tier" data-i18n="vip_name">VIP</h2>
+        <div class="price">
+          <strong>$99</strong>
+          <span data-i18n="monthly">/mo</span>
+        </div>
+        <p class="summary" data-i18n="vip_summary">For power users and client-facing workflows with no ceiling.</p>
+        <ul>
+          <li data-i18n="vip_feat_1">Unlimited messages</li>
+          <li data-i18n="vip_feat_2">Priority handling</li>
+          <li data-i18n="vip_feat_3">Best fit for high-frequency decision support</li>
+        </ul>
+        <button type="button" data-tier="vip" class="subscribe-button" data-i18n="subscribe">Subscribe</button>
+      </article>
+    </section>
+
+    <div class="footer-row">
+      <div id="status" class="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <script>
+    const TOKEN_KEY = "eisax_token";
+    const STRINGS = {
+      en: {
+        eyebrow: "EisaX Billing",
+        headline: "Upgrade the way you work with markets.",
+        subhead: "Choose the plan that matches your workflow, then jump into a secure Stripe checkout. Pro adds more room and exports. VIP removes ceilings and moves you to the front of the queue.",
+        details_title: "Billing Details",
+        arabic_toggle: "Arabic RTL",
+        user_id: "User ID",
+        email: "Email",
+        details_help: "This page reads the API token from localStorage.eisax_token. Enter the same user ID and email you want to bind to the Stripe customer record.",
+        token_label: "API token:",
+        manage_billing: "Manage Billing",
+        basic_name: "Basic",
+        basic_price: "Free",
+        basic_term: "forever",
+        basic_summary: "For light usage and quick questions.",
+        basic_feat_1: "20 messages per day",
+        basic_feat_2: "Core chat access",
+        basic_feat_3: "Standard response priority",
+        basic_button: "Included",
+        pro_badge: "Most Popular",
+        pro_name: "Pro",
+        monthly: "/mo",
+        pro_summary: "For active users who need more capacity and exports.",
+        pro_feat_1: "200 messages per day",
+        pro_feat_2: "PDF export",
+        pro_feat_3: "Faster workflow for recurring analysis",
+        subscribe: "Subscribe",
+        vip_name: "VIP",
+        vip_summary: "For power users and client-facing workflows with no ceiling.",
+        vip_feat_1: "Unlimited messages",
+        vip_feat_2: "Priority handling",
+        vip_feat_3: "Best fit for high-frequency decision support"
+      },
+      ar: {
+        eyebrow: "فواتير EisaX",
+        headline: "طوّر طريقة عملك مع الأسواق.",
+        subhead: "اختر الخطة المناسبة ثم انتقل إلى صفحة دفع Stripe الآمنة. خطة Pro تمنحك مساحة أكبر وتصدير PDF، وخطة VIP تزيل الحدود وتمنحك أولوية أعلى.",
+        details_title: "بيانات الفوترة",
+        arabic_toggle: "العربية RTL",
+        user_id: "معرّف المستخدم",
+        email: "البريد الإلكتروني",
+        details_help: "تقرأ هذه الصفحة الرمز من localStorage.eisax_token. أدخل نفس معرّف المستخدم والبريد الإلكتروني المطلوب ربطهما بسجل عميل Stripe.",
+        token_label: "رمز API:",
+        manage_billing: "إدارة الفوترة",
+        basic_name: "Basic",
+        basic_price: "مجاني",
+        basic_term: "دائمًا",
+        basic_summary: "للاستخدام الخفيف والأسئلة السريعة.",
+        basic_feat_1: "20 رسالة يوميًا",
+        basic_feat_2: "وصول أساسي إلى المحادثة",
+        basic_feat_3: "أولوية استجابة عادية",
+        basic_button: "متاح",
+        pro_badge: "الأكثر شيوعًا",
+        pro_name: "Pro",
+        monthly: "/شهريًا",
+        pro_summary: "للمستخدمين النشطين الذين يحتاجون إلى سعة أكبر وتصدير الملفات.",
+        pro_feat_1: "200 رسالة يوميًا",
+        pro_feat_2: "تصدير PDF",
+        pro_feat_3: "سير عمل أسرع للتحليل المتكرر",
+        subscribe: "اشترك",
+        vip_name: "VIP",
+        vip_summary: "للمستخدمين المتقدمين وسيناريوهات العمل عالية الكثافة.",
+        vip_feat_1: "رسائل غير محدودة",
+        vip_feat_2: "أولوية قصوى",
+        vip_feat_3: "الأفضل لسير العمل عالي التكرار"
+      }
+    };
+
+    const userIdInput = document.getElementById("userId");
+    const emailInput = document.getElementById("email");
+    const tokenState = document.getElementById("tokenState");
+    const statusEl = document.getElementById("status");
+    const rtlToggle = document.getElementById("rtlToggle");
+    const portalButton = document.getElementById("portalButton");
+
+    function getToken() {
+      return localStorage.getItem(TOKEN_KEY) || "";
+    }
+
+    function setStatus(message, tone) {
+      statusEl.textContent = message || "";
+      statusEl.className = "status" + (tone ? " " + tone : "");
+    }
+
+    function syncTokenState() {
+      const token = getToken();
+      tokenState.textContent = token ? "Loaded" : "Missing";
+      tokenState.style.color = token ? "var(--accent)" : "var(--danger)";
+    }
+
+    function applyLanguage(lang) {
+      document.documentElement.lang = lang;
+      document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
+      rtlToggle.checked = lang === "ar";
+      document.querySelectorAll("[data-i18n]").forEach((node) => {
+        const key = node.getAttribute("data-i18n");
+        const text = STRINGS[lang][key];
+        if (text) {
+          node.textContent = text;
+        }
+      });
+    }
+
+    function prefillFields() {
+      userIdInput.value = localStorage.getItem("eisax_user_id") || localStorage.getItem("user_id") || "";
+      emailInput.value = localStorage.getItem("eisax_email") || localStorage.getItem("email") || "";
+    }
+
+    async function startCheckout(tier) {
+      const token = getToken();
+      const userId = userIdInput.value.trim();
+      const email = emailInput.value.trim();
+      if (!token) {
+        setStatus("Missing localStorage.eisax_token", "error");
+        return;
+      }
+      if (!userId || !email) {
+        setStatus("Enter both user ID and email before subscribing.", "warn");
+        return;
+      }
+
+      setStatus("Creating Stripe checkout session...", "warn");
+      try {
+        const response = await fetch("/v1/billing/checkout", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": token
+          },
+          body: JSON.stringify({ user_id: userId, email, tier })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Checkout request failed");
+        }
+        if (!data.checkout_url) {
+          throw new Error("Stripe checkout URL missing from response");
+        }
+        window.location.href = data.checkout_url;
+      } catch (error) {
+        setStatus(error.message || "Checkout request failed", "error");
+      }
+    }
+
+    async function openPortal() {
+      const token = getToken();
+      const userId = userIdInput.value.trim();
+      if (!token) {
+        setStatus("Missing localStorage.eisax_token", "error");
+        return;
+      }
+      if (!userId) {
+        setStatus("Enter your user ID to open the billing portal.", "warn");
+        return;
+      }
+
+      setStatus("Opening billing portal...", "warn");
+      try {
+        const response = await fetch("/v1/billing/portal?user_id=" + encodeURIComponent(userId), {
+          headers: {
+            "X-API-Key": token
+          }
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Portal request failed");
+        }
+        if (!data.portal_url) {
+          throw new Error("Portal URL missing from response");
+        }
+        window.location.href = data.portal_url;
+      } catch (error) {
+        setStatus(error.message || "Portal request failed", "error");
+      }
+    }
+
+    function handleQueryState() {
+      const params = new URLSearchParams(window.location.search);
+      const checkoutState = params.get("checkout");
+      const portalState = params.get("portal");
+      if (checkoutState === "success") {
+        setStatus("Checkout completed. Your plan will update after Stripe confirms the session.", "ok");
+      } else if (checkoutState === "cancelled") {
+        setStatus("Checkout was cancelled.", "warn");
+      } else if (portalState === "returned") {
+        setStatus("Returned from billing portal.", "ok");
+      }
+    }
+
+    document.querySelectorAll(".subscribe-button").forEach((button) => {
+      button.addEventListener("click", () => startCheckout(button.dataset.tier));
+    });
+
+    portalButton.addEventListener("click", openPortal);
+    rtlToggle.addEventListener("change", () => applyLanguage(rtlToggle.checked ? "ar" : "en"));
+
+    prefillFields();
+    applyLanguage("en");
+    syncTokenState();
+    handleQueryState();
+  </script>
+</body>
+</html>
