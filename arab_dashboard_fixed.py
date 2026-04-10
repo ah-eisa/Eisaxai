@@ -175,6 +175,18 @@ TRANSLATIONS = {
         "add": "إضافة",
         "commodities_unavailable": "بيانات السلع غير متاحة مؤقتاً",
         "one_day_change": "تغير يوم واحد",
+        "forex_tab": "العملات",
+        "crypto_tab": "العملات الرقمية",
+        "forex_unavailable": "بيانات الفوركس غير متاحة مؤقتاً",
+        "crypto_unavailable": "بيانات العملات الرقمية غير متاحة مؤقتاً",
+        "pair": "الزوج",
+        "rate": "السعر",
+        "prev_close": "إغلاق سابق",
+        "change_pct": "التغيير %",
+        "category": "الفئة",
+        "arab_pairs": "أزواج عربية",
+        "major_pairs": "أزواج رئيسية",
+        "em_pairs": "أسواق ناشئة",
         # AI
         "ai_title": "المساعد الذكي EisaX",
         "ai_desc": "اسأل أي سؤال عن السوق بالعربية أو الإنجليزية",
@@ -280,6 +292,18 @@ TRANSLATIONS = {
         "add": "Add",
         "commodities_unavailable": "Commodities data temporarily unavailable",
         "one_day_change": "1-Day Change",
+        "forex_tab": "Forex",
+        "crypto_tab": "Crypto",
+        "forex_unavailable": "Forex data temporarily unavailable",
+        "crypto_unavailable": "Crypto data temporarily unavailable",
+        "pair": "Pair",
+        "rate": "Rate",
+        "prev_close": "Prev Close",
+        "change_pct": "Change %",
+        "category": "Category",
+        "arab_pairs": "Arab Pairs",
+        "major_pairs": "Major Pairs",
+        "em_pairs": "Emerging Markets",
         # AI
         "ai_title": "EisaX AI Assistant",
         "ai_desc": "Ask anything about the market in Arabic or English",
@@ -1121,7 +1145,7 @@ with cols[4]:
     st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{cc};">{avg_ch:+.2f}%</div><div class="metric-label">{t("avg_change")}</div></div>', unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     f"📋 {t('stocks_tab')}",
     f"🎯 {t('opportunities_tab')}",
     f"📈 {t('analysis_tab')}",
@@ -1130,6 +1154,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     f"⭐ {t('watchlist_tab')}",
     f"🤖 {t('ai_tab')}",
     f"🏭 {t('commodities_tab')}",
+    f"💱 {t('forex_tab')}",
+    f"🪙 {t('crypto_tab')}",
 ])
 
 # ═══════════════════════════════════════════════════════
@@ -1603,6 +1629,187 @@ with tab8:
         })
         show_cols = [c for c in [t("name"), t("price"), t("one_day_change")] if c in table_df.columns]
         st.dataframe(table_df[show_cols], use_container_width=True, hide_index=True)
+
+# ═══════════════════════════════════════════════════════
+# TAB 9 — Forex
+# ═══════════════════════════════════════════════════════
+with tab9:
+    st.markdown(f"### 💱 {t('forex_tab')}")
+
+    try:
+        from core.forex import ForexFetcher, FOREX_PAIRS
+        _fx_data = ForexFetcher().fetch(use_cache=True)
+    except Exception as _fx_exc:
+        _fx_data = []
+        st.warning(f"{t('forex_unavailable')}: {_fx_exc}")
+
+    if _fx_data:
+        # ── KPI row: key Arab rates ────────────────────────────────────────────
+        arab_kpis = [("USDAED=X","🇦🇪 USD/AED"),("USDSAR=X","🇸🇦 USD/SAR"),
+                     ("USDEGP=X","🇪🇬 USD/EGP"),("USDKWD=X","🇰🇼 USD/KWD"),
+                     ("USDQAR=X","🇶🇦 USD/QAR"),("USDBHD=X","🇧🇭 USD/BHD")]
+        _fx_by_sym = {r["symbol"]: r for r in _fx_data}
+        kpi_cols_fx = st.columns(len(arab_kpis))
+        for idx, (sym, label) in enumerate(arab_kpis):
+            row = _fx_by_sym.get(sym, {})
+            price = row.get("price")
+            chg   = row.get("change_pct")
+            val   = f"{price:,.4f}" if price else "—"
+            delta = f"{chg:+.2f}%" if chg is not None else None
+            src   = row.get("source","")
+            with kpi_cols_fx[idx]:
+                st.metric(label, val, delta=delta)
+                if src == "fallback":
+                    st.caption("📌 est.")
+
+        st.divider()
+
+        # ── Grouped tables ─────────────────────────────────────────────────────
+        _cat_labels = {
+            "arab":  f"🌙 {t('arab_pairs')}",
+            "major": f"🌍 {t('major_pairs')}",
+            "em":    f"🌱 {t('em_pairs')}",
+        }
+        _cat_order = ["arab", "major", "em"]
+
+        for cat in _cat_order:
+            cat_rows = [r for r in _fx_data if r.get("category") == cat]
+            if not cat_rows:
+                continue
+            st.markdown(f"#### {_cat_labels.get(cat, cat)}")
+            df_cat = pd.DataFrame(cat_rows)
+            display_cols = {
+                "name":       t("pair"),
+                "price":      t("rate"),
+                "prev_close": t("prev_close"),
+                "change_pct": t("change_pct"),
+                "source":     "Source",
+            }
+            df_show = df_cat[[c for c in display_cols if c in df_cat.columns]].copy()
+            df_show = df_show.rename(columns=display_cols)
+
+            # Style change column
+            def _style_chg(val):
+                if val is None or pd.isna(val):
+                    return ""
+                return "color: #10b981" if val > 0 else ("color: #ef4444" if val < 0 else "")
+
+            chg_col = t("change_pct")
+            if chg_col in df_show.columns:
+                df_show[chg_col] = df_show[chg_col].apply(
+                    lambda v: f"{v:+.4f}%" if v is not None and not pd.isna(v) else "—"
+                )
+            rate_col = t("rate")
+            if rate_col in df_show.columns:
+                df_show[rate_col] = df_show[rate_col].apply(
+                    lambda v: f"{v:,.6f}" if v is not None else "—"
+                )
+            prev_col = t("prev_close")
+            if prev_col in df_show.columns:
+                df_show[prev_col] = df_show[prev_col].apply(
+                    lambda v: f"{v:,.6f}" if v is not None else "—"
+                )
+
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+        # Source timestamp
+        if _fx_data:
+            ts_fx = _fx_data[0].get("timestamp", "")
+            if ts_fx:
+                st.caption(f"🕐 {t('last_update')}: {ts_fx}")
+    else:
+        if not _fx_data:
+            st.info(t("forex_unavailable"))
+
+
+# ═══════════════════════════════════════════════════════
+# TAB 10 — Crypto
+# ═══════════════════════════════════════════════════════
+with tab10:
+    st.markdown(f"### 🪙 {t('crypto_tab')}")
+
+    cache_obj_c, _, _ = _get_pipeline()
+    df_crypto, ts_crypto = cache_obj_c.get_latest("crypto") if cache_obj_c is not None else (None, None)
+
+    if df_crypto is None or df_crypto.empty:
+        st.info(t("crypto_unavailable"))
+    else:
+        df_crypto = df_crypto.copy()
+        for col in ("close", "change", "volume", "market_cap_basic"):
+            if col in df_crypto.columns:
+                df_crypto[col] = pd.to_numeric(df_crypto[col], errors="coerce")
+
+        # ── KPI row: BTC / ETH / BNB ──────────────────────────────────────────
+        kpi_crypto = [("BTCUSDT","₿ Bitcoin","BTC"),("ETHUSDT","Ξ Ethereum","ETH"),("BNBUSDT","⬡ BNB","BNB")]
+        kpi_cols_c = st.columns(3)
+        for idx, (sym, label, short) in enumerate(kpi_crypto):
+            _row = None
+            if "name" in df_crypto.columns:
+                _matches = df_crypto[df_crypto["name"].str.upper().str.contains(short, na=False)]
+                if _matches.empty:
+                    _matches = df_crypto[df_crypto.index.astype(str).str.upper().str.contains(sym, na=False)]
+                _row = _matches.iloc[0] if not _matches.empty else None
+            price_c = _row["close"] if _row is not None and pd.notna(_row.get("close")) else None
+            chg_c   = _row["change"] if _row is not None and pd.notna(_row.get("change")) else None
+            val_c   = f"${price_c:,.2f}" if price_c else "—"
+            delta_c = f"{chg_c:+.2f}%" if chg_c is not None else None
+            with kpi_cols_c[idx]:
+                st.metric(label, val_c, delta=delta_c)
+
+        st.divider()
+
+        # ── Top gainers / losers ───────────────────────────────────────────────
+        if "change" in df_crypto.columns:
+            col_g, col_l = st.columns(2)
+            with col_g:
+                st.markdown("#### 🟢 Top Gainers")
+                df_g = df_crypto.nlargest(10, "change")[["name","close","change"]].copy()
+                df_g.columns = [t("name"), t("price"), t("change")]
+                df_g[t("price")] = df_g[t("price")].apply(lambda v: f"${v:,.4f}" if pd.notna(v) else "—")
+                df_g[t("change")] = df_g[t("change")].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
+                st.dataframe(df_g, use_container_width=True, hide_index=True)
+            with col_l:
+                st.markdown("#### 🔴 Top Losers")
+                df_l = df_crypto.nsmallest(10, "change")[["name","close","change"]].copy()
+                df_l.columns = [t("name"), t("price"), t("change")]
+                df_l[t("price")] = df_l[t("price")].apply(lambda v: f"${v:,.4f}" if pd.notna(v) else "—")
+                df_l[t("change")] = df_l[t("change")].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
+                st.dataframe(df_l, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Full table ─────────────────────────────────────────────────────────
+        st.markdown(f"#### 📊 All Cryptocurrencies ({len(df_crypto)} coins)")
+        sort_opts = [c for c in ["market_cap_basic","change","volume","close"] if c in df_crypto.columns]
+        if sort_opts:
+            sort_by = st.selectbox("Sort by", sort_opts, index=0, key="crypto_sort")
+            df_table = df_crypto.sort_values(sort_by, ascending=False)
+        else:
+            df_table = df_crypto
+
+        show_cols_c = [c for c in ["name","close","change","volume","market_cap_basic"] if c in df_table.columns]
+        df_show_c = df_table[show_cols_c].copy()
+        rename_map = {"name": t("name"), "close": t("price"), "change": t("change"),
+                      "volume": t("volume"), "market_cap_basic": t("cap")}
+        df_show_c = df_show_c.rename(columns={k: v for k, v in rename_map.items() if k in df_show_c.columns})
+        pr_col = t("price")
+        if pr_col in df_show_c.columns:
+            df_show_c[pr_col] = df_show_c[pr_col].apply(lambda v: f"${v:,.4f}" if pd.notna(v) else "—")
+        ch_col = t("change")
+        if ch_col in df_show_c.columns:
+            df_show_c[ch_col] = df_show_c[ch_col].apply(lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
+        cap_col = t("cap")
+        if cap_col in df_show_c.columns:
+            df_show_c[cap_col] = df_show_c[cap_col].apply(
+                lambda v: f"${v/1e9:.2f}B" if pd.notna(v) and v >= 1e9
+                else (f"${v/1e6:.1f}M" if pd.notna(v) and v >= 1e6 else ("—" if not pd.notna(v) else f"${v:,.0f}"))
+            )
+
+        st.dataframe(df_show_c, use_container_width=True, hide_index=True)
+
+        if ts_crypto:
+            st.caption(f"🕐 {t('last_update')}: {ts_crypto}")
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
