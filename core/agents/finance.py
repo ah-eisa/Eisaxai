@@ -6427,7 +6427,65 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 _insight = ' '.join(_insight.splitlines()).strip()
                 _top_risk = ' '.join(_top_risk.splitlines()).strip()
 
+                # ── Final Action label (Fundamental × Entry Timing) ───────────
+                # This is the single user-facing action — all sections must agree.
+                try:
+                    _locked_v   = (verdict_sc or 'HOLD').upper()
+                    _locked_et  = (_entry_timing or 'WAIT').upper()
+                    if _locked_v in ('REDUCE', 'SELL', 'AVOID'):
+                        _final_action = '🔴 REDUCE / RISK CONTROL'
+                    elif _locked_v == 'BUY' and 'WAIT' in _locked_et:
+                        _final_action = '🟡 WATCHLIST / WAIT FOR ENTRY'
+                    elif _locked_v == 'BUY':
+                        _final_action = '🟢 BUY — Entry Confirmed'
+                    elif _locked_v == 'HOLD' and 'WAIT' in _locked_et:
+                        _final_action = '⚪ WAIT / NO ACTION'
+                    else:
+                        _final_action = '⚪ HOLD — Monitor'
+                    if _is_arabic_request:
+                        _final_action_ar = {
+                            '🔴 REDUCE / RISK CONTROL':      '🔴 تخفيض / إدارة مخاطر',
+                            '🟡 WATCHLIST / WAIT FOR ENTRY': '🟡 قائمة مراقبة / انتظر نقطة دخول',
+                            '🟢 BUY — Entry Confirmed':      '🟢 شراء — نقطة دخول مؤكدة',
+                            '⚪ WAIT / NO ACTION':           '⚪ انتظر / لا إجراء',
+                            '⚪ HOLD — Monitor':             '⚪ احتفظ — مراقبة',
+                        }.get(_final_action, _final_action)
+                        _final_action = _final_action_ar
+                    _final_action_line = (
+                        f"**{'القرار النهائي' if _is_arabic_request else 'Final Action'}:** {_final_action}"
+                    )
+                except Exception:
+                    _final_action_line = ""
+
+                # ── Contradiction guard for insight line ──────────────────────
+                # If insight text implies an action that contradicts the locked
+                # verdict, relabel it as a supporting technical signal only.
+                try:
+                    _locked_v_g = (verdict_sc or 'HOLD').upper()
+                    _buy_re  = _re_qv.compile(
+                        r'\b(strong buy|buy now|accumulate|add to position|tactical buy|long position)\b',
+                        _re_qv.IGNORECASE,
+                    )
+                    _red_re  = _re_qv.compile(
+                        r'\b(reduce|sell|trim|underweight|exit|short)\b',
+                        _re_qv.IGNORECASE,
+                    )
+                    _insight_conflict = False
+                    if _locked_v_g in ('HOLD', 'WAIT') and (_buy_re.search(_insight) or _red_re.search(_insight)):
+                        _insight_conflict = True
+                    if _locked_v_g == 'BUY' and _red_re.search(_insight):
+                        _insight_conflict = True
+                    if _locked_v_g in ('REDUCE', 'SELL', 'AVOID') and _buy_re.search(_insight):
+                        _insight_conflict = True
+                    if _insight_conflict:
+                        _ts_label = 'إشارة تقنية' if _is_arabic_request else 'Technical Signal'
+                        _insight = f"[{_ts_label}] {_insight}"
+                except Exception:
+                    pass
+
                 _lines = [_verdict_display]
+                if _final_action_line:
+                    _lines.append(_final_action_line)
                 if _insight:
                     _lines.append(f"💡 {_insight}")
                 if _top_risk:
