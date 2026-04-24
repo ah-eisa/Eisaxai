@@ -32,6 +32,54 @@ from core.agents.finance_helpers import (   # noqa: E402
     _fetch_onchain,
 )
 
+# ── yfinance ADX guard (monkey-patch) ────────────────────────────────────────
+# Yahoo Finance has NO data for Abu Dhabi ADX stocks (.AE suffix).
+# Every yf.Ticker("ADNOCGAS.AE").info call returns HTTP 404 and triggers
+# exponential retries (3× per call site × many call sites = 3+ min wasted).
+# Patch yf.Ticker globally so .AE tickers return empty results immediately,
+# allowing the system to fall through to local cache / pipeline data.
+try:
+    import yfinance as _yf_module
+    import pandas as _pd
+
+    _OrigTicker = _yf_module.Ticker
+
+    class _ADXSafeTicker(_OrigTicker):
+        """Drop-in replacement that short-circuits Yahoo for ADX (.AE) stocks."""
+        _ADX_SUFFIXES = ('.AE',)
+
+        def __init__(self, ticker, *args, **kwargs):
+            super().__init__(ticker, *args, **kwargs)
+            self._is_adx_skip = str(ticker).upper().endswith(self._ADX_SUFFIXES)
+
+        @property
+        def info(self):
+            if self._is_adx_skip:
+                return {}
+            return super().info
+
+        @property
+        def fast_info(self):
+            if self._is_adx_skip:
+                return type('_EmptyFastInfo', (), {'last_price': None, 'market_cap': None})()
+            return super().fast_info
+
+        def history(self, *args, **kwargs):
+            if self._is_adx_skip:
+                return _pd.DataFrame()
+            return super().history(*args, **kwargs)
+
+        @property
+        def calendar(self):
+            if self._is_adx_skip:
+                return {}
+            return super().calendar
+
+    _yf_module.Ticker = _ADXSafeTicker
+    logger.info("[yf_adx_guard] Monkey-patched yf.Ticker — .AE tickers will skip Yahoo Finance")
+except Exception as _yf_patch_err:
+    logger.warning("[yf_adx_guard] Patch failed: %s", _yf_patch_err)
+
 # ── Report Cache (TTL: 10 min) ─────────────────────────────────────────────
 _REPORT_CACHE: dict = {}
 _REPORT_CACHE_TTL = 600  # seconds
@@ -39,6 +87,8 @@ _REPORT_CACHE_TTL = 600  # seconds
 # Per-instance caches (not global singletons — avoids cross-request pollution)
 _div_yield_cache    = _TTLCache(ttl_seconds=3600)   # dividend yields → 1h TTL
 _fundamentals_cache = _TTLCache(ttl_seconds=600)    # fundamentals   → 10min TTL
+
+_ETF_EQUITY_ONLY_SUFFIXES = (".CA",)
 
 
 # _safe_div_yield, _VERDICT_TIERS, _consensus_divergence, _fetch_btc_etf_flows
@@ -51,6 +101,15 @@ def _yf_with_retry(ticker: str, max_attempts: int = 3, base_delay: float = 1.5):
     Returns (ticker_obj, info_dict). Raises on all attempts failing.
     """
     import yfinance as yf
+
+    # Yahoo Finance does NOT carry ADX (Abu Dhabi .AE) stocks — they 404 every
+    # time, burning 2-3 minutes on retries. Return empty immediately so the
+    # caller falls through to local-cache / pipeline data.
+    _YF_UNAVAILABLE = ('.AE', '.BH', '.MA', '.TN')
+    if any(ticker.upper().endswith(s) for s in _YF_UNAVAILABLE):
+        logger.debug("[yf_retry] %s: skipping yfinance (ADX .AE not on Yahoo) — using local cache", ticker)
+        return yf.Ticker(ticker), {}
+
     last_exc = None
     for attempt in range(max_attempts):
         try:
@@ -1629,14 +1688,14 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
         elif _verdict == "HOLD":
             if is_crypto:
                 no_action_en = (
-                    "If price stays in a range with no directional catalyst or on-chain signal shift, HOLD remains the preferred no-trade stance."
+                    "If price stays in a range with no directional catalyst or on-chain signal shift, keep allocation unchanged and await a higher-conviction setup."
                 )
-                no_action_ar = "لو السعر في نطاق جانبي بدون محفز اتجاهي أو تحول في إشارات الأونشين، يفضل الاستمرار على HOLD بدون تداول جديد."
+                no_action_ar = "لو السعر في نطاق جانبي بدون محفز اتجاهي أو تحول في إشارات الأونشين، يفضل الإبقاء على التوزيع الحالي وانتظار إشارة أوضح."
             else:
                 no_action_en = (
-                    "If price stays in a range with no catalyst surprise, HOLD remains the preferred no-trade stance until next earnings."
+                    "If price stays in a range with no catalyst surprise, keep allocation unchanged and monitor entry conditions before adding."
                 )
-                no_action_ar = "لو السعر في نطاق جانبي بدون مفاجآت محفزة، يفضل الاستمرار على HOLD بدون تداول جديد لحين نتائج الأرباح القادمة."
+                no_action_ar = "لو السعر في نطاق جانبي بدون مفاجآت محفزة، يفضل الإبقاء على التوزيع الحالي ومراقبة شروط الدخول قبل أي إضافة."
         elif _cp and _ep and _cp > (_ep * 1.02):
             no_action_en = f"If price stays above the preferred entry zone ({_fmt_price(_ep)}), avoid chasing and await pullback confirmation."
             no_action_ar = f"لو السعر استمر أعلى من منطقة الدخول المفضلة ({_fmt_price(_ep)})، الأفضل عدم المطاردة وانتظار تأكيد البولباك."
@@ -1681,7 +1740,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             return (
                 "\n\n---\n"
                 "## إطار القرار (Advisory Layer)\n"
-                f"- **ثقة القرار:** {confidence}% (Conviction: {conviction})\n"
+                f"- **ثقة القرار:** {confidence}%\n"
                 f"{_conviction_note_line}"
                 "- **الأفق الزمني:** تكتيكي 1-3 أشهر | استراتيجي 12-36 شهر\n"
                 f"- **حالة عدم اتخاذ إجراء:** {no_action_ar}\n"
@@ -1857,17 +1916,72 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             factors, final, sc_data = result  # capture updated sc_data (has _score_capped, etc.)
             verdict_sc, emoji, conviction = get_verdict(final, sc_data)
 
-            trend_state = str(summary.get('trend') or '').strip().lower()
-            if verdict_sc == "BUY" and trend_state == "bearish":
-                decision_type = "contrarian_early"
-            elif verdict_sc == "BUY" and trend_state == "neutral":
-                decision_type = "early_reversal"
-            elif verdict_sc == "BUY" and trend_state == "bullish":
-                decision_type = "trend_confirmed"
-            elif verdict_sc == "HOLD":
-                decision_type = "wait_for_confirmation"
-            else:
-                decision_type = "trend_failure"
+            # ── Decision Engine binding layer (Week 4) ─────────────────────
+            # Build interpretation labels from sc_data (ADX/RSI are deterministic).
+            # Then apply hard constraints via build_decision — the result overrides
+            # verdict_sc so the displayed verdict is NEVER contradicted by signals.
+            try:
+                from core.services.decision_engine import (
+                    build_decision as _build_decision,
+                    classify_decision_type as _classify_decision_type,
+                )
+                from core.services.interpretation_engine import (
+                    build_interpretation_labels as _build_interp_labels_de,
+                )
+                _de_labels = _build_interp_labels_de(
+                    adx=float(sc_data.get('adx') or 0),
+                    rsi=float(sc_data.get('rsi') or 50),
+                )
+                _upside_for_de = (
+                    (sc_data['target'] - sc_data['price']) / sc_data['price'] * 100
+                    if sc_data.get('target') and sc_data.get('price')
+                    else 0.0
+                )
+                _de_result = _build_decision(
+                    interpretation_labels=_de_labels,
+                    score_data={**sc_data, 'upside_pct': _upside_for_de,
+                                'scorecard_verdict': verdict_sc,
+                                'eisax_score': final},  # EisaX Score for Rule 8A
+                )
+                # Override verdict; keep emoji/conviction from scorecard
+                verdict_sc    = _de_result['verdict']
+                decision_type = _classify_decision_type(verdict_sc, _de_labels)
+
+                # ── RULE 8A — Final enforcement in _build_scorecard_md ────────
+                # Even after decision engine, if score ≥ 75 AND upside ≥ 20%:
+                # Fundamental Verdict = BUY. Weak technicals = Entry Timing only.
+                _upside_r8a = (
+                    (sc_data['target'] - sc_data['price']) / sc_data['price'] * 100
+                    if sc_data.get('target') and sc_data.get('price') else 0.0
+                )
+                if final >= 75 and _upside_r8a >= 20.0 and verdict_sc not in ('BUY', 'STRONG BUY'):
+                    verdict_sc = 'BUY'
+                    conviction = 'High' if final >= 80 else 'Medium'
+                    emoji      = '🟢'
+                    sc_data['_rule8a_applied'] = True
+                    logger.info(
+                        f"[Rule8A] {target}: Score={final}, Upside={_upside_r8a:.1f}%"
+                        f" → Fundamental=BUY (was {_de_result['verdict']})"
+                    )
+            except Exception as _de_err:
+                import logging as _de_log
+                _de_log.getLogger(__name__).warning(
+                    "[DecisionEngine] binding failed for %s: %s", target, _de_err
+                )
+                # Fallback: ADX-aware classification (no LLM trend_state)
+                _de_adx = float(sc_data.get('adx') or 0)
+                if verdict_sc in ("BUY", "STRONG BUY"):
+                    if _de_adx >= 25:
+                        decision_type = "trend_confirmed"
+                    elif _de_adx >= 20:
+                        decision_type = "early_reversal"
+                    else:
+                        decision_type = "contrarian_early"
+                elif verdict_sc == "HOLD":
+                    decision_type = "wait_for_confirmation"
+                else:
+                    decision_type = "trend_failure"
+            # ── End Decision Engine ────────────────────────────────────────
 
             _div_info = _consensus_divergence(
                 verdict_sc, analyst_consensus or '',
@@ -1904,6 +2018,44 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             if verdict_sc == "BUY":
                 verdict_display = f"Tactical BUY — {_decision_type_label}"
 
+            # ── Entry Timing (from scorecard Rule 8A or get_verdict) ─────────
+            _entry_timing = sc_data.get('entry_timing', '')
+            # If entry_timing not yet set (no Rule8A path), derive from technicals
+            if not _entry_timing:
+                _adx_et = float(sc_data.get('adx', 0) or 0)
+                _rsi_et = float(sc_data.get('rsi', 50) or 50)
+                if verdict_sc in ('BUY', 'STRONG BUY'):
+                    if _rsi_et > 70:
+                        _entry_timing = 'WAIT — RSI overbought, await pullback'
+                    elif _adx_et < 20:
+                        _entry_timing = 'WAIT — trend not confirmed (ADX < 20)'
+                    elif _adx_et < 25:
+                        _entry_timing = 'ADD ON DIP — await ADX > 25'
+                    else:
+                        _entry_timing = 'BUY NOW — trend confirmed'
+                elif verdict_sc in ('REDUCE', 'SELL', 'AVOID'):
+                    _entry_timing = 'REDUCE INTO STRENGTH'
+                else:
+                    _entry_timing = 'WAIT'
+
+            # Arabic timing labels (user-facing Quick View only; English kept in prompt)
+            # _is_arabic_request lives in _handle_analytics scope — guard against NameError here
+            _is_ar_sc = False
+            try:
+                _is_ar_sc = bool(_is_arabic_request)
+            except NameError:
+                pass
+            if _is_ar_sc:
+                _TIMING_AR = {
+                    'WAIT — RSI overbought, await pullback': 'انتظر — مؤشر RSI في منطقة التشبع، انتظر تراجعًا',
+                    'WAIT — trend not confirmed (ADX < 20)': 'انتظر — الاتجاه غير مؤكد (ADX أقل من 20)',
+                    'ADD ON DIP — await ADX > 25': 'شراء تدريجي عند التراجع — انتظر ADX فوق 25',
+                    'BUY NOW — trend confirmed': 'شراء الآن — الاتجاه مؤكد',
+                    'REDUCE INTO STRENGTH': 'خفّف مع الارتفاع',
+                    'WAIT': 'انتظر تأكيدًا',
+                }
+                _entry_timing = _TIMING_AR.get(_entry_timing, _entry_timing)
+
             if _is_crypto_t:
                 # ── Crypto-specific scorecard display ──
                 # ATH: priority chain → CoinGecko real ATH → sc_data year_high → fund year_high
@@ -1939,7 +2091,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 ---
 
 ## 🎯 EisaX Crypto Score Card
-**{target}** | **{verdict_display} {emoji}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
+**{target}** | Fundamental: **{verdict_display} {emoji}** | Timing: **{_entry_timing}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
 
 *Crypto-specific scoring: Network Dominance, SMA200 Valuation, ATH Recovery, On-Chain Metrics*
 
@@ -1976,7 +2128,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 ---
 
 ## 🎯 EisaX Proprietary Score Card
-**{target}** | **{verdict_display} {emoji}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
+**{target}** | Fundamental: **{verdict_display} {emoji}** | Timing: **{_entry_timing}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
 
 *Conviction driven by: {", ".join(filter(None, [
     # Upside — only show as positive driver when conviction is Medium/High (final >= 60)
@@ -2166,20 +2318,38 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             _live_price = (f"{_fp2:,.2f} {_sym}" if _is_local_price and _fp2
                           else f"${_fp2:,.2f}" if _fp2 else "N/A")
 
-            _beta_raw = dc_data.get('beta') or fund.get('beta') or summary.get('beta')
-            if _beta_raw:
-                _beta_live = f"{float(_beta_raw):.2f}"
-            elif effective_beta:
-                # Crypto: no yfinance beta — show rolling beta vs BTC
+            # ── Beta: single source of truth = effective_beta (pre-validated,
+            #    same value as scorecard). Raw yfinance is not used directly
+            #    because it can return garbage like -0.01 for GCC stocks.
+            _beta_eff_fc = float(effective_beta) if effective_beta else 0.0
+            if _beta_eff_fc < 0:
+                _beta_live = "Not reliable"       # negative beta is garbage data
+            elif _beta_eff_fc > 5:
+                _beta_live = "Not reliable"       # absurdly high — don't display
+            elif _beta_eff_fc > 0:
                 _is_crypto_fc = str(ticker).upper().endswith('-USD')
-                _beta_note = " *(rolling, vs BTC)*" if _is_crypto_fc else " *(rolling)*"
-                _beta_live = f"{float(effective_beta):.2f}{_beta_note}"
+                _beta_note = " *(rolling)*" if _is_crypto_fc else ""
+                _beta_live = f"{_beta_eff_fc:.2f}{_beta_note}"
             else:
-                _beta_live = 'N/A'
+                # effective_beta is 0 (unavailable) — try dc_data only (StockAnalysis)
+                _beta_dc_fc = float(dc_data.get('beta') or 0)
+                if 0 < _beta_dc_fc <= 5:
+                    _beta_live = f"{_beta_dc_fc:.2f}"
+                elif _beta_dc_fc < 0 or _beta_dc_fc > 5:
+                    _beta_live = "Not reliable"
+                else:
+                    _beta_live = 'N/A'
+            # ── P/E sanity: values ≤ 0 or > 200 are not meaningful to display ──
             _pe_raw    = fund.get('pe_ratio') or (
                 float(dc_data.get('pe_ratio', 0)) if dc_data.get('pe_ratio') else 0)
-            _pe_live   = f"{_pe_raw:.1f}x" if _pe_raw else 'N/A'
-            _fpe_live  = f"{float(dc_data.get('forward_pe') or forward_pe or 0):.1f}x" if (dc_data.get('forward_pe') or forward_pe) else 'N/A'
+            _pe_float  = float(_pe_raw) if _pe_raw else 0.0
+            _pe_live   = ("Not reliable" if _pe_float > 200
+                          else f"{_pe_float:.1f}x" if _pe_float > 0
+                          else 'N/A')
+            _fpe_raw   = float(dc_data.get('forward_pe') or forward_pe or 0)
+            _fpe_live  = ("Not reliable" if _fpe_raw > 200
+                          else f"{_fpe_raw:.1f}x" if _fpe_raw > 0
+                          else 'N/A')
             # Crypto: inject market cap from CoinGecko
             if not dc_data.get('market_cap') and str(ticker).upper().endswith(('-USD', '-USDT')):
                 try:
@@ -2840,6 +3010,12 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                     _cache_markets = ["kuwait"]
                 elif _target_up.endswith(".QA"):
                     _cache_markets = ["qatar"]
+                elif _target_up.endswith(".BH"):
+                    _cache_markets = ["bahrain"]
+                elif _target_up.endswith(".MA"):
+                    _cache_markets = ["morocco"]
+                elif _target_up.endswith(".TN"):
+                    _cache_markets = ["tunisia"]
                 else:
                     # Try all regional caches for bare tickers like "ADNOCGAS"
                     _cache_markets = ["uae", "ksa", "egypt", "kuwait", "qatar"]
@@ -2935,7 +3111,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                     _db.close()
                     if _row and any(v is not None for v in _row[:8]):
                         _cols = ["pe_ratio","beta","market_cap","eps","div_yield","revenue","net_margin","forward_pe",
-                                 "sector","company_name","year_high","year_low","roe","gross_margin",
+                                 "sector","company_name","week52_high","week52_low","roe","gross_margin",
                                  "revenue_growth","earnings_growth","net_income"]
                         _db_fund = {k: v for k, v in zip(_cols, _row) if v is not None}
                         fund = {**_db_fund, **fund}   # DB fills gaps, live data takes priority
@@ -2960,16 +3136,33 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             if _cache_row:
                 try:
                     _cache_fund = {}
-                    if _cache_row.get("price_earnings_ttm") and not fund.get("pe_ratio"):
-                        _cache_fund["pe_ratio"] = float(_cache_row["price_earnings_ttm"])
-                    if _cache_row.get("earnings_per_share_diluted_ttm") and not fund.get("eps"):
-                        _cache_fund["eps"] = float(_cache_row["earnings_per_share_diluted_ttm"])
+                    import math as _math_fc
+                    def _valid_cache_num(v):
+                        """Return True if v is a non-NaN, non-inf, non-zero number."""
+                        try:
+                            f = float(v)
+                            return not (_math_fc.isnan(f) or _math_fc.isinf(f)) and f != 0
+                        except (TypeError, ValueError):
+                            return False
+                    _pe_raw = _cache_row.get("price_earnings_ttm")
+                    if _valid_cache_num(_pe_raw) and not fund.get("pe_ratio"):
+                        _cache_fund["pe_ratio"] = float(_pe_raw)
+                    _eps_raw = _cache_row.get("earnings_per_share_diluted_ttm")
+                    if _valid_cache_num(_eps_raw) and not fund.get("eps"):
+                        _cache_fund["eps"] = float(_eps_raw)
                     if _cache_row.get("market_cap_basic") and not fund.get("market_cap"):
                         _cache_fund["market_cap"] = float(_cache_row["market_cap_basic"])
                     if _cache_row.get("sector") and not fund.get("sector"):
                         _cache_fund["sector"] = str(_cache_row["sector"])
                     if _cache_row.get("dividend_yield_recent") is not None and not fund.get("div_yield"):
                         _cache_fund["div_yield"] = float(_cache_row["dividend_yield_recent"] or 0)
+                    # Inject 52W range from TradingView cache if not already populated
+                    _cache_52h = float(_cache_row.get("high_52_week") or _cache_row.get("week52_high") or 0)
+                    _cache_52l = float(_cache_row.get("low_52_week") or _cache_row.get("week52_low") or 0)
+                    if _cache_52h and not fund.get("week52_high"):
+                        _cache_fund["week52_high"] = _cache_52h
+                    if _cache_52l and not fund.get("week52_low"):
+                        _cache_fund["week52_low"] = _cache_52l
                     # Inject TradingView technicals directly
                     _cache_fund["rsi"]        = round(float(_cache_row.get("RSI") or 0), 2)
                     _cache_fund["macd"]       = round(float(_cache_row.get("MACD.macd") or 0), 4)
@@ -2985,12 +3178,20 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                         _fund_source = "tradingview_cache"
                     logger.info("[MarketCache] Injected %d fundamental fields for %s (P/E=%.1f, RSI=%.1f)",
                                 len(_cache_fund), target,
-                                float(_cache_row.get("price_earnings_ttm") or 0),
+                                (float(_cache_row.get("price_earnings_ttm") or 0) if _valid_cache_num(_cache_row.get("price_earnings_ttm")) else 0.0),
                                 float(_cache_row.get("RSI") or 0))
                 except Exception as _cfe:
                     logger.debug("[MarketCache] Fund inject failed: %s", _cfe)
 
             logger.info(f"[Fund] {target}: source={_fund_source}, fields={_fund_useful}")
+
+            # Data coverage level — drives LLM report verbosity
+            _data_coverage_level = (
+                "technical_only" if _fund_useful == 0
+                else "low" if _fund_useful < 2
+                else "medium" if _fund_useful < 4
+                else "high"
+            )
 
             # ── collect: Analyst Consensus (DeepCrawl primary, yfinance fill) ─
             # Pre-seed from fund dict (get_fundamentals runs its own sequential yfinance)
@@ -3537,7 +3738,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             logger.info(f"[Analytics] FearGreed={fg_data.get('score','?')} NextEarnings={next_earnings}")
 
             # ── collect: Technical Analysis ──────────────────────────────────
-            _is_local_market = target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA"))
+            _is_local_market = target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN"))
             try:
                 prices = _f_prices.result(timeout=15)
                 if prices.empty:
@@ -3574,7 +3775,15 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                     _df_cache = None  # BUG-02 FIX: initialize before try block
                     try:
                         from core.market_data_engine import get_stock_data as _get_mde
-                        _mkt = "AE" if target.upper().endswith((".AE", ".DU")) else "SA" if target.upper().endswith(".SR") else "EG" if target.upper().endswith(".CA") else "KW" if target.upper().endswith(".KW") else "QA" if target.upper().endswith(".QA") else None
+                        _mkt = ("AE" if target.upper().endswith((".AE", ".DU"))
+                                else "SA" if target.upper().endswith(".SR")
+                                else "EG" if target.upper().endswith(".CA")
+                                else "KW" if target.upper().endswith(".KW")
+                                else "QA" if target.upper().endswith(".QA")
+                                else "BH" if target.upper().endswith(".BH")
+                                else "MA" if target.upper().endswith(".MA")
+                                else "TN" if target.upper().endswith(".TN")
+                                else None)
                         if _mkt:
                             _df_cache = _get_mde(target, _mkt, period="5y", force_refresh=False)
                             if _df_cache is not None and not _df_cache.empty and "Close" in _df_cache.columns:
@@ -3785,8 +3994,9 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             _dc_beta_v = float(dc_data.get('beta') or 0)
             _yf_beta_v = float(fund.get('beta') or 0)
             _is_local_stock = any(target.upper().endswith(sfx) for sfx in ('.AE', '.DU', '.SR', '.CA', '.KW', '.QA'))
-            # If yfinance says 1.0 for a regional stock — treat as "unknown" (real betas are rarely exactly 1.0)
-            if _is_local_stock and abs(_yf_beta_v - 1.0) < 0.005:
+            # Reject yfinance garbage for regional stocks:
+            # (a) exactly 1.0 → placeholder default  (b) ≤ 0 → calculation artifact / no data
+            if _is_local_stock and (abs(_yf_beta_v - 1.0) < 0.005 or _yf_beta_v <= 0):
                 _yf_beta_v = 0  # discard suspicious default
             _effective_beta = _dc_beta_v or _yf_beta_v or 0
             if not _effective_beta:
@@ -3810,6 +4020,22 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                     summary[_sk] = _svf
             except Exception:
                 summary[_sk] = _sd
+
+        # ── Sanitize fund dict: replace NaN/inf in numeric fields ──────────────
+        import math as _math_fund
+        _FUND_NUMERIC_FIELDS = ["pe_ratio", "eps", "revenue_growth", "roe", "roic",
+                                "net_margin", "gross_margin", "debt_equity", "market_cap",
+                                "div_yield", "dividend_yield", "beta", "forward_pe",
+                                "week52_high", "week52_low", "volume_avg90d"]
+        for _fk in _FUND_NUMERIC_FIELDS:
+            _fv = fund.get(_fk)
+            if _fv is not None:
+                try:
+                    _ff = float(_fv)
+                    if _math_fund.isnan(_ff) or _math_fund.isinf(_ff):
+                        fund[_fk] = None
+                except (TypeError, ValueError):
+                    pass
 
         # ── 5a. Fetch on-chain data for crypto (parallel-safe) ───────────────
         _onchain_data = {}
@@ -4095,8 +4321,8 @@ TECHNICALS:
 - MACD: {summary.get('macd', 0):.2f} | Signal: {summary.get('macd_signal', 0):.2f} | {"Bullish crossover" if summary.get('macd', 0) > summary.get('macd_signal', 0) else "Bearish crossover"}
 - SMA50: {_currency_sym}{summary['sma_50']:,.2f} | SMA200: {_currency_sym}{summary['sma_200']:,.2f}
 - Price vs SMA50: {f"{((real_price - summary['sma_50']) / summary['sma_50'] * 100):+.1f}%" if real_price and summary.get('sma_50') and float(summary.get('sma_50',0)) != 0 else "N/A"} | vs SMA200: {f"{((real_price - summary['sma_200']) / summary['sma_200'] * 100):+.1f}%" if real_price and summary.get('sma_200') and float(summary.get('sma_200',0)) != 0 else "N/A"}
-- ADX: {summary.get('adx', 0):.1f} ({"Strong trend" if summary.get('adx', 0) > 25 else "Weak/No trend"}) | ATR: {summary.get('atr', 0):.2f}
-{"- ⚠️ Technical Note: Momentum indicators (MACD/RSI) reflect price-driven buying pressure, while ADX measures trend strength independently of direction. A bullish momentum reading alongside a weak ADX (< 25) indicates early-stage or range-bound price action — not a confirmed trend. Treat momentum signals with reduced confidence until ADX sustains above 25." if (summary.get('adx', 0) < 25 and (summary.get('macd', 0) > 0 or summary.get('rsi', 0) > 55)) else ""}
+- ADX: {summary.get('adx', 0):.1f} ({"Strong trend" if summary.get('adx', 0) >= 30 else "Confirmed trend" if summary.get('adx', 0) >= 25 else "Emerging trend" if summary.get('adx', 0) >= 20 else "Weak trend"}) | ATR: {summary.get('atr', 0):.2f}
+{("- ⚠️ Technical Note: Momentum is improving, but ADX still maps to a weak trend regime, so directional conviction remains limited." if (summary.get('adx', 0) < 20 and (summary.get('macd', 0) > 0 or summary.get('rsi', 0) > 55)) else "- ⚠️ Technical Note: Momentum is improving, but ADX still maps to an emerging trend regime, so the move should be treated as early-stage rather than fully validated." if (summary.get('adx', 0) < 25 and (summary.get('macd', 0) > 0 or summary.get('rsi', 0) > 55)) else "")}
 {(lambda v_t, v_a: f"""
 VOLUME:
 - Today: {v_t/1e6:.1f}M vs 90-day avg {v_a/1e6:.1f}M → {"🔴 LOW volume ({:.0f}% of avg) — weak conviction in move".format(v_t/v_a*100) if v_a and v_t/v_a < 0.75 else "🟢 HIGH volume ({:.0f}% of avg) — strong conviction".format(v_t/v_a*100) if v_a and v_t/v_a > 1.25 else "⚪ Normal volume ({:.0f}% of avg)".format(v_t/v_a*100) if v_a else "N/A"}
@@ -4333,7 +4559,10 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
             _etf_early_yf_raw = (
                 profile.get("_yf_raw", {}) if "profile" in dir() and profile else {}
             ) or fund or {}
-            _etf_meta_early = _detect_etf_early(target, _etf_early_yf_raw)
+            if str(target).upper().endswith(_ETF_EQUITY_ONLY_SUFFIXES):
+                logger.debug("[ETF] %s: skipped early ETF detection for equity-only suffix", target)
+            else:
+                _etf_meta_early = _detect_etf_early(target, _etf_early_yf_raw)
             if _etf_meta_early:
                 from core.etf_intelligence import build_etf_data_block as _build_etf_db, build_etf_scenarios as _build_etf_sc
                 from core.macro_intelligence import get_live_macro as _etf_glm
@@ -4411,23 +4640,243 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
         else:
             ep = None
 
-        # ── Entry / stop / target (Phase-2 → scorecard_engine service) ─────────
-        from core.services.scorecard_engine import compute_positioning as _compute_pos
-        _pos = _compute_pos(
-            real_price    = _rp_ref,
-            sma200        = sma200_v or 0.0,
-            h52           = float(fund.get('week52_high') or 0),
-            l52           = float(fund.get('week52_low')  or 0),
-            display_target= _display_target,
-            currency_sym  = _currency_sym,
-            currency_lbl  = _currency_lbl,
-            fv_label      = _fv_label,
+        from core.services.report_snapshot import ReportSnapshot as _ReportSnapshot
+
+        _trust_audit_log = []
+        _trust_visible_warnings = []
+        _report_snapshot = None
+        _report_classification = "SAFE"
+
+        _atr_val = float(summary.get('atr', 0) or fund.get('atr', 0) or 0)
+
+        def _atr_stop(ref_price, atr, mult=2.0, fallback_pct=0.09):
+            if atr and atr > 0 and ref_price and ref_price > 0 and atr < ref_price * 0.25:
+                return round(ref_price - (mult * atr), 4)
+            return round(ref_price * (1 - fallback_pct), 4) if ref_price else None
+
+        if _rp_ref and sma200_v:
+            _pct_from_sma = (_rp_ref - sma200_v) / sma200_v
+            if _pct_from_sma < -0.10:
+                ep = _rp_ref * 0.97
+                sp = _atr_stop(_rp_ref, _atr_val, fallback_pct=0.09)
+            elif _pct_from_sma < 0:
+                ep = sma200_v * 0.98
+                sp = _atr_stop(sma200_v, _atr_val, fallback_pct=0.08)
+            else:
+                ep = ep if ep else sma200_v * 1.01
+                sp = _atr_stop(_rp_ref, _atr_val, mult=2.0, fallback_pct=0.09)
+        else:
+            ep = ep if ep else (_rp_ref * 0.96 if _rp_ref else None)
+            sp = _atr_stop(_rp_ref, _atr_val, fallback_pct=0.09)
+
+        _snapshot_target = _display_target or None
+        _trust_target_is_sma = False
+        _trust_sma_used = "SMA50" if (sma50_v and not sma200_v) else "SMA200"
+        if not _snapshot_target and sma200_v and _rp_ref:
+            _is_crypto_tgt = bool(
+                str(target).upper().endswith(('-USD', '-BTC', '-ETH'))
+                or 'BTC' in str(target).upper()
+                or 'ETH' in str(target).upper()
+                or 'crypto' in str(fund.get('sector', '')).lower()
+            )
+            if _rp_ref < sma200_v:
+                _snapshot_target = sma200_v if _is_crypto_tgt else sma200_v * 1.15
+                _trust_sma_used = "SMA200"
+            elif sma50_v and _rp_ref < sma50_v:
+                _snapshot_target = sma50_v
+                _trust_sma_used = "SMA50"
+            else:
+                _snapshot_target = sma200_v * 1.15
+                _trust_sma_used = "SMA200"
+            _trust_target_is_sma = True
+        elif not _snapshot_target and sma50_v and _rp_ref:
+            _snapshot_target = sma50_v if _rp_ref < sma50_v else sma50_v * 1.05
+            _trust_target_is_sma = True
+            _trust_sma_used = "SMA50"
+
+        def _fmt_positioning_price(p):
+            if not p:
+                return "N/A"
+            return f"{p:,.2f} {_currency_sym}" if _is_local_currency else f"${p:,.2f}"
+
+        _trust_target_label = (
+            f"{_trust_sma_used} Technical Target"
+            if _trust_target_is_sma
+            else _fv_label
+            if _target_is_estimate
+            else "Analyst Target"
         )
-        pre_entry  = _pos["pre_entry"]
-        pre_stop   = _pos["pre_stop"]
-        pre_target = _pos["pre_target"]
-        ep         = _pos["ep"]
-        sp         = _pos["sp"]
+        pre_entry = _fmt_positioning_price(ep)
+        if ep and _rp_ref and ep < _rp_ref * 0.985:
+            pre_entry += " *(Limit Order - wait for pullback)*"
+        pre_stop = _fmt_positioning_price(sp)
+        if _snapshot_target and _rp_ref:
+            _snapshot_upside = ((_snapshot_target / _rp_ref) - 1) * 100
+            pre_target = (
+                f"{_fmt_positioning_price(_snapshot_target)} ({_snapshot_upside:+.1f}%) - *{_trust_target_label}*"
+            )
+        else:
+            pre_target = "N/A"
+
+        _snapshot_ts = datetime.now().isoformat()
+        _price_source = "realtime" if real_price else "cache" if _fallback_price else "fallback"
+        _price_delay = 15 if _price_source == "cache" else None
+        _interpretation_labels = {}
+        _approved_phrase_map = {}
+        _interpretation_block = ""
+        _approved_phrase_block = ""
+        _interpretation_context = {}
+
+        def _safe_positive_float(value):
+            try:
+                numeric = float(value or 0)
+            except Exception:
+                return None
+            return numeric if numeric > 0 else None
+
+        def _nearest_support_level(current_price, *candidates):
+            if not current_price:
+                return None
+            valid = []
+            for candidate in candidates:
+                numeric = _safe_positive_float(candidate)
+                if numeric and numeric < current_price:
+                    valid.append(numeric)
+            return max(valid) if valid else None
+
+        def _nearest_resistance_level(current_price, *candidates):
+            if not current_price:
+                return None
+            valid = []
+            for candidate in candidates:
+                numeric = _safe_positive_float(candidate)
+                if numeric and numeric > current_price:
+                    valid.append(numeric)
+            return min(valid) if valid else None
+
+        try:
+            from core.services.interpretation_engine import (
+                build_interpretation_labels as _build_interpretation_labels,
+                format_interpretation_block as _format_interpretation_block,
+            )
+            from core.services.phrase_builder import (
+                build_approved_phrase_map as _build_approved_phrase_map,
+                format_approved_phrase_block as _format_approved_phrase_block,
+            )
+
+            _interp_price = _safe_positive_float(_rp_ref)
+            _interp_support = _nearest_support_level(
+                _interp_price,
+                (summary or {}).get("fib_support"),
+                (summary or {}).get("support"),
+                (summary or {}).get("fib_key_support"),
+                (dc_data or {}).get("support"),
+                sma50_v,
+                sma200_v,
+                _l52,
+            )
+            _interp_resistance = _nearest_resistance_level(
+                _interp_price,
+                (summary or {}).get("fib_resistance"),
+                (summary or {}).get("resistance"),
+                (dc_data or {}).get("resistance"),
+                sma50_v,
+                sma200_v,
+                _h52,
+            )
+            _interp_div_yield = (
+                dividend_yield
+                if "dividend_yield" in dir() and dividend_yield is not None
+                else fund.get("dividend_yield")
+                or fund.get("trailingAnnualDividendYield")
+            )
+            _interp_entry = _safe_positive_float(ep)
+            _interp_volume_today = _safe_positive_float(
+                fund.get("volume_today") or (summary or {}).get("volume")
+            )
+            _interp_volume_avg = _safe_positive_float(
+                fund.get("volume_avg90d") or fund.get("avg_volume")
+            )
+            _trend_text = str((summary or {}).get("trend", "") or "").lower()
+            if "bear" in _trend_text or "below sma200" in _trend_text:
+                _primary_trend = "bearish"
+            elif "bull" in _trend_text or "above sma200" in _trend_text:
+                _primary_trend = "bullish"
+            else:
+                _primary_trend = "neutral"
+
+            _interpretation_labels = _build_interpretation_labels(
+                adx=float((summary or {}).get("adx", 0) or 0),
+                rsi=float((summary or {}).get("rsi", 50) or 50),
+                price=_interp_price or 0,
+                support=_interp_support or 0,
+                resistance=_interp_resistance or 0,
+                div_yield=_interp_div_yield,
+                entry_price=_interp_entry,
+                volume_today=_interp_volume_today,
+                volume_avg=_interp_volume_avg,
+            )
+            _approved_phrase_map = _build_approved_phrase_map(
+                _interpretation_labels,
+                primary_trend=_primary_trend,
+            )
+            _interpretation_block = _format_interpretation_block(_interpretation_labels)
+            _approved_phrase_block = _format_approved_phrase_block(_approved_phrase_map)
+            _interpretation_context = {
+                "adx": float((summary or {}).get("adx", 0) or 0),
+                "rsi": float((summary or {}).get("rsi", 50) or 50),
+                "price": _interp_price or 0,
+                "support": _interp_support or 0,
+                "resistance": _interp_resistance or 0,
+                "div_yield": _interp_div_yield,
+                "entry_price": _interp_entry or 0,
+                "volume_today": _interp_volume_today or 0,
+                "volume_avg": _interp_volume_avg or 0,
+                "primary_trend": _primary_trend,
+                "labels": dict(_interpretation_labels),
+                "phrases": dict(_approved_phrase_map),
+            }
+        except Exception as _interp_err:
+            logger.warning("[InterpretationLayer] Initialization failed for %s: %s", target, _interp_err)
+            _trust_audit_log.append({
+                "event": "interpretation_layer_initialization_failed",
+                "timestamp": _snapshot_ts,
+                "error": str(_interp_err),
+            })
+            _report_classification = "PARTIAL"
+        _trust_raw_snapshot = {
+            "ticker": {"value": (_original_target if "_original_target" in dir() and _original_target != target else target), "source": "fallback", "timestamp": _snapshot_ts},
+            "price": {"value": _rp_ref or None, "source": _price_source, "timestamp": _snapshot_ts, "delay_minutes": _price_delay},
+            "entry": {"value": ep, "source": "calculated", "timestamp": _snapshot_ts},
+            "stop": {"value": sp, "source": "calculated", "timestamp": _snapshot_ts},
+            "target": {"value": _snapshot_target, "source": "calculated" if (_trust_target_is_sma or _target_is_estimate) else "fallback", "timestamp": _snapshot_ts},
+            "beta": {"value": locals().get("_effective_beta") or fund.get('beta') or 1.0, "source": "cache" if fund.get('beta') else "fallback", "timestamp": _snapshot_ts},
+            "pe": {"value": fund.get('pe_ratio'), "source": "cache" if fund.get('pe_ratio') else "fallback", "timestamp": _snapshot_ts},
+            "forward_pe": {"value": forward_pe, "source": "cache" if forward_pe else "fallback", "timestamp": _snapshot_ts},
+            "sma50": {"value": sma50_v or None, "source": "calculated", "timestamp": _snapshot_ts},
+            "sma200": {"value": sma200_v or None, "source": "calculated", "timestamp": _snapshot_ts},
+            "week52_high": {"value": _h52 or None, "source": "cache" if fund.get('week52_high') else "fallback", "timestamp": _snapshot_ts},
+            "week52_low": {"value": _l52 or None, "source": "cache" if fund.get('week52_low') else "fallback", "timestamp": _snapshot_ts},
+            "market_cap": {"value": fund.get('market_cap'), "source": "cache" if fund.get('market_cap') else "fallback", "timestamp": _snapshot_ts},
+            "div_yield": {"value": fund.get('dividend_yield') or fund.get('trailingAnnualDividendYield'), "source": "cache" if (fund.get('dividend_yield') or fund.get('trailingAnnualDividendYield')) else "fallback", "timestamp": _snapshot_ts},
+        }
+        try:
+            _report_snapshot = _ReportSnapshot(_trust_raw_snapshot)
+            _report_snapshot.set("_interpretation_context", {"value": _interpretation_context, "source": "calculated", "timestamp": _snapshot_ts})
+            _report_snapshot.set("_interpretation_labels", {"value": dict(_interpretation_labels), "source": "calculated", "timestamp": _snapshot_ts})
+            _report_snapshot.set("_interpretation_block", {"value": _interpretation_block, "source": "calculated", "timestamp": _snapshot_ts})
+            _report_snapshot.set("_approved_phrase_map", {"value": dict(_approved_phrase_map), "source": "calculated", "timestamp": _snapshot_ts})
+            _report_snapshot.freeze()
+            _trust_audit_log.extend(_report_snapshot.get_audit_log())
+        except Exception as _snapshot_err:
+            logger.warning("[TrustLayer] Snapshot initialization failed for %s: %s", target, _snapshot_err)
+            _trust_visible_warnings.append("Data validation layer unavailable — report generated with fallback safeguards.")
+            _trust_audit_log.append({
+                "event": "snapshot_initialization_failed",
+                "timestamp": _snapshot_ts,
+                "error": str(_snapshot_err),
+            })
+            _report_classification = "PARTIAL"
         _is_local_currency = _currency_lbl in ("SAR", "AED", "EGP", "KWF", "QAR")
         # ── ETF Detection ────────────────────────────────────────────────────
         _etf_meta = None
@@ -4437,7 +4886,10 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
             _yf_info_for_etf = (
                 profile.get("_yf_raw", {}) if "profile" in dir() and profile else {}
             ) or fund.get("_yf_raw", {}) or {}
-            _etf_meta = _detect_etf(target, _yf_info_for_etf)
+            if str(target).upper().endswith(_ETF_EQUITY_ONLY_SUFFIXES):
+                logger.debug("[ETF] %s: skipped ETF detection for equity-only suffix", target)
+            else:
+                _etf_meta = _detect_etf(target, _yf_info_for_etf)
             if _etf_meta:
                 logger.info(f"[ETF] {target} detected as {_etf_meta['etf_type']} — {_etf_meta['etf_label']}")
         except Exception as _etf_e:
@@ -4486,25 +4938,45 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
                     _sc_v, _sc_e, _sc_c = _vh_m.group(1).strip(), _vh_m.group(2).strip(), _vh_m.group(3).strip()
                     scorecard_verdict_hint = f'{_sc_v} {_sc_e} (Conviction: {_sc_c})'
                 else:
-                    scorecard_verdict_hint = 'HOLD (Conviction: Low)'
+                    # Primary regex failed — try broader extraction before giving up
+                    _vh_m2 = _re_hint.search(r'\b(BUY|HOLD|SELL|REDUCE|ACCUMULATE|UNDERWEIGHT|AVOID)\b', _pre_scorecard_md)
+                    _vc_m2 = _re_hint.search(r'Conviction[\s:*|]+?(High|Medium|Low)', _pre_scorecard_md, _re_hint.IGNORECASE)
+                    if _vh_m2:
+                        _sc_c2 = _vc_m2.group(1).strip() if _vc_m2 else 'Medium'
+                        scorecard_verdict_hint = f'{_vh_m2.group(1)} (Conviction: {_sc_c2})'
+                        logger.warning(f"[ScorecardHint] Primary regex failed for {target}, broad fallback: {scorecard_verdict_hint}")
+                    else:
+                        scorecard_verdict_hint = None
+                        logger.warning(f"[ScorecardHint] Could not extract verdict for {target} — pre-verdict omitted from prompt")
                 logger.info(f"[ScorecardHint] {target}: verdict={scorecard_verdict_hint}")
         except Exception as _sve:
-            logger.warning(f"[ScorecardHint] failed for {target}: {_sve}")
+            logger.warning(f"[ScorecardHint] exception for {target}: {_sve}")
             _pre_scorecard_md = ""
-            scorecard_verdict_hint = 'HOLD (Conviction: Low)'
+            scorecard_verdict_hint = None  # Do not default to HOLD on error
 
-        _scorecard_verdict = str((scorecard_verdict_hint or 'HOLD').split()[0]).upper()
+        _scv_parts = (scorecard_verdict_hint or '').split()
+        _scorecard_verdict = (_scv_parts[0].upper() if _scv_parts else '') or 'UNKNOWN'
+
+        import re as _re_cv2
+        _scorecard_conviction_level = "Medium"  # safe default
+        if scorecard_verdict_hint:
+            _scv_conv_m = _re_cv2.search(r'Conviction:\s*(High|Medium|Low)', scorecard_verdict_hint, _re_cv2.IGNORECASE)
+            if _scv_conv_m:
+                _scorecard_conviction_level = _scv_conv_m.group(1).capitalize()
+
         _trend_state = str((summary or {}).get('trend') or '').strip().lower()
-        if _scorecard_verdict == "BUY" and _trend_state == "bearish":
+        if _scorecard_verdict in ("BUY", "ACCUMULATE") and _trend_state == "bearish":
             _decision_type = "contrarian_early"
-        elif _scorecard_verdict == "BUY" and _trend_state == "neutral":
+        elif _scorecard_verdict in ("BUY", "ACCUMULATE") and _trend_state == "neutral":
             _decision_type = "early_reversal"
-        elif _scorecard_verdict == "BUY" and _trend_state == "bullish":
+        elif _scorecard_verdict in ("BUY", "ACCUMULATE") and _trend_state == "bullish":
             _decision_type = "trend_confirmed"
         elif _scorecard_verdict == "HOLD":
             _decision_type = "wait_for_confirmation"
-        else:
+        elif _scorecard_verdict in ("REDUCE", "SELL", "UNDERWEIGHT", "AVOID"):
             _decision_type = "trend_failure"
+        else:  # UNKNOWN — scorecard could not be computed
+            _decision_type = "open"
 
         _decision_type_label_map = {
             "contrarian_early": "Contrarian Early",
@@ -4512,6 +4984,7 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
             "trend_confirmed": "Trend Confirmed",
             "wait_for_confirmation": "Wait For Confirmation",
             "trend_failure": "Trend Failure",
+            "open": "Open — Reason Independently",
         }
         _decision_type_label = _decision_type_label_map.get(
             _decision_type, _decision_type.replace('_', ' ').title()
@@ -4650,6 +5123,55 @@ RESEARCH CONTEXT ({_dt.now().strftime("%B %Y")}):
                         "   ⛔ If you truly cannot compare, name the peer and compare qualitatively (margins, growth, market share).\n"
                         "   ⚡ PEER SELECTION: Choose the MOST RELEVANT competitor — for cloud/software companies this may be AMZN (AWS) or META, not necessarily GOOGL. For UAE/Saudi companies compare to the closest regional peer."
                     )
+
+                # ── Data mode block: compact report when fundamentals are limited ────────
+                _data_mode_block = ""
+                if '_data_coverage_level' in dir() and _data_coverage_level in ("technical_only", "low"):
+                    _data_mode_block = (
+                        "\n🔴 DATA COVERAGE ALERT: FUNDAMENTAL DATA LIMITED\n"
+                        "⛔ COMPACT REPORT MODE — MANDATORY:\n"
+                        "- Executive Summary MUST open with: \"⚠️ Fundamental data is largely unavailable — this analysis relies primarily on technical signals.\"\n"
+                        "- Section 2 (Fundamental Analysis): Write 2-3 sentences MAX. State which metrics ARE available. Then: \"Full fundamental analysis is not possible with available data.\"\n"
+                        "- Section 5: Write \"No analyst coverage or consensus data available.\" — do not invent price targets.\n"
+                        "- Section 6 (Peer Comparison): Write \"Peer comparison unavailable — insufficient data coverage for this market.\" — do not invent peer data.\n"
+                        "- Total memo body: maximum 600 words. Be concise.\n"
+                    )
+
+                # ── Conviction anchor: cascade Low conviction to all sections ──────────
+                _conviction_anchor_block = ""
+                _scorecard_conviction_level_safe = locals().get("_scorecard_conviction_level", "Medium")
+                _eisax_score_int = int(_eisax_score) if (isinstance(_eisax_score, str) and _eisax_score.isdigit()) else (int(_eisax_score) if isinstance(_eisax_score, int) else 0)
+                if _scorecard_conviction_level_safe == "Low" or _eisax_score_int < 60:
+                    _conviction_anchor_block = (
+                        f"\n⚠️ LOW CONVICTION SIGNAL: EisaX Score={_eisax_score_int}/100, Conviction={_scorecard_conviction_level_safe}\n"
+                        "This MUST cascade through the entire memo:\n"
+                        "- Every section: use hedged language (\"suggests\", \"may indicate\", \"limited evidence for\") rather than confident assertions.\n"
+                        "- Avoid specific price targets — use ranges with explicit uncertainty (e.g., \"estimated range 20–25, low confidence\").\n"
+                        "- Section 8b Conviction: MUST be Low for both Fundamental and Timing dimensions.\n"
+                        "- Do NOT write a high-confidence Executive Summary when conviction is Low.\n"
+                    )
+
+                # ── Verdict tone lock: prevent tone contradictions ──────────────────────
+                _verdict_tone_lock = ""
+                _locked_verdict = locals().get("_scorecard_verdict", "")
+                if _locked_verdict in ("REDUCE", "SELL", "AVOID"):
+                    _verdict_tone_lock = (
+                        f"\n🔒 VERDICT TONE LOCK: {_locked_verdict}\n"
+                        "⛔ BANNED PHRASES across ALL sections (any of these = hard violation):\n"
+                        "  \"attractive entry\", \"compelling opportunity\", \"buy the dip\", \"accumulate\", \"add to position\",\n"
+                        "  \"strong momentum\", \"poised for upside\", \"bullish setup\", \"upside potential looks significant\"\n"
+                        "✅ REQUIRED TONE: Cautious, risk-first framing. Every section must justify the REDUCE/SELL verdict.\n"
+                    )
+                elif _locked_verdict in ("BUY", "STRONG BUY", "ACCUMULATE"):
+                    _verdict_tone_lock = (
+                        f"\n🔒 VERDICT TONE LOCK: {_locked_verdict}\n"
+                        "⛔ BANNED PHRASES that contradict a BUY verdict:\n"
+                        "  \"avoid\", \"high risk\", \"not recommended\", \"too expensive\", \"overvalued\",\n"
+                        "  \"limited upside\", \"unattractive\"\n"
+                        "(Exception: if citing specific analyst concerns with data, you may mention them — but frame them as risks to monitor, not reasons to avoid.)\n"
+                        "✅ REQUIRED TONE: Constructive. Timing caveats (WAIT, ADD ON DIP) belong ONLY in Section 8b Entry Timing — NOT in Executive Summary.\n"
+                    )
+
                 prompt = f"""You are EisaX, Chief Investment Officer - built by Eng. Ahmed Eisa.
 
 🚨 CRITICAL: Today's date is {_dt.now().strftime("%B %d, %Y")}.{research_summary}
@@ -4663,14 +5185,36 @@ Your advantage over general AI assistants:
 - You have access to LIVE market data (not training data)
 - You provide institutional-grade analysis with specific entry/exit levels
 
-🎯 SCORECARD PRE-VERDICT (computed before this memo): **{scorecard_verdict_hint}**
+{(f'🎯 SCORECARD PRE-VERDICT (computed before this memo): **{scorecard_verdict_hint}**') if scorecard_verdict_hint else '⚠️ Scorecard pre-verdict unavailable — reason independently from the data below.'}
+{_verdict_tone_lock}{_data_mode_block}{_conviction_anchor_block}
 DECISION TYPE (deterministic): **{_decision_type} — {_decision_type_label}**
-⛔ TONE ALIGNMENT RULE — MANDATORY:
-Your memo MUST be tonally consistent with the above verdict:
-- If verdict = REDUCE or SELL → Executive Summary must reflect caution. No "compelling entry", "attractive opportunity", or buy language. Acknowledge the headwinds clearly.
-- If verdict = HOLD → Balanced tone. Acknowledge both upside potential and risks equally.
-- If verdict = BUY or ACCUMULATE → Constructive tone. State the opportunity while acknowledging risks.
-- ⛔ NEVER write a bullish Executive Summary when the verdict is REDUCE/SELL. This creates a contradiction the client will immediately notice and destroys credibility.
+
+⛔ MANDATORY DECISION STRUCTURE — output this exact block in Section 8b of every report (no exceptions):
+  Fundamental Verdict: BUY / HOLD / REDUCE / SELL
+  Entry Timing: BUY NOW / WAIT / ADD ON DIP / REDUCE INTO STRENGTH
+  Conviction — Fundamental: High / Medium / Low  |  Timing: High / Medium / Low
+  Score: [N]/100 — Score reflects business quality, not short-term return potential.
+
+🔴 RULE 8A — FORCED BUY (HARD RULE, NO EXCEPTIONS):
+   If Score ≥ 75 AND Upside ≥ 20% → Fundamental Verdict MUST be BUY.
+   RSI overbought does NOT override this. ADX weak does NOT override this.
+   Weak technicals → set Entry Timing = WAIT. They do NOT change Fundamental Verdict to HOLD.
+   When Fundamental = BUY and Timing = WAIT, you MUST include this sentence:
+   "BUY conditions met, but entry delayed due to [specific technical reason]."
+
+🔴 RULE 8B — HOLD IS RESTRICTED:
+   HOLD for Fundamental Verdict is only valid when ALL THREE are true:
+   (1) Score between 60–74, (2) Upside < 20%, (3) Bear case downside < -15%.
+   If Score ≥ 75 + Upside ≥ 20% and you write HOLD → this is a rule violation.
+   "Tactical HOLD" as a default is banned. Use it only for a named, time-bound reason.
+
+⛔ TONE ALIGNMENT RULE:
+Your tone MUST follow Fundamental Verdict — not Entry Timing:
+- Fundamental = REDUCE or SELL → Cautious tone. No "compelling entry" or buy language.
+- Fundamental = HOLD → Balanced tone. Acknowledge both upside potential and risks equally.
+- Fundamental = BUY → Constructive tone. Even when Entry Timing = WAIT, do NOT write a HOLD-toned memo.
+- ⛔ NEVER collapse BUY + WAIT into HOLD. They are separate, distinct outputs.
+- ⛔ NEVER write a bullish Executive Summary when Fundamental Verdict = REDUCE/SELL.
 
 🔴 LANGUAGE QUALITY RULES:
 - ⛔ NEVER use boilerplate phrases like "according to recent analyst data", "market observers note", "analysts suggest", or "industry experts believe" — these are empty filler. Use the ACTUAL data provided or state explicitly that the data is unavailable.
@@ -4684,6 +5228,17 @@ Your memo MUST be tonally consistent with the above verdict:
 Analyze the following data and write an institutional-grade investment memorandum.
 {_user_ctx_block}
 {data_block}
+{_interpretation_block}
+{_approved_phrase_block}
+
+INTERPRETATION CONTROL RULES:
+- Any sentence making a technical, timing, support/resistance, volume, or yield claim must remain consistent with the locked interpretation block.
+- Executive Summary must ground strength, main risk, and timing posture in the locked phrases.
+- Technical Outlook must use the locked trend, RSI, support/resistance, and volume labels without reinterpretation.
+- Why Now must use the locked entry-quality and trend-confirmation language.
+- Portfolio Role must use the locked yield description and tactical versus strategic framing.
+- If the locked labels are cautious, your wording must remain cautious.
+- ⚠️ RULE 8A EXCEPTION (takes precedence over the line above): When the SCORECARD PRE-VERDICT = BUY, cautious technical labels apply ONLY to the Entry Timing description in Section 8b. The Executive Summary, thesis, and overall memo tone MUST be constructive (BUY-aligned). Do NOT write a cautious or HOLD-toned Executive Summary for a BUY verdict. Entry timing caveats (RSI overbought, ADX weak) belong in Section 8b — not in the opening thesis.
 
 {(f"""
 ⚠️ ETF ANALYSIS MODE — {_etf_meta_early['etf_label'] if _etf_meta_early else ''}
@@ -4829,7 +5384,7 @@ CONSISTENCY RULES (MANDATORY):
 Use actual numbers. Be specific. Institutional tone.
 {"CRITICAL: This is an ENERGY sector stock. Oil prices are the PRIMARY driver. You MUST discuss oil price impact throughout the report, include the sensitivity table, and reference Brent crude at $" + str(round(_oil_data.get('price',0),2)) + "/bbl." if _is_energy else ""}
 {"CURRENCY: Use " + _currency_sym + " (" + _currency_lbl + ") for ALL price references — NOT USD." if _currency_lbl != "USD" else ""}
-{"LANGUAGE: The user's request was in Arabic. Write the FULL report in Arabic. IMPORTANT: Use the SAME number of sections, SAME level of detail, and ALL 9 sections — do NOT simplify or shorten because it is in Arabic. Arabic and English reports must be identical in depth and structure. Section 6 (Peer Comparison) must still be exactly 2 sentences with competitor ticker and valuation numbers in Arabic." if _is_arabic_request else "LANGUAGE: Write in English."}
+{"LANGUAGE: The user's request was in Arabic. Write the FULL report in Arabic. IMPORTANT: Use the SAME number of sections, SAME level of detail, and ALL 9 sections — do NOT simplify or shorten because it is in Arabic. Arabic and English reports must be identical in depth and structure. Section 6 (Peer Comparison) must still be exactly 2 sentences with competitor ticker and valuation numbers in Arabic. USE THESE EXACT ARABIC SECTION HEADINGS — no variations: ### 1. الملخص التنفيذي | ### 2. أطروحة الاستثمار | ### 3. التحليل الفني | ### 4. إشارات المخاطر | ### 5. التقييم والسعر المستهدف | ### 6. المقارنة مع الأقران | ### 7. القرار والتوقيت | ### 8. ما الذي يغيّر هذا القرار | ### 9. ما الذي قد يثبت خطأ هذا الرأي. Verdict labels in Arabic: شراء / احتفاظ / تخفيف / بيع. Timing labels: شراء الآن / انتظر تأكيدًا / شراء تدريجي عند التراجع / خفّف مع الارتفاع." if _is_arabic_request else "LANGUAGE: Write in English."}
 {"🚨 EXTREME PRICE MOVE ALERT — " + _crash_direction + " (" + f"{change_pct:+.2f}%" + " single-day move detected): This MUST be the FIRST thing addressed in Section 1 (Executive Summary). In Section 4 (Key Risks), you MUST investigate and explain the likely cause: check if this is an ex-dividend drop, rights issue (capital increase), trading halt lifted, forced selling, major news event, or circuit-breaker trigger. State the most probable cause based on available data. Do NOT treat this as a normal trading day — this is an exceptional event requiring forensic analysis." if _is_crash else ""}
 IMPORTANT RULES:
 - Do NOT mention dividend yield unless above 0.5%
@@ -4959,9 +5514,10 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         )
         _oil_badge = f" | **🛢️ Brent: ${_oil_data.get('price',0):.2f}**" if _is_energy and _oil_data.get('price') else ""
         _display_ticker = (_original_target if "_original_target" in dir() and _original_target != target else target)
+        _price_header_label = "Cached Price" if (_report_snapshot and _report_snapshot.is_cached("price")) else "Live Price"
         header = (
             f"# EisaX Intelligence Report: {_display_ticker}\n\n"
-            f"**🔴 Live Price:** {price_str} | "
+            f"**🔴 {_price_header_label}:** {price_str} | "
             f"**Sector:** {fund.get('sector', 'N/A')} | "
             f"**EisaX Score:** {_eisax_score}/100"
             + (f" | **{_exch_label}**" if _exch_label else "")
@@ -5261,106 +5817,44 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 return d
         sma50  = _clean(summary.get('sma_50', 0))
         sma200 = _clean(summary.get('sma_200', 0))
-        # Entry = SAME VALUES as used in prompt (consistency fix)
-        # Use the pre-calculated ep/sp values from line 499-503
         _fp_ref = _clean(real_price or _fallback_price or 0)
-        # ── Smart Entry/Stop: ATR-based dynamic stops ────────────────────────
-        _atr_val = float(summary.get('atr', 0) or fund.get('atr', 0) or 0)
-        _atr_mult = 2.0  # 2×ATR stop distance (industry standard)
-        def _atr_stop(ref_price, atr, mult=_atr_mult, fallback_pct=0.09):
-            """Return stop price: ATR-based when ATR available, else fallback %."""
-            if atr and atr > 0 and ref_price and ref_price > 0:
-                # Sanity check: ATR should be < 25% of price
-                if atr < ref_price * 0.25:
-                    return round(ref_price - (mult * atr), 4)
-            return round(ref_price * (1 - fallback_pct), 4) if ref_price else None
-
-        if _fp_ref and sma200:
-            _pct_from_sma = (_fp_ref - sma200) / sma200
-            if _pct_from_sma < -0.10:
-                # Price deeply below SMA200 — mean reversion play
-                entry_price = _fp_ref * 0.97
-                stop_price  = _atr_stop(_fp_ref, _atr_val, fallback_pct=0.09)
-            elif _pct_from_sma < 0:
-                # Slightly below SMA200
-                entry_price = sma200 * 0.98
-                stop_price  = _atr_stop(sma200, _atr_val, fallback_pct=0.08)
-            else:
-                # Above SMA200 — stop from CURRENT PRICE (not SMA200), standard 2×ATR
-                entry_price = ep if ep else sma200 * 1.01
-                stop_price  = sp if sp else _atr_stop(_fp_ref, _atr_val, mult=2.0, fallback_pct=0.09)
-        else:
-            entry_price = ep if ep else (_fp_ref * 0.96 if _fp_ref else None)
-            stop_price  = sp if sp else _atr_stop(_fp_ref, _atr_val, fallback_pct=0.09)
-        # Final guard: entry must NEVER exceed current price
-        if _fp_ref and entry_price and entry_price >= _fp_ref:
-            entry_price = _fp_ref * 0.97
-            stop_price  = _atr_stop(_fp_ref, _atr_val, fallback_pct=0.09)
         def _fmt_price(p):
             if not p:
                 return "N/A"
             return f"{p:,.2f} {_currency_sym}" if _is_local_mkt else f"${p:,.2f}"
-        entry_level  = _fmt_price(entry_price)
-        stop_level   = _fmt_price(stop_price)
-        _pos_target = _display_target or analyst_target
-        _rp_pos = real_price or _fallback_price or 0
-        _target_is_sma = False
+        if _report_snapshot:
+            entry_price = _report_snapshot.get("entry")
+            stop_price = _report_snapshot.get("stop")
+            _pos_target = _report_snapshot.get("target")
+            _rp_pos = _report_snapshot.get("price")
+        else:
+            entry_price = ep
+            stop_price = sp
+            _pos_target = _snapshot_target
+            _rp_pos = _fp_ref
+
+        entry_level = _fmt_price(entry_price)
+        stop_level = _fmt_price(stop_price)
         if _pos_target and _rp_pos:
             upside = ((_pos_target / _rp_pos) - 1) * 100
             target_level = f"{_pos_target:,.2f} {_currency_sym} ({upside:+.1f}%)" if _is_local_mkt else f"${_pos_target:,.2f} ({upside:+.1f}%)"
-        elif sma200 and _rp_pos:
-            # Target logic:
-            # Crypto below SMA200 → target = SMA200 (base case: mean reversion to SMA200)
-            # Equity below SMA200 → target = SMA200 × 1.15 (standard mean-reversion buffer)
-            # Price above SMA200 but below SMA50 → target = SMA50
-            # Price above both → target = SMA200 × 1.15
-            _is_crypto_tgt = bool(
-                str(target).upper().endswith(('-USD', '-BTC', '-ETH')) or
-                'BTC' in str(target).upper() or 'ETH' in str(target).upper() or
-                'crypto' in str(fund.get('sector', '')).lower()
-            )
-            if _rp_pos < sma200:
-                if _is_crypto_tgt:
-                    _tech_tgt = sma200          # Crypto: SMA200 itself = base case target
-                else:
-                    _tech_tgt = sma200 * 1.15   # Equity: buffer above SMA200
-                _sma_used = "SMA200"
-            elif sma50 and _rp_pos < sma50:
-                _tech_tgt = sma50               # recovering back to SMA50
-                _sma_used = "SMA50"
-            else:
-                _tech_tgt = sma200 * 1.15       # price above both — target 15% above SMA200
-                _sma_used = "SMA200"
-            _tech_up  = ((_tech_tgt / _rp_pos) - 1) * 100
-            target_level = (f"{_tech_tgt:,.2f} {_currency_sym} ({_tech_up:+.1f}%)"
-                            if _is_local_mkt else f"${_tech_tgt:,.2f} ({_tech_up:+.1f}%)")
-            _target_is_sma = True
-        elif sma50 and _rp_pos:
-            # Fallback to SMA50 as near-term technical target (mean reversion)
-            _tech_tgt = sma50 if _rp_pos < sma50 else sma50 * 1.05
-            _tech_up  = ((_tech_tgt / _rp_pos) - 1) * 100
-            target_level = (f"{_tech_tgt:,.2f} {_currency_sym} ({_tech_up:+.1f}%)"
-                            if _is_local_mkt else f"${_tech_tgt:,.2f} ({_tech_up:+.1f}%)")
-            _target_is_sma = True
         else:
             target_level = "N/A"
-            _target_is_sma = False
 
-        # Target label: SMA technical takes priority over FV-estimate label
-        # _sma_used may already be set inside the elif sma200 block above; only default here if not
-        if '_sma_used' not in dir():
-            _sma_used = "SMA50" if (sma50 and not sma200) else "SMA200"
-        if _target_is_sma:
-            _is_crypto_local = bool(fund.get('asset_type') == 'crypto' or
-                                    str(target).upper().endswith(('-USD', '-BTC', '-ETH')) or
-                                    'BTC' in str(target).upper() or 'ETH' in str(target).upper() or
-                                    'crypto' in str(fund.get('sector', '')).lower())
+        if _trust_target_is_sma:
+            _is_crypto_local = bool(
+                fund.get('asset_type') == 'crypto'
+                or str(target).upper().endswith(('-USD', '-BTC', '-ETH'))
+                or 'BTC' in str(target).upper()
+                or 'ETH' in str(target).upper()
+                or 'crypto' in str(fund.get('sector', '')).lower()
+            )
             if _is_crypto_local and _rp_pos and sma200 and _rp_pos < sma200:
-                _target_rationale = f'⚠️ Base case target: {_sma_used} mean reversion (price below {_sma_used}, no analyst coverage)'
+                _target_rationale = f'⚠️ Base case target: {_trust_sma_used} mean reversion (price below {_trust_sma_used}, no analyst coverage)'
             elif _is_crypto_local:
-                _target_rationale = f'⚠️ Crypto technical target: {_sma_used} × 1.15 extension (no analyst coverage)'
+                _target_rationale = f'⚠️ Crypto technical target: {_trust_sma_used} × 1.15 extension (no analyst coverage)'
             else:
-                _target_rationale = f'⚠️ Technical target ({_sma_used} mean-reversion) — not analyst'
+                _target_rationale = f'⚠️ Technical target ({_trust_sma_used} mean-reversion) — not analyst'
         elif _target_is_estimate:
             _target_rationale = '⚠️ EisaX FV Estimate (no analyst coverage)'
         else:
@@ -5402,6 +5896,12 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             else 'At current price — entry zone active'
         )
 
+        from core.services.positioning_validator import validate_positioning as _trust_validate_positioning
+        _positioning_validation = _trust_validate_positioning(entry_price, stop_price, _pos_target, side="long")
+        _trust_audit_log.append(_positioning_validation.audit)
+        if _positioning_validation.suppressed:
+            _trust_visible_warnings.append("Positioning section unavailable pending validation.")
+
         # ── Position Size Block ────────────────────────────────────────────────
         # Safe fallbacks: sc_data/verdict_sc/final/conviction are local to _build_scorecard_md.
         # Extract real score from _pre_scorecard_md string first (most accurate source).
@@ -5440,7 +5940,8 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             _sh = scorecard_verdict_hint or ''
             final = 75 if 'BUY' in _sh.upper() else 45 if 'SELL' in _sh.upper() or 'REDUCE' in _sh.upper() else 55
         if 'conviction' not in dir():
-            conviction = 'Medium' if 'BUY' in (scorecard_verdict_hint or '').upper() else 'Low'
+            _hint_up = (scorecard_verdict_hint or '').upper()
+            conviction = 'High' if 'STRONG BUY' in _hint_up else 'Medium' if 'BUY' in _hint_up else 'Low'
         if not _div_info.get('message'):
             _div_info = _consensus_divergence(
                 verdict_sc, analyst_consensus or '',
@@ -5599,12 +6100,15 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             _eq_score2, _eq_label2, _eq_note2 = 50, 'N/A', ''
 
         # ── Final Technical Signal ─────────────────────────────────────────────
+        from core.services.scorecard_engine import classify_adx as _sc_classify_adx
         _trend_bull  = bool(real_price and sma200 and real_price > sma200)
         _macd_bull   = float(summary.get('macd', 0) or 0) > float(summary.get('macd_signal', 0) or 0)
-        _adx_strong  = float(summary.get('adx', 0) or 0) > 25
+        _adx_val_sc  = float(summary.get('adx', 0) or 0)
+        _adx_strong  = _adx_val_sc > 25
         _trend_lbl   = "Bullish Trend" if _trend_bull  else "Bearish Trend"
         _macd_lbl    = "Bullish Momentum" if _macd_bull  else "Bearish Momentum"
-        _adx_lbl     = "Strong ADX" if _adx_strong else "Weak ADX"
+        _adx_short_sc, _ = _sc_classify_adx(_adx_val_sc)
+        _adx_lbl     = f"{_adx_short_sc} ADX"
         if _trend_bull and _macd_bull and _adx_strong:
             _final_sig, _final_sig_emoji = "Strong Buy",   "✅"
         elif _trend_bull and _macd_bull and not _adx_strong:
@@ -5645,20 +6149,35 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             f"*({_trend_lbl} + {_macd_lbl} + {_adx_lbl})*\n"
         )
 
-        positioning_block = (
-            f"\n\n---\n"
-            f"📊 **Positioning Guide**\n"
-            f"> ⏱️ **Entry Quality: {_eq_score2}/100 — {_eq_label2}** | {_eq_note2}\n\n"
-            f"| | Level | Rationale |\n"
-            f"|---|---|---|\n"
-            f"| 🟢 Entry | {entry_level} | {_entry_rationale} |\n"
-            f"| 🎯 Target | {target_level} | {_target_rationale} |\n"
-            f"| 🔴 Stop | {stop_level} | {_stop_rationale} |\n"
-            f"{_entry_note}"
-            f"{_position_size_block}"
-        )
+        if _positioning_validation.suppressed:
+            positioning_block = ""
+        else:
+            positioning_block = (
+                f"\n\n---\n"
+                f"📊 **Positioning Guide**\n"
+                f"> ⏱️ **Entry Quality: {_eq_score2}/100 — {_eq_label2}** | {_eq_note2}\n\n"
+                f"| | Level | Rationale |\n"
+                f"|---|---|---|\n"
+                f"| 🟢 Entry | {entry_level} | {_entry_rationale} |\n"
+                f"| 🎯 Target | {target_level} | {_target_rationale} |\n"
+                f"| 🔴 Stop | {stop_level} | {_stop_rationale} |\n"
+                f"{_entry_note}"
+                f"{_position_size_block}"
+            )
 
-        chart_block = f"\n\n---\n📈 **Price Chart (60 days)**\n<div class=\"eisax-chart\" data-ticker=\"{target}\"></div>"
+        _trust_warning_block = ""
+        if _trust_visible_warnings:
+            _trust_warning_block = "\n\n---\n" + "\n".join(f"> {warning}" for warning in _trust_visible_warnings)
+
+        _ascii_section = (
+            "\n" + "\n".join(f"> {l}" for l in chart_str.split("\n")) + "\n"
+            if chart_str else ""
+        )
+        chart_block = (
+            f"\n\n---\n📈 **Price Chart (60 days)**\n"
+            f"<div class=\"eisax-chart\" data-ticker=\"{target}\"></div>"
+            + _ascii_section
+        )
 
         _analysis_disclaimer = (
             "\n\n---\n"
@@ -5764,6 +6283,25 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 logger.debug(f"[Compress] skipped: {_comp_e}")
             deepseek_reply = self._soften_execution_language(deepseek_reply)
             deepseek_reply = self._round_scenario_prices(deepseek_reply, _currency_sym)
+            # ── TG1/TG6: Deduplicate repeated sentences across the full report ──────
+            try:
+                _dedup_lines = []
+                _seen_line_keys = set()
+                for _dline in deepseek_reply.split('\n'):
+                    _dk = _dline.strip().lower()
+                    # Always keep headings, table rows, empty lines, and short lines
+                    if not _dk or _dk.startswith('#') or _dk.startswith('|') or len(_dk) < 40:
+                        _dedup_lines.append(_dline)
+                        continue
+                    # For prose lines, deduplicate on first 80 chars
+                    _dk80 = _dk[:80]
+                    if _dk80 not in _seen_line_keys:
+                        _seen_line_keys.add(_dk80)
+                        _dedup_lines.append(_dline)
+                    # else: silently drop the duplicate prose line
+                deepseek_reply = '\n'.join(_dedup_lines)
+            except Exception as _dd_e:
+                logger.debug("[Dedup] skipped: %s", _dd_e)
             # ── Quick-mode reply trimmer: strip CIO boilerplate + cap at 3 sections ──
             if _analysis_mode == "quick":
                 import re as _re2
@@ -5785,71 +6323,143 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 deepseek_reply = "".join(_kept).strip()
 
             def _build_quick_view(full_report: str, ticker: str, scorecard_md: str = "") -> str:
-                """Compact 3-line snapshot — verdict · one insight · one risk. Full report follows."""
+                """Compact 3-line snapshot — verdict · deterministic insight · one risk. Full report follows."""
                 import re as _re_qv
 
-                # ── Line 1: Verdict from scorecard (authoritative) ──────────────
-                _vl = ""
-                if scorecard_md:
-                    _vm = _re_qv.search(
-                        r'\*\*' + _re_qv.escape(ticker) + r'\*\*.*?EisaX Score.*?\d+/100',
-                        scorecard_md
-                    )
-                    if _vm:
-                        _vl = _re_qv.sub(r'[*`]', '', _vm.group(0)).strip()
-                _verdict_display = f"**{_vl}**" if _vl else f"**{ticker} | Analysis Complete**"
+                # ── Line 1: Verdict — use outer-scope verdict_sc / _entry_timing ──
+                # These are already resolved by Rule 8A and the decision engine.
+                # Fallback to scorecard markdown regex only if outer scope unavailable.
+                _lbl_fundamental = "الأساسيات:" if _is_arabic_request else "Fundamental:"
+                _lbl_timing      = "التوقيت:"   if _is_arabic_request else "Timing:"
+                _lbl_conviction  = "الثقة:"     if _is_arabic_request else "Conviction:"
+                _lbl_score       = "درجة EisaX:" if _is_arabic_request else "EisaX Score:"
 
-                # ── Line 2: First sentence of Executive Summary ──────────────────
-                _clean = _re_qv.sub(
-                    r'MEMORANDUM.*?(?:^---\s*$|\n---\s*\n)',
-                    '', full_report[:3000], flags=_re_qv.DOTALL | _re_qv.MULTILINE
-                )
-                _s1 = _re_qv.search(
-                    r'(?:^|\n)#+\s*1[.\s]*Executive Summary\s*\n(.*?)(?=\n#+\s*2[.\s])',
-                    _clean, _re_qv.DOTALL | _re_qv.IGNORECASE
-                )
-                _insight = ""
-                if _s1:
-                    _s1_text = _re_qv.sub(r'[#*`>]', '', _s1.group(1)).strip()
-                    _sents = _re_qv.split(r'(?<=[.!?])\s+', _s1_text)
-                    _insight = _sents[0] if _sents else ""
-                if not _insight:
-                    _plain = _re_qv.sub(r'[#*`>]', '', _clean)
-                    _sents = _re_qv.split(r'(?<=[.!?])\s+', _plain.strip())
-                    _insight = _sents[0] if _sents else ""
+                try:
+                    _outer_verdict  = verdict_sc   # from outer _build_scorecard_md scope
+                    _outer_timing   = _entry_timing
+                    _outer_conv     = conviction
+                    _outer_score    = final
+                    _outer_emoji    = emoji
+                    _verdict_display = (
+                        f"**{ticker} | {_lbl_fundamental} {_outer_verdict} {_outer_emoji}"
+                        f" | {_lbl_timing} {_outer_timing}"
+                        f" | {_lbl_conviction} {_outer_conv}"
+                        f" | {_lbl_score} {_outer_score}/100**"
+                    )
+                except NameError:
+                    # Fallback: parse from scorecard markdown
+                    _vl = ""
+                    if scorecard_md:
+                        _vm = _re_qv.search(
+                            r'\*\*' + _re_qv.escape(ticker) + r'\*\*.*?EisaX Score.*?\d+/100',
+                            scorecard_md
+                        )
+                        if _vm:
+                            _vl = _re_qv.sub(r'[*`]', '', _vm.group(0)).strip()
+                    _verdict_display = f"**{_vl}**" if _vl else f"**{ticker} | Analysis Complete**"
+
+                # ── Line 2: Deterministic quick insight from interpretation labels ──
+                try:
+                    from core.services.phrase_builder import build_quick_insight
+
+                    # Pass the resolved verdict so the phrase reflects BUY+WAIT, not HOLD
+                    _qv_decision = {
+                        'verdict':      verdict_sc,
+                        'verdict_type': 'Tactical',
+                        'constraints':  getattr(_de_result, 'get', lambda k, d=None: d)('constraints', [])
+                                        if '_de_result' in dir() else [],
+                    }
+                    _qv_snapshot = {"ticker": ticker}
+                    _insight = build_quick_insight(_qv_snapshot, _interpretation_labels or {}, _qv_decision)
+                except Exception as _qv_err:
+                    logger.debug("[QuickView] deterministic insight failed: %s", _qv_err)
+                    _insight = ""
+                    # Fallback: extract first sentence from Executive Summary
+                    _clean = _re_qv.sub(
+                        r'MEMORANDUM.*?(?:^---\s*$|\n---\s*\n)',
+                        '', full_report[:3000], flags=_re_qv.DOTALL | _re_qv.MULTILINE
+                    )
+                    _s1 = _re_qv.search(
+                        r'(?:^|\n)#+\s*1[.\s]*Executive Summary\s*\n(.*?)(?=\n#+\s*2[.\s])',
+                        _clean, _re_qv.DOTALL | _re_qv.IGNORECASE
+                    )
+                    if _s1:
+                        _s1_text = _re_qv.sub(r'[#*`>]', '', _s1.group(1)).strip()
+                        _sents = _re_qv.split(r'(?<=[.!?])\s+', _s1_text)
+                        _insight = _sents[0] if _sents else ""
+                    if not _insight:
+                        _plain = _re_qv.sub(r'[#*`>]', '', _clean)
+                        _sents = _re_qv.split(r'(?<=[.!?])\s+', _plain.strip())
+                        _insight = _sents[0] if _sents else f"{ticker} analysis complete."
 
                 # ── Line 3: Top risk label from Section 4 ────────────────────────
+                _risk_patterns = [
+                    r'(?:Key Risks?|إشارات المخاطر|مخاطر رئيسية)[^\n]*\n+([^\n]{20,200})',
+                ]
                 _top_risk = ""
-                _s4 = _re_qv.search(
-                    r'(?:^|\n)#+\s*4[.\s]*Key Risks?(.*?)(?=\n#+\s*5[.\s])',
-                    full_report, _re_qv.DOTALL | _re_qv.IGNORECASE
-                )
-                if _s4:
-                    for _l in _s4.group(1).split('\n'):
-                        _ls = _l.strip()
-                        if _re_qv.match(r'^[\*\-•]|^\d+\.', _ls) and len(_ls) > 15:
-                            _lbl = _re_qv.search(r'\*\*([^*]+)\*\*\s*\(Severity[^)]+\)', _ls)
-                            if _lbl:
-                                _top_risk = _lbl.group(0)
-                            elif len(_ls) < 120:
-                                _top_risk = _re_qv.sub(r'[*`]', '', _ls)[:100]
-                            break
+                for _rp in _risk_patterns:
+                    _rm = _re_qv.search(_rp, full_report, _re_qv.IGNORECASE)
+                    if _rm:
+                        _top_risk = _rm.group(1).strip()
+                        break
+                if not _top_risk:
+                    _s4 = _re_qv.search(
+                        r'(?:^|\n)#+\s*4[.\s]*(?:Key Risks?|إشارات المخاطر|مخاطر رئيسية)(.*?)(?=\n#+\s*5[.\s])',
+                        full_report, _re_qv.DOTALL | _re_qv.IGNORECASE
+                    )
+                    if _s4:
+                        for _l in _s4.group(1).split('\n'):
+                            _ls = _l.strip()
+                            if _re_qv.match(r'^[\*\-•]|^\d+\.', _ls) and len(_ls) > 15:
+                                _lbl = _re_qv.search(r'\*\*([^*]+)\*\*\s*\(Severity[^)]+\)', _ls)
+                                if _lbl:
+                                    _top_risk = _lbl.group(0)
+                                elif len(_ls) < 120:
+                                    _top_risk = _re_qv.sub(r'[*`]', '', _ls)[:100]
+                                break
+
+                # Strip accidental leading numbering from insight and risk
+                _insight = _re_qv.sub(r'^\d+\.\s*', '', _insight).strip()
+                _top_risk = _re_qv.sub(r'^\d+\.\s*', '', _top_risk).strip()
+
+                # Flatten embedded newlines so insight stays on one line
+                # (prevents "...weak.\n⚠️ Top Risk" collision)
+                _insight = ' '.join(_insight.splitlines()).strip()
+                _top_risk = ' '.join(_top_risk.splitlines()).strip()
 
                 _lines = [_verdict_display]
                 if _insight:
-                    # Strip accidental leading numbering (e.g. "1." "2.") from insight
-                    _insight = _re_qv.sub(r'^\d+\.\s*', '', _insight).strip()
                     _lines.append(f"💡 {_insight}")
                 if _top_risk:
-                    # Strip accidental leading numbering (e.g. "1." "2.") from risk
-                    _top_risk = _re_qv.sub(r'^\d+\.\s*', '', _top_risk).strip()
                     _lines.append(f"⚠️ Top Risk: {_top_risk}")
 
+                _qv_trailer = "\n\n---\n📄 *التقرير الكامل أدناه*\n" if _is_arabic_request else "\n\n---\n📄 *Full report below*\n"
                 return (
-                    f"## ⚡ Quick View — {ticker}\n\n"
+                    f"## ⚡ {'نظرة سريعة' if _is_arabic_request else 'Quick View'} — {ticker}\n\n"
                     + "\n\n".join(_lines)
-                    + "\n\n---\n📄 *Full report below*\n"
+                    + _qv_trailer
                 )
+
+            # ── Apply interpretation guard before rendering Quick View ────────
+            try:
+                if _interpretation_labels:
+                    from core.services.interpretation_guard import InterpretationGuard
+
+                    _guard = InterpretationGuard()
+                    _guard_result = _guard.audit_and_sanitize(deepseek_reply, _interpretation_labels)
+                    if _guard_result.replacements_made > 0:
+                        deepseek_reply = _guard_result.text
+                        _trust_audit_log.extend(_guard_result.audit_log)
+                        _report_classification = "PARTIAL"
+                        _override_warning = "Technical language aligned with confirmed data signals."
+                        if _override_warning not in _trust_visible_warnings:
+                            _trust_visible_warnings.append(_override_warning)
+                        logger.info(
+                            "[QuickView] interpretation guard replaced %d conflicting claim(s)",
+                            _guard_result.replacements_made,
+                        )
+            except Exception as _guard_err:
+                logger.debug("[QuickView] interpretation guard skipped: %s", _guard_err)
 
             quick_view = _build_quick_view(deepseek_reply, target, _pre_scorecard_md if '_pre_scorecard_md' in dir() else "")
             final_reply = quick_view + "\n\n---\n## 📋 Full Report\n\n" + deepseek_reply
@@ -5966,12 +6576,134 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                         + _final_tech_block
                         + factcheck_block
                         + news_block
+                        + _trust_warning_block
                         + positioning_block
                         + _heatmap_block
                         + _pre_scorecard_md
                         + chart_block
                         + _analysis_disclaimer
                     )
+
+                _trust_layer_data = {
+                    "classification": _report_classification,
+                    "warnings": list(_trust_visible_warnings),
+                    "errors": [],
+                    "audit": list(_trust_audit_log),
+                }
+                if _report_snapshot:
+                    from core.services.report_lint import ReportSection as _ReportSection
+                    from core.services.report_lint import RenderedReport as _RenderedReport
+                    from core.services.report_lint import lint_report as _lint_report
+
+                    if _analysis_mode in ("quick", "cio"):
+                        _report_sections = [_ReportSection("Memo", reply)]
+                    else:
+                        _report_sections = [
+                            _ReportSection("Memo", final_reply),
+                            _ReportSection("Fact Check", factcheck_block),
+                            _ReportSection("News", news_block),
+                            _ReportSection("Trust Warnings", _trust_warning_block),
+                            _ReportSection("Positioning Guide", positioning_block),
+                            _ReportSection("Heatmap", _heatmap_block),
+                            _ReportSection("Scorecard", _pre_scorecard_md),
+                            _ReportSection("Chart", chart_block),
+                            _ReportSection("Disclaimer", _analysis_disclaimer),
+                        ]
+
+                    _render_candidate = _RenderedReport(
+                        ticker=_display_ticker,
+                        full_text=reply,
+                        sections=_report_sections,
+                        entry=entry_price,
+                        stop=stop_price,
+                        target=_pos_target,
+                        warnings=list(_trust_visible_warnings),
+                        audit_log=list(_trust_audit_log),
+                        observed_prices=[
+                            _report_snapshot.get("price"),
+                            real_price or _fallback_price or 0,
+                        ],
+                    )
+                    _lint = _lint_report(
+                        _render_candidate,
+                        _report_snapshot,
+                        decision=locals().get('_de_result'),
+                        interpretation_labels=locals().get('_de_labels'),
+                    )
+                    _trust_audit_log.extend(_lint.audit)
+                    _trust_layer_data = {
+                        "classification": (
+                            "FLAGGED" if not _lint.safe_to_render
+                            else "PARTIAL" if (_lint.warnings or _trust_visible_warnings or _report_classification == "PARTIAL")
+                            else "SAFE"
+                        ),
+                        "warnings": _lint.warnings + list(_trust_visible_warnings),
+                        "errors": _lint.errors,
+                        "audit": list(_trust_audit_log),
+                    }
+
+                    if not _lint.safe_to_render:
+                        _blocked_reasons = "\n".join(f"- {err}" for err in _lint.errors)
+                        reply = (
+                            header
+                            + "> Warning: Trust layer blocked this report before render.\n\n"
+                            + _blocked_reasons
+                        )
+                        state.set_artifact(sid, {
+                            "type": "analysis", "content": reply, "source": "self_generated",
+                            "exportable": False, "timestamp": datetime.now()
+                        })
+                        _REPORT_CACHE[_cache_key] = (_tc.time(), {
+                            "type": "chat.reply",
+                            "reply": reply,
+                            "data": {
+                                "agent": "finance",
+                                "analytics": summary,
+                                "fundamentals": fund,
+                                "trust_layer": _trust_layer_data,
+                            },
+                        })
+                        return {
+                            "type": "chat.reply",
+                            "reply": reply,
+                            "data": {
+                                "agent": "finance",
+                                "analytics": summary,
+                                "fundamentals": fund,
+                                "trust_layer": _trust_layer_data,
+                            },
+                        }
+
+                    if _analysis_mode not in ("quick", "cio"):
+                        _section_map = {section.name: section for section in _render_candidate.sections}
+                        factcheck_block = _section_map["Fact Check"].content
+                        news_block = _section_map["News"].content
+                        _trust_warning_block = _section_map["Trust Warnings"].content
+                        positioning_block = _section_map["Positioning Guide"].content
+                        _heatmap_block = _section_map["Heatmap"].content
+                        _pre_scorecard_md = _section_map["Scorecard"].content
+                        chart_block = _section_map["Chart"].content
+                        _analysis_disclaimer = _section_map["Disclaimer"].content
+                        reply = (
+                            header
+                            + _regime_block
+                            + _vel_note
+                            + _trend_chart_block
+                            + _alert_block
+                            + _acc_block
+                            + _div_block
+                            + final_reply
+                            + _decision_framework_block
+                            + _final_tech_block
+                            + factcheck_block
+                            + news_block
+                            + _trust_warning_block
+                            + positioning_block
+                            + _heatmap_block
+                            + _pre_scorecard_md
+                            + chart_block
+                            + _analysis_disclaimer
+                        )
 
                 # ── EisaX Cache Enhancement ────────────────────────────────
                 try:
@@ -5998,8 +6730,8 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 # Save to brain
                 self._save_to_brain(target, reply, real_price, analyst_target, fund, news_sent)
 
-                _REPORT_CACHE[_cache_key] = (_tc.time(), {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund}})
-                return {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund}}
+                _REPORT_CACHE[_cache_key] = (_tc.time(), {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund, "trust_layer": _trust_layer_data}})
+                return {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund, "trust_layer": _trust_layer_data}}
             except Exception as _e:
                 logger.error(f"[Analytics] Reply build failed: {_e}")
                 return {"type": "chat.reply", "reply": final_reply, "data": {"agent": "finance"}}

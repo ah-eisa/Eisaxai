@@ -2,6 +2,8 @@ import numpy; import yfinance
 import os
 import logging
 import time as _time
+import asyncio
+import uuid
 from core.config import (
     APP_DB, STATIC_DIR, EXPORTS_DIR, FILE_CACHE_DIR,
     BACKEND_LOG, ENV_FILE,
@@ -13,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from typing import Optional
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import uvicorn
 import io
 import jwt as _jwt
@@ -50,6 +54,24 @@ def _resolve_auth(
     if SECURE_TOKEN and (token == SECURE_TOKEN or bearer == SECURE_TOKEN):
         return {'user_id': 'admin', 'tier': 'vip', 'method': 'secure_token'}
     raise HTTPException(403, 'Unauthorized')
+
+
+# ── JWT auth dependency — defined early so routes above line 3816 can use it ──
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _require_jwt(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
+    """FastAPI dependency — validates Bearer JWT, returns payload dict."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    from core.auth import decode_token as _decode_token
+    try:
+        return _decode_token(credentials.credentials)
+    except _jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except _jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 
 # ── Logging with rotation (max 10MB per file, keep 3 backups) ──────────────
 _log_handler = RotatingFileHandler(
@@ -128,10 +150,20 @@ orchestrator = MultiAgentOrchestrator(db_path=str(APP_DB))
 tts_service = TTSService()
 
 SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
+_ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
+_STAGING_UPSTREAM_BASE = os.getenv("STAGING_UPSTREAM_BASE", "http://127.0.0.1:8000").rstrip("/")
+_STAGING_LEADS_PATH = Path(
+    os.getenv(
+        "STAGING_LEADS_PATH",
+        "/home/ubuntu/investwise/data/staging-agent-leads.jsonl",
+    )
+)
+_STAGING_LEADS_PATH.parent.mkdir(parents=True, exist_ok=True)
 # Disk-based file store (shared across all workers)
 import json as _json
 _FILE_CACHE_DIR = str(FILE_CACHE_DIR)
 _FILE_STORE_TTL = 3600  # seconds
+_DOWNLOAD_TOKENS = {}
 os.makedirs(_FILE_CACHE_DIR, exist_ok=True)
 
 def _evict_old_files():
@@ -156,6 +188,36 @@ def _file_store_get(file_id: str):
         return None
     with open(fpath, "r", encoding="utf-8") as _f:
         return _json.load(_f)
+
+
+def _create_download_token(filename: str, user_id: str) -> str:
+    now = _time.time()
+    for existing_token, entry in list(_DOWNLOAD_TOKENS.items()):
+        if not isinstance(entry, dict) or entry.get("expires", 0) <= now:
+            _DOWNLOAD_TOKENS.pop(existing_token, None)
+
+    token = uuid.uuid4().hex
+    _DOWNLOAD_TOKENS[token] = {
+        "filename": filename,
+        "user_id": user_id,
+        "expires": now + 3600,
+    }
+    return token
+
+
+def _file_store_get_for_user(file_id: str, user_id: Optional[str]):
+    entry = _file_store_get(file_id)
+    if entry is None:
+        return None
+    if isinstance(entry, str):
+        return {"text": entry}
+    if not isinstance(entry, dict):
+        return None
+
+    stored_user_id = entry.get("user_id")
+    if stored_user_id is not None and stored_user_id != user_id:
+        raise HTTPException(status_code=403, detail="File access denied")
+    return entry
 
 
 def _soften_portfolio_advice(text: str) -> str:
@@ -237,6 +299,838 @@ class MessagePayload(BaseModel):
     session_id: Optional[str] = None
     files: Optional[list] = []
     settings: Optional[dict] = None
+
+
+class PilotReportPayload(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=32)
+    market: str = Field(..., min_length=1, max_length=16)
+    language: str = Field(default="en", min_length=2, max_length=8)
+    report_type: str = Field(..., min_length=4, max_length=32)
+
+
+class StagingLeadPayload(BaseModel):
+    email: str = Field(..., max_length=320)
+    name: Optional[str] = Field(default=None, max_length=120)
+    query: Optional[str] = Field(default=None, max_length=500)
+    report_kind: Optional[str] = Field(default=None, max_length=40)
+
+
+def _ensure_staging_public_enabled():
+    if _ENVIRONMENT != "staging":
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def _staging_client_id(request: Request) -> str:
+    raw_ip = (
+        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or request.headers.get("X-Real-IP")
+        or str(request.client.host)
+    )
+    safe_ip = _re.sub(r"[^0-9a-fA-F:.]", "", raw_ip) or "unknown"
+    return f"staging:{safe_ip}"
+
+
+def _staging_proxy_headers() -> dict:
+    return {"X-API-Key": SECURE_TOKEN}
+
+
+def _staging_clean_text(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = _re.sub(r"```.*?```", " ", cleaned, flags=_re.S)
+    cleaned = _re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", cleaned)
+    cleaned = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = cleaned.replace("|", " ")
+    cleaned = _re.sub(r"[#>*_`]+", " ", cleaned)
+    cleaned = _re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _staging_extract_section(markdown: str, markers: list[str]) -> str:
+    lines = (markdown or "").splitlines()
+    for idx, line in enumerate(lines):
+        normalized = _staging_clean_text(line).lower()
+        if not normalized:
+            continue
+        if any(marker.lower() in normalized for marker in markers):
+            chunk = []
+            for next_line in lines[idx + 1:]:
+                if next_line.strip().startswith("#"):
+                    break
+                chunk.append(next_line)
+            body = "\n".join(chunk).strip()
+            if body:
+                return body
+    return ""
+
+
+def _staging_extract_sentences(text: str) -> list[str]:
+    sentences = []
+    for raw in _re.split(r"(?<=[.!?])\s+", _staging_clean_text(text)):
+        candidate = raw.strip(" -")
+        if len(candidate) >= 40 and candidate not in sentences:
+            sentences.append(candidate)
+    return sentences
+
+
+def _staging_extract_marked_line(markdown: str, patterns: list[str]) -> Optional[str]:
+    for line in (markdown or "").splitlines():
+        cleaned = _staging_clean_text(line)
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if any(pattern.lower() in lowered for pattern in patterns):
+            return cleaned
+    return None
+
+
+def _staging_extract_verdict(markdown: str, report_kind: str, result_type: str = "") -> str:
+    # ── Construction results use a dedicated vocabulary ──────────────────
+    if result_type == "construction":
+        md = markdown or ""
+        if _re.search(r"CONDITIONAL APPROVAL", md, _re.I):
+            return "CONDITIONAL APPROVAL"
+        if _re.search(r"EXCEEDS RISK|exceeds.*drawdown|drawdown.*exceeds", md, _re.I):
+            return "EXCEEDS RISK LIMIT"
+        if _re.search(r"APPROVED|within mandate|within.*constraint", md, _re.I):
+            return "PORTFOLIO READY"
+        return "WITHIN MANDATE"
+
+    if report_kind == "portfolio":
+        verdict_patterns = [
+            r"\bRating:\s*(Conservative|Balanced|Aggressive|Speculative)\b",
+            r"\bRisk Level:\s*([A-Za-z-]+)\b",
+            r"\bRisk Profile:\s*([A-Za-z-]+)\b",
+        ]
+    else:
+        verdict_patterns = [
+            r"\|\s*(BUY|HOLD|SELL|WATCHLIST|ACCUMULATE|REDUCE)\b",
+            r"\bVerdict Type:\s*([A-Za-z -]+)\b",
+        ]
+    for pattern in verdict_patterns:
+        match = _re.search(pattern, markdown or "", flags=_re.I)
+        if match:
+            return match.group(1).strip().upper() if report_kind == "stock" else match.group(1).strip()
+    return "Analysis Ready" if report_kind == "stock" else "Portfolio Review Ready"
+
+
+def _staging_extract_confidence(markdown: str) -> Optional[str]:
+    percent_match = _re.search(r"\bConfidence:\s*(\d+%)", markdown or "", flags=_re.I)
+    if percent_match:
+        return percent_match.group(1)
+    conviction_match = _re.search(r"\bConviction:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
+    if conviction_match:
+        return conviction_match.group(1).strip().title()
+    return None
+
+
+def _staging_extract_risk_level(markdown: str) -> Optional[str]:
+    top_risk = _re.search(r"Top Risk:\s*.*?Severity:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
+    if top_risk:
+        return top_risk.group(1).strip().title()
+    total_risk = _re.search(r"Risk profile \(total beta\):\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
+    if total_risk:
+        return total_risk.group(1).strip().title()
+    risk_level = _re.search(r"\bRisk Level:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
+    if risk_level:
+        return risk_level.group(1).strip().title()
+    risk_profile = _re.search(r"\bRisk Profile:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
+    if risk_profile:
+        return risk_profile.group(1).strip().title()
+    return None
+
+
+def _staging_extract_summary(markdown: str, report_kind: str, result_type: str = "") -> str:
+    # ── Construction: pull from Portfolio Overview / Strategy Readiness ──────
+    if result_type == "construction":
+        overview = _staging_extract_section(markdown, ["Portfolio Overview", "Strategy Readiness"])
+        for paragraph in _re.split(r"\n\s*\n", overview or ""):
+            cleaned = _staging_clean_text(paragraph)
+            # skip tables, bullets, headings, short lines
+            if cleaned and len(cleaned) > 40 and not cleaned.startswith("|") and not cleaned.startswith("-") and not cleaned.startswith("#"):
+                # Return max 2 sentences
+                sentences = _re.findall(r"[^.!?]+[.!?]+", cleaned)
+                return " ".join(sentences[:2]).strip() or cleaned[:280]
+        # Fallback: first meaningful line from whole report
+        for line in (markdown or "").splitlines():
+            c = _staging_clean_text(line)
+            if c and len(c) > 40 and not c.startswith("|") and not c.startswith("-") and not c.startswith("#"):
+                return c[:280]
+        return "Portfolio constructed and ready for review."
+
+    markers = ["Executive Summary", "Executive Assessment"]
+    section = _staging_extract_section(markdown, markers)
+    for paragraph in _re.split(r"\n\s*\n", section or markdown or ""):
+        cleaned = _staging_clean_text(paragraph)
+        if cleaned and not cleaned.lower().startswith("metric "):
+            return cleaned
+    return _staging_clean_text(markdown)[:280]
+
+
+def _staging_extract_insights(markdown: str, report_kind: str, summary: str, result_type: str = "") -> list[str]:
+    # ── Construction insights: return / volatility / concentration ───────────
+    if result_type == "construction":
+        insights: list[str] = []
+        # 1) Expected return
+        ret_m = _re.search(r"Expected Annual Return[:\s]+([0-9.]+%[^.\n]{0,60})", markdown or "", _re.I)
+        if ret_m:
+            insights.append("Expected annual return: " + ret_m.group(1).strip().rstrip(","))
+        # 2) Volatility / Sharpe / drawdown
+        vol_m = _re.search(r"Annual Volatility[:\s]+([0-9.]+%[^.\n]{0,80})", markdown or "", _re.I)
+        shr_m = _re.search(r"Sharpe Ratio[:\s]+([0-9.]+[^.\n]{0,60})", markdown or "", _re.I)
+        if vol_m and shr_m:
+            insights.append(f"Volatility {vol_m.group(1).strip().rstrip(',')} · Sharpe {shr_m.group(1).strip()}")
+        elif vol_m:
+            insights.append("Annual volatility: " + vol_m.group(1).strip().rstrip(","))
+        # 3) Concentration / correlation risk from the report
+        conc_m = _re.search(
+            r"(Concentration[^.\n]{10,120}|correlation[^.\n]{10,120}|Effective N[^.\n]{10,120})",
+            markdown or "", _re.I
+        )
+        if conc_m:
+            insights.append(_staging_clean_text(conc_m.group(1)))
+        # Fill with fallbacks if fewer than 3
+        fallbacks = [
+            "Allocation generated and ready for review.",
+            "Open the full report for detailed asset rationale.",
+            "Risk constraints and implementation plan included.",
+        ]
+        for fb in fallbacks:
+            if len(insights) >= 3:
+                break
+            if fb not in insights:
+                insights.append(fb)
+        return insights[:3]
+
+    candidates = []
+    tracked_lines = [
+        _staging_extract_marked_line(markdown, ["Top Risk:", "Risk Level:", "Risk Profile:"]),
+        _staging_extract_marked_line(markdown, ["Final Technical Signal:", "Decision Discipline Layer", "Alpha driver:"]),
+        _staging_extract_marked_line(markdown, ["Next Earnings:", "NEAR-TERM CATALYST", "Decision Boundary:"]),
+    ]
+    for line in tracked_lines:
+        if line and line not in candidates:
+            candidates.append(line)
+    for sentence in _staging_extract_sentences(summary):
+        if sentence not in candidates:
+            candidates.append(sentence)
+    if report_kind == "portfolio":
+        portfolio_note = _staging_extract_marked_line(markdown, ["EisaX Risk Assessment", "Portfolio Assessment"])
+        if portfolio_note and portfolio_note not in candidates:
+            candidates.append(portfolio_note)
+    return candidates[:3] or [
+        "Live analysis completed and ready for deeper review.",
+        "Open the full report to inspect the detailed assumptions.",
+        "Use the email form below to request the institutional report.",
+    ]
+
+
+def _staging_prepare_query(query: str) -> str:
+    normalized = (query or "").strip()
+    if not normalized:
+        return normalized
+
+    analyze_match = _re.match(r"(?i)^analyze\s+(.+)$", normalized)
+    if analyze_match:
+        subject = analyze_match.group(1).strip()
+        return (
+            f"Analyze {subject} for an investment decision. "
+            "Respond in concise institutional tone and keep the answer under 350 words. "
+            "Include a clear BUY, HOLD, or SELL verdict, a short executive summary, risk level, "
+            "confidence if available, and exactly three key insights."
+        )
+
+    if _re.search(r"(?i)\bportfolio\b", normalized):
+        return (
+            f"{normalized}. Respond in institutional tone with a concise allocation rationale, risk framing, "
+            "and portfolio construction logic."
+        )
+
+    return normalized
+
+
+def _resolution_error_response(resolution: dict) -> JSONResponse:
+    status = resolution.get("resolution_status") or "unresolved"
+    normalized_query = resolution.get("normalized_query") or resolution.get("query_raw") or "this request"
+    if status == "ambiguous":
+        detail = f"'{normalized_query}' is ambiguous. Please specify the exact instrument."
+    else:
+        detail = f"Unable to resolve '{normalized_query}' safely. Please use the exact ticker."
+    payload = {"ok": False, "detail": detail, **resolution}
+    return JSONResponse(status_code=400, content=payload)
+
+
+_INTENT_ASSET_ANALYSIS = "asset_analysis"
+_INTENT_PORTFOLIO_ANALYSIS = "portfolio_analysis"
+_INTENT_PORTFOLIO_CONSTRUCTION = "portfolio_construction"
+_INTENT_FIXED_INCOME = "fixed_income"
+
+
+def _classify_request_intent(message: str, *, has_file: bool = False) -> str:
+    raw = (message or "").strip()
+    if has_file:
+        return _INTENT_PORTFOLIO_ANALYSIS
+    if not raw:
+        return _INTENT_ASSET_ANALYSIS
+
+    lowered = raw.lower()
+    portfolio_analysis_keywords = [
+        "upload",
+        "csv",
+        "xlsx",
+        "xls",
+        "my portfolio",
+        "my holdings",
+        "my positions",
+        "analyze portfolio",
+        "analyze my portfolio",
+        "portfolio analysis",
+        "portfolio review",
+        "portfolio risk",
+        "holdings analysis",
+        "upload portfolio",
+    ]
+    portfolio_analysis_keywords_ar = [
+        "محفظتي",
+        "محفظتى",
+        "حلل محفظتي",
+        "حلل محفظتى",
+        "تحليل محفظتي",
+        "تحليل محفظتى",
+        "ارفع",
+        "رفع ملف",
+        "csv",
+        "اكسل",
+        "إكسل",
+    ]
+    if any(keyword in lowered for keyword in portfolio_analysis_keywords):
+        return _INTENT_PORTFOLIO_ANALYSIS
+    if any(keyword in raw for keyword in portfolio_analysis_keywords_ar):
+        return _INTENT_PORTFOLIO_ANALYSIS
+
+    construction_keywords = [
+        "portfolio",
+        "build",
+        "create",
+        "construct",
+        "design",
+        "allocate",
+        "rebalance",
+        "re-balance",
+        "allocation",
+        "max down",
+        "max drawdown",
+        "risk tolerance",
+        "drawdown",
+        "aggressive",
+        "conservative",
+        "balanced",
+        "moderate",
+        "equities",
+        "stocks",
+        "saudi",
+        "us equities",
+        "american equities",
+    ]
+    construction_keywords_ar = [
+        "محفظة",
+        "محفظه",
+        "ابني",
+        "ابنى",
+        "ابنِ",
+        "كوّن",
+        "كون",
+        "خصص",
+        "خصّص",
+        "وزع",
+        "وزّع",
+        "أعد موازنة",
+        "اعد موازنة",
+        "موازنة",
+        "عدواني",
+        "عدوانيه",
+        "محافظ",
+        "متوازن",
+        "مخاطرة",
+        "مخاطر",
+    ]
+
+    english_hits = sum(1 for keyword in construction_keywords if keyword in lowered)
+    arabic_hits = sum(1 for keyword in construction_keywords_ar if keyword in raw)
+    if english_hits >= 2 or arabic_hits >= 1:
+        return _INTENT_PORTFOLIO_CONSTRUCTION
+
+    try:
+        from portfolio_pipeline import is_pipeline_request as _is_pipeline_request
+
+        if _is_pipeline_request(raw):
+            return _INTENT_PORTFOLIO_CONSTRUCTION
+    except Exception:
+        pass
+
+    # Fixed income / sukuk / bond / ISIN detection
+    try:
+        from core.fixed_income import is_fixed_income_query as _is_fi_query
+
+        if _is_fi_query(raw):
+            return _INTENT_FIXED_INCOME
+    except Exception:
+        pass
+
+    return _INTENT_ASSET_ANALYSIS
+
+
+def _portfolio_analysis_prompt_response(query: str) -> str:
+    subject = (query or "your portfolio").strip()
+    return (
+        "## Portfolio Analysis Intake\n\n"
+        f"To analyze {subject}, upload a CSV or Excel portfolio file and I will run a holdings-based risk and exposure review.\n\n"
+        "### Required next step\n"
+        "- Upload a `.csv`, `.xlsx`, or `.xls` file with your holdings.\n\n"
+        "### What the analysis will cover\n"
+        "- Position concentration and allocation gaps\n"
+        "- Risk exposure by asset and market\n"
+        "- Portfolio-level observations and next-step actions\n"
+    )
+
+
+def _should_resolve_direct_analysis_request(message: str) -> bool:
+    raw = (message or "").strip()
+    if not raw:
+        return False
+    if _classify_request_intent(raw) != _INTENT_ASSET_ANALYSIS:
+        return False
+    if not _re.search(
+        r"(?i)^\s*(?:please\s+)?(?:analyze|analysis of|full analysis of|quick analysis of|brief analysis of)\b",
+        raw,
+    ) and not _re.search(r"^\s*(?:حلل|حللي|حللى|تحليل)\b", raw):
+        return False
+
+    lowered = raw.lower()
+    blockers = [" and ", " vs ", " versus ", ",", "\n", "portfolio", "compare", "محفظة", "قارن"]
+    return not any(token in lowered for token in blockers)
+
+
+def _staging_shape_result(
+    *,
+    query: str,
+    report_text: str,
+    report_kind: str,
+    mode: str,
+    download_url: Optional[str] = None,
+    html_report: Optional[str] = None,
+    report_json: Optional[dict] = None,
+    resolution: Optional[dict] = None,
+    result_type: str = "",
+) -> dict:
+    summary = _staging_extract_summary(report_text, report_kind=report_kind, result_type=result_type)
+    confidence = _staging_extract_confidence(report_text)
+    payload = {
+        "ok": True,
+        "mode": mode,
+        "query": query,
+        "report_kind": report_kind,
+        "result_type": result_type or report_kind,
+        "summary": summary,
+        "verdict": _staging_extract_verdict(report_text, report_kind=report_kind, result_type=result_type),
+        "risk_level": _staging_extract_risk_level(report_text),
+        "confidence": confidence,
+        "insights": _staging_extract_insights(report_text, report_kind=report_kind, summary=summary, result_type=result_type),
+        "download_url": download_url,
+        "teaser": (report_text[:500] + "...") if len(report_text) > 500 else report_text,
+        "full_report": html_report or report_text,
+        "report_json": report_json,
+    }
+    if resolution:
+        payload["resolution"] = resolution
+    return payload
+
+
+def _staging_fallback_payload(query: str, file_name: Optional[str] = None) -> dict:
+    subject = file_name or query or "your request"
+    fallback_report = (
+        "## Agent Preview\n\n"
+        f"The live analysis service is temporarily unavailable, so this staging page is showing a fallback preview for {subject}.\n\n"
+        "### What You Can Expect\n"
+        "- Institutional summary with verdict and risk framing.\n"
+        "- Three key insights surfaced from the live agent workflow.\n"
+        "- A full report handoff path after lead capture.\n"
+    )
+    return _staging_shape_result(
+        query=query or f"Analyze {file_name}" if file_name else "Analyze request",
+        report_text=fallback_report,
+        report_kind="portfolio" if file_name else "stock",
+        mode="fallback",
+    )
+
+
+def _staging_proxy_chat(query: str, user_id: str) -> dict:
+    import requests as _requests
+
+    response = _requests.post(
+        f"{_STAGING_UPSTREAM_BASE}/v1/chat",
+        headers={**_staging_proxy_headers(), "Content-Type": "application/json"},
+        json={"message": _staging_prepare_query(query), "user_id": user_id},
+        timeout=120,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"detail": response.text[:500]}
+    return {"status_code": response.status_code, "body": body}
+
+
+def _staging_proxy_upload(file_name: str, file_bytes: bytes, user_id: str) -> dict:
+    import requests as _requests
+
+    response = _requests.post(
+        f"{_STAGING_UPSTREAM_BASE}/v1/upload-portfolio",
+        headers=_staging_proxy_headers(),
+        files={"file": (file_name, file_bytes)},
+        data={"user_id": user_id},
+        timeout=120,
+    )
+    try:
+        body = response.json()
+    except Exception:
+        body = {"detail": response.text[:500]}
+    return {"status_code": response.status_code, "body": body}
+
+
+def _staging_upstream_error(status_code: int, body: dict, default_message: str) -> HTTPException:
+    if status_code == 429:
+        return HTTPException(status_code=429, detail="The live agent is busy right now. Please retry in a moment.")
+    if status_code == 413:
+        return HTTPException(status_code=413, detail="The uploaded file is too large for the current staging limit.")
+    if status_code == 400:
+        return HTTPException(status_code=400, detail=body.get("error") or body.get("detail") or default_message)
+    return HTTPException(status_code=502, detail=default_message)
+
+
+@app.get("/staging-api/health")
+@limiter.limit("30/minute")
+async def staging_public_health(request: Request):
+    _ensure_staging_public_enabled()
+    return {"status": "ok"}
+
+
+# ── Market Updates — public read, admin generate ──────────────────────────────
+
+@app.get("/staging-api/updates")
+@limiter.limit("60/minute")
+async def api_updates_latest(request: Request):
+    """Return latest daily + weekly updates with LinkedIn-formatted text."""
+    import json as _json
+    from core.services.market_updates import get_latest_updates
+    result = get_latest_updates()
+    if not result:
+        return JSONResponse({"daily": None, "weekly": None}, status_code=200)
+    print("DEBUG /api/updates response:", _json.dumps(result)[:1000])
+    return result
+
+
+@app.get("/staging-api/updates/daily")
+@limiter.limit("60/minute")
+async def api_updates_daily(request: Request):
+    from core.services.market_updates import get_latest_updates
+    result = get_latest_updates()
+    daily = result.get("daily")
+    if not daily:
+        return JSONResponse({"detail": "No daily update available yet"}, status_code=404)
+    return daily
+
+
+@app.get("/staging-api/updates/weekly")
+@limiter.limit("60/minute")
+async def api_updates_weekly(request: Request):
+    from core.services.market_updates import get_latest_updates
+    result = get_latest_updates()
+    weekly = result.get("weekly")
+    if not weekly:
+        return JSONResponse({"detail": "No weekly update available yet"}, status_code=404)
+    return weekly
+
+
+@app.post("/staging-api/updates/generate")
+@limiter.limit("5/minute")
+async def api_updates_generate(request: Request):
+    """Admin-only: trigger generation of daily + weekly updates."""
+    _require_admin_cookie(request)
+    import asyncio as _aio
+    from core.services.market_updates import generate_daily_update, generate_weekly_update
+    loop = _aio.get_event_loop()
+    daily  = await loop.run_in_executor(None, generate_daily_update)
+    weekly = await loop.run_in_executor(None, generate_weekly_update)
+    return {"status": "generated", "daily": daily, "weekly": weekly}
+
+
+@app.post("/staging-api/analyze")
+@limiter.limit("12/minute")
+async def staging_public_analyze(
+    request: Request,
+    query: str = Form(""),
+    symbol: str = Form(""),
+    skip_resolution: bool = Form(False),
+    report_language: str = Form("en"),
+    language: str = Form(""),
+    file: UploadFile = File(None),
+):
+    _ensure_staging_public_enabled()
+    normalized_query = (query or "").strip()
+    selected_symbol = (symbol or "").strip().upper()
+    preferred_language = (report_language or language or "en").strip().lower() or "en"
+    intent = _classify_request_intent(normalized_query, has_file=file is not None)
+    if not normalized_query and not file and not selected_symbol:
+        raise HTTPException(status_code=400, detail="Enter a request or upload a portfolio file.")
+
+    user_id = _staging_client_id(request)
+    try:
+        if file is not None:
+            file_bytes = await file.read()
+            live_payload = await run_in_threadpool(
+                _staging_proxy_upload,
+                file.filename or "portfolio.csv",
+                file_bytes,
+                user_id,
+            )
+            if live_payload["status_code"] >= 500:
+                raise RuntimeError(f"upstream upload error {live_payload['status_code']}")
+            if live_payload["status_code"] >= 400:
+                raise _staging_upstream_error(
+                    live_payload["status_code"],
+                    live_payload["body"],
+                    "Portfolio analysis is temporarily unavailable.",
+                )
+            report_text = live_payload["body"].get("analysis") or ""
+            if not report_text:
+                raise HTTPException(status_code=502, detail="Portfolio analysis returned no content.")
+            return _staging_shape_result(
+                query=normalized_query or f"Analyze {file.filename}",
+                report_text=report_text,
+                report_kind="portfolio",
+                mode="live",
+                download_url=None,
+            )
+
+        from core.services.entity_resolution import EntityResolution, is_exact_ticker, resolve_asset_entity
+        from core.services.market_route_handler import handle_stock_analysis as _handle_stock_analysis
+        from portfolio_builder import detect_and_build as _detect_and_build
+
+        if skip_resolution and selected_symbol:
+            exact_symbol = is_exact_ticker(selected_symbol)
+            if not exact_symbol:
+                return _resolution_error_response(
+                    {
+                        "query_raw": normalized_query or selected_symbol,
+                        "normalized_query": selected_symbol,
+                        "resolution_status": "unresolved",
+                    }
+                )
+            resolution = EntityResolution(
+                query_raw=normalized_query or selected_symbol,
+                normalized_query=selected_symbol,
+                resolution_status="resolved",
+                symbol=exact_symbol.symbol,
+                market=exact_symbol.market,
+                asset_type=exact_symbol.asset_type,
+                currency=exact_symbol.currency,
+                resolution_source="exact_symbol",
+                confidence="high",
+                name=exact_symbol.name,
+                local_name=exact_symbol.local_name,
+                exchange=exact_symbol.exchange,
+                universe_source=exact_symbol.source_tag,
+            )
+        elif intent == _INTENT_PORTFOLIO_ANALYSIS:
+            if not file:
+                return _staging_shape_result(
+                    query=normalized_query,
+                    report_text=_portfolio_analysis_prompt_response(normalized_query),
+                    report_kind="portfolio",
+                    mode="guided",
+                    download_url=None,
+                )
+        elif intent == _INTENT_PORTFOLIO_CONSTRUCTION:
+            logger.info(
+                "[intent-gate][staging] portfolio construction routed to builder: %s",
+                normalized_query,
+            )
+            report_text = await run_in_threadpool(_detect_and_build, normalized_query)
+            if not report_text:
+                raise HTTPException(status_code=502, detail="Portfolio builder returned no content.")
+            return _staging_shape_result(
+                query=normalized_query,
+                report_text=report_text,
+                report_kind="portfolio",
+                result_type="construction",
+                mode="live",
+                download_url=None,
+            )
+        elif intent == _INTENT_FIXED_INCOME:
+            logger.info(
+                "[intent-gate][staging] fixed-income query routed to finance agent: %s",
+                normalized_query,
+            )
+            try:
+                from core.agents.finance import FinancialAgent as _FinancialAgent
+
+                _fi_agent = _FinancialAgent()
+                _fi_result = await run_in_threadpool(
+                    _fi_agent.think,
+                    normalized_query,
+                    {"session_id": f"staging-fi-{int(_time.time() * 1000)}"},
+                    {"model": os.getenv("MODEL_NAME", "")},
+                )
+                report_text = _fi_result.get("reply") or ""
+                if not report_text:
+                    raise HTTPException(status_code=502, detail="Fixed income analysis returned no content.")
+                return _staging_shape_result(
+                    query=normalized_query,
+                    report_text=report_text,
+                    report_kind="fixed_income",
+                    result_type="fixed_income",
+                    mode="live",
+                    download_url=None,
+                )
+            except HTTPException:
+                raise
+            except Exception as _fi_err:
+                logger.error("[fixed-income][staging] error: %s", _fi_err, exc_info=True)
+                raise HTTPException(status_code=502, detail=f"Fixed income analysis failed: {_fi_err}")
+        else:
+            # ── Fast pre-route: local ticker index (O(1)) before LLM resolution ──
+            _idx_resolution: Optional[EntityResolution] = None
+            try:
+                from core.ticker_index import quick_scan as _quick_scan
+                _idx_hit = _quick_scan(normalized_query or selected_symbol)
+                if _idx_hit:
+                    _idx_resolution = EntityResolution(
+                        query_raw=normalized_query,
+                        normalized_query=_idx_hit.symbol,
+                        resolution_status="resolved",
+                        symbol=_idx_hit.symbol,
+                        market=_idx_hit.market,
+                        asset_type=_idx_hit.asset_type,
+                        currency=_idx_hit.currency,
+                        resolution_source="ticker_index",
+                        confidence="high",
+                        name=_idx_hit.name,
+                        exchange=_idx_hit.exchange,
+                    )
+                    logger.info(
+                        "[ticker_index] pre-routed '%s' → %s / %s (bypassing entity resolution)",
+                        normalized_query, _idx_hit.symbol, _idx_hit.market,
+                    )
+            except Exception as _idx_err:
+                logger.debug("[ticker_index] scan error (non-fatal): %s", _idx_err)
+                _idx_resolution = None
+
+            resolution = _idx_resolution or resolve_asset_entity(normalized_query)
+        resolution_payload = resolution.to_dict()
+        if not resolution.is_resolved:
+            logger.info("[entity-resolution] %s", resolution_payload)
+            return _resolution_error_response(resolution_payload)
+
+        stock_instruction = resolution.analysis_instruction
+        logger.info(
+            "[entity-resolution] raw='%s' normalized='%s' -> %s / %s via %s (%s)",
+            normalized_query or selected_symbol,
+            resolution.normalized_query,
+            resolution.symbol,
+            resolution.market,
+            resolution.resolution_source,
+            resolution.confidence,
+        )
+        started_at = _time.perf_counter()
+        session_id = f"staging-{int(_time.time() * 1000)}"
+        orchestrator.session_mgr.get_or_create_session(
+            user_id,
+            session_id=session_id,
+            ip=request.headers.get("X-Real-IP") or str(request.client.host),
+            user_agent=request.headers.get("User-Agent", ""),
+        )
+        live_payload = await _handle_stock_analysis(
+            orchestrator=orchestrator,
+            session_id=session_id,
+            user_id=user_id,
+            message=stock_instruction,
+            instruction=stock_instruction,
+            user_ctx={
+                "market": resolution.market,
+                "asset_type": resolution.asset_type,
+                "currency": resolution.currency,
+                "resolution_source": resolution.resolution_source,
+                "resolution_confidence": resolution.confidence,
+            },
+        )
+        report_text = live_payload.get("reply") or ""
+        if not report_text:
+            raise HTTPException(status_code=502, detail="Analysis returned no content.")
+        report_json = None
+        try:
+            from core.services.pilot_report_json import build_pilot_report_json
+
+            generated_at = datetime.now().astimezone().isoformat()
+            report_json = build_pilot_report_json(
+                symbol=resolution.symbol,
+                market=resolution.market,
+                language=preferred_language,
+                report_text=report_text,
+                analysis_data=live_payload.get("data") or {},
+                system_version=_APP_VERSION,
+                model_primary="DeepSeek V3",
+                generated_at=generated_at,
+                data_as_of=generated_at,
+                latency_seconds=max(0, int(round(_time.perf_counter() - started_at))),
+            )
+        except Exception as exc:
+            logger.warning("[staging-api] pilot json unavailable for '%s': %s", normalized_query, exc)
+        return _staging_shape_result(
+            query=normalized_query or selected_symbol,
+            report_text=report_text,
+            report_kind="stock",
+            mode="live",
+            download_url=live_payload.get("download_url"),
+            html_report=report_text,
+            report_json=report_json,
+            resolution=resolution_payload,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[staging-api] analyze degraded for '%s': %s", normalized_query or getattr(file, "filename", "portfolio"), exc)
+        return JSONResponse(
+            status_code=200,
+            content=_staging_fallback_payload(
+                normalized_query,
+                file_name=getattr(file, "filename", None),
+            ),
+        )
+
+
+@app.post("/staging-api/lead")
+@limiter.limit("20/minute")
+async def staging_public_lead(request: Request, payload: StagingLeadPayload):
+    _ensure_staging_public_enabled()
+    email = (payload.email or "").strip().lower()
+    if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    lead_record = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "email": email,
+        "name": (payload.name or "").strip() or None,
+        "query": (payload.query or "").strip() or None,
+        "report_kind": (payload.report_kind or "").strip() or None,
+        "ip": (
+            request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.headers.get("X-Real-IP")
+            or str(request.client.host)
+        ),
+        "user_agent": request.headers.get("User-Agent", "")[:300],
+    }
+    with _STAGING_LEADS_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(_json.dumps(lead_record, ensure_ascii=False) + "\n")
+    return {"ok": True, "message": "Lead captured."}
 
 @app.get("/")
 async def root():
@@ -1653,15 +2547,15 @@ async def portfolio_history(
     request: Request,
     user_id: str,
     limit: int = 20,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """
     Return portfolio snapshot history for a user.
     Shows how allocation + metrics evolved over time.
     """
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    is_admin = user.get("role") == "admin" or user.get("user_id") == "admin"
+    if not is_admin and user_id != str(user["sub"]):
+        raise HTTPException(status_code=403, detail="Access denied")
     try:
         from portfolio_memory import get_user_snapshots, get_performance_history
         snapshots = get_user_snapshots(user_id, limit=limit)
@@ -1681,20 +2575,20 @@ async def portfolio_history(
 async def get_portfolio_snapshot(
     request: Request,
     snapshot_id: str,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """
     Retrieve a specific portfolio snapshot by ID — full report + audit data.
     Enables report reproducibility.
     """
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from portfolio_memory import get_snapshot
         snap = get_snapshot(snapshot_id)
         if not snap:
             raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found")
+        is_admin = user.get("role") == "admin" or user.get("user_id") == "admin"
+        if snap.get("user_id") and snap["user_id"] != str(user["sub"]) and not is_admin:
+            raise HTTPException(status_code=403, detail="Access denied")
         return snap
     except HTTPException:
         raise
@@ -1708,17 +2602,22 @@ async def compare_portfolio_snapshots(
     request: Request,
     snap_a: str,
     snap_b: str,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """
     Compare two portfolio snapshots: allocation drift + metric changes.
     Use to track how a portfolio evolved between rebalances.
     """
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
-        from portfolio_memory import compare_snapshots
+        from portfolio_memory import compare_snapshots, get_snapshot
+        is_admin = user.get("role") == "admin" or user.get("user_id") == "admin"
+        snapshot_a = get_snapshot(snap_a)
+        snapshot_b = get_snapshot(snap_b)
+        if not snapshot_a or not snapshot_b:
+            raise HTTPException(status_code=404, detail="One or both snapshot IDs not found")
+        for snap in (snapshot_a, snapshot_b):
+            if snap.get("user_id") and snap["user_id"] != str(user["sub"]) and not is_admin:
+                raise HTTPException(status_code=403, detail="Access denied")
         diff = compare_snapshots(snap_a, snap_b)
         if not diff:
             raise HTTPException(status_code=404, detail="One or both snapshot IDs not found")
@@ -1763,8 +2662,7 @@ async def compare_portfolio_snapshots(
 @limiter.limit("5/minute")
 async def global_allocate(
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """
     🌍 Global Allocation Engine — cross-market QP optimization.
@@ -1780,8 +2678,6 @@ async def global_allocate(
         "rf_rate":          0.045                     // optional: risk-free rate
     }
     """
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         body = await request.json()
     except Exception:
@@ -1814,12 +2710,9 @@ async def global_allocate(
 @limiter.limit("60/minute")
 async def global_allocate_profiles(
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """List available risk profiles and regions for the Global Allocation Engine."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from global_allocator import _PROFILES, _UNIVERSE
         regions = sorted(set(a.region for a in _UNIVERSE))
@@ -1842,15 +2735,15 @@ async def global_allocate_profiles(
 async def portfolio_performance_chart(
     request: Request,
     user_id: str,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
     """
     Return time-series of key metrics across all snapshots for chart rendering.
     Frontend can plot Sharpe / Beta / CVaR evolution over time.
     """
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    is_admin = user.get("role") == "admin" or user.get("user_id") == "admin"
+    if not is_admin and user_id != str(user["sub"]):
+        raise HTTPException(status_code=403, detail="Access denied")
     try:
         from portfolio_memory import get_performance_history
         history = get_performance_history(user_id, limit=50)
@@ -1872,21 +2765,34 @@ async def portfolio_performance_chart(
 
 @app.post("/upload")
 @limiter.limit("10/minute")
-async def upload_file_ui(request: Request, file: UploadFile = File(...), access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+async def upload_file_ui(
+    request: Request,
+    file: UploadFile = File(...),
+    user: dict = Depends(_require_jwt),
+):
     """Receive file from chat UI, extract text via Gemini Vision or file_processor."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     import uuid as _uuid, base64 as _b64
     from core.file_processor import process_file
     raw = await file.read()
     b64 = _b64.b64encode(raw).decode()
     result = process_file(file.filename, b64)
     file_id = str(_uuid.uuid4())
+    uploader_user_id = str(user["sub"])
+    if not uploader_user_id:
+        try:
+            uploader_user_id = _resolve_user_context(
+                access_token=None,
+                access_token_alt=access_token_alt,
+                authorization=authorization,
+            ).get("user_id")
+        except HTTPException:
+            uploader_user_id = None
     _evict_old_files()
     _file_store_set(file_id, {
         "id": file_id,
         "filename": file.filename,
         "text": result.get("text", ""),
+        "user_id": uploader_user_id,
         "error": result.get("error"),
         "_ts": _time.time(),
     })
@@ -1922,6 +2828,104 @@ def _coerce_chat_payload(raw: dict) -> MessagePayload:
     if not data.get("user_id"):
         data["user_id"] = "admin"
     return MessagePayload(**data)
+
+
+@app.post("/v1/pilot-report")
+@app.post("/v1/report")
+@limiter.limit("10/minute")
+async def pilot_report(
+    payload: PilotReportPayload,
+    request: Request,
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
+    _token = access_token or access_token_alt
+    if _token != SECURE_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    if str(payload.report_type or "").strip().lower() != "pilot_report":
+        raise HTTPException(status_code=400, detail="report_type must be 'pilot_report'")
+    if not orchestrator.financial_agent:
+        raise HTTPException(status_code=503, detail="Financial agent is unavailable")
+
+    client_ip = (
+        request.headers.get("X-Real-IP")
+        or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        or str(request.client.host)
+    )
+    user_agent = request.headers.get("User-Agent", "")
+    session_user = f"pilot-report:{client_ip}"
+    session_id = orchestrator.session_mgr.get_or_create_session(
+        session_user,
+        ip=client_ip,
+        user_agent=user_agent,
+    )
+    orchestrator.session_mgr.get_or_create_session(
+        session_user,
+        session_id=session_id,
+        ip=client_ip,
+        user_agent=user_agent,
+    )
+
+    market = str(payload.market or "").strip().upper()
+    symbol = str(payload.symbol or "").strip().upper()
+    language = (str(payload.language or "").strip().lower() or "en")
+    message = (
+        f"تحليل كامل لـ {symbol}"
+        if language.startswith("ar")
+        else f"full analysis of {symbol}"
+    )
+
+    started_at = _time.perf_counter()
+    generated_at = datetime.now().astimezone().isoformat()
+    try:
+        analysis_result = await asyncio.wait_for(
+            run_in_threadpool(
+                orchestrator.financial_agent._handle_analytics,
+                session_id,
+                {"user_id": session_user, "user_ctx": {"market": market, "language": language}},
+                message,
+                False,
+                "full",
+            ),
+            timeout=300,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning("[pilot-report] timed out for %s (%s)", symbol, market)
+        raise HTTPException(status_code=504, detail="Pilot report generation timed out") from exc
+    except Exception as exc:
+        logger.exception("[pilot-report] generation failed for %s (%s)", symbol, market)
+        raise HTTPException(status_code=500, detail="Pilot report generation failed") from exc
+
+    html_report = analysis_result.get("reply") or ""
+    if not html_report:
+        raise HTTPException(status_code=502, detail="Pilot report returned empty output")
+
+    try:
+        from core.services.pilot_report_json import build_pilot_report_json
+
+        latency_seconds = max(0, int(round(_time.perf_counter() - started_at)))
+        report_json = build_pilot_report_json(
+            symbol=symbol,
+            market=market,
+            language=language,
+            report_text=html_report,
+            analysis_data=analysis_result.get("data") or {},
+            system_version=_APP_VERSION,
+            model_primary="DeepSeek V3",
+            generated_at=generated_at,
+            data_as_of=generated_at,
+            latency_seconds=latency_seconds,
+        )
+    except Exception as exc:
+        logger.exception("[pilot-report] json build failed for %s (%s)", symbol, market)
+        raise HTTPException(status_code=500, detail="Pilot report JSON validation failed") from exc
+
+    return JSONResponse(
+        content={
+            "html_report": html_report,
+            "report_json": report_json,
+        }
+    )
 
 @app.post("/v1/chat")
 @limiter.limit("30/minute")
@@ -1991,12 +2995,32 @@ async def unified_chat(
         )
 
     message = payload.message
-
-    # Inject file content from /upload store via active_file_id
+    resolution_payload = None
     active_file_id = None
     if payload.settings and isinstance(payload.settings, dict):
         active_file_id = payload.settings.get("active_file_id")
-    stored_file = _file_store_get(active_file_id) if active_file_id else None
+
+    if not payload.files and not active_file_id and _should_resolve_direct_analysis_request(message):
+        from core.services.entity_resolution import resolve_asset_entity
+
+        resolution = resolve_asset_entity(message)
+        resolution_payload = resolution.to_dict()
+        if not resolution.is_resolved:
+            logger.info("[entity-resolution][chat] %s", resolution_payload)
+            return _resolution_error_response(resolution_payload)
+        logger.info(
+            "[entity-resolution][chat] raw='%s' normalized='%s' -> %s / %s via %s (%s)",
+            message,
+            resolution.normalized_query,
+            resolution.symbol,
+            resolution.market,
+            resolution.resolution_source,
+            resolution.confidence,
+        )
+        message = resolution.analysis_instruction
+
+    # Inject file content from /upload store via active_file_id
+    stored_file = _file_store_get_for_user(active_file_id, payload.user_id) if active_file_id else None
     if stored_file and stored_file.get("text"):
         file_text = stored_file["text"]
         fname = stored_file.get("filename", "file")
@@ -2042,6 +3066,8 @@ async def unified_chat(
         "format": result.get("format"),
         "quota": quota,
     }
+    if resolution_payload:
+        response_body["resolution"] = resolution_payload
     return JSONResponse(
         content=response_body,
         headers=orchestrator.session_mgr.get_quota_header(payload.user_id),
@@ -2161,19 +3187,105 @@ async def text_to_speech(request: Request, tts_body: TTSRequest, access_token: s
 # --- Admin Endpoints ---
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+ADMIN_PASSPHRASE = os.getenv("ADMIN_PASSPHRASE", "") or os.getenv("ADMIN_TOKEN", "")
 if not ADMIN_TOKEN:
     logger.warning("[STARTUP] ADMIN_TOKEN is not set — admin endpoints will be disabled")
 
-def _check_admin(token: str):
-    if not ADMIN_TOKEN:
+class AdminAuthRequest(BaseModel):
+    token: str = Field(..., min_length=1)
+
+class AdminLoginRequest(BaseModel):
+    password: str = Field(..., min_length=1)
+
+def _decode_admin_session_token(token: str) -> Optional[dict]:
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+    except (_jwt.ExpiredSignatureError, _jwt.InvalidTokenError):
+        return None
+    if payload.get("role") != "admin":
+        return None
+    return payload
+
+def _check_secure_or_admin_session(token: str, request: Optional[Request] = None):
+    if request:
+        cookie_tok = request.cookies.get("eisax_admin_session", "")
+        if cookie_tok and _decode_admin_session_token(cookie_tok):
+            return
+    if SECURE_TOKEN and token and token == SECURE_TOKEN:
+        return
+    if token and _decode_admin_session_token(token):
+        return
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+def _check_admin(token: str = "", request: Optional[Request] = None):
+    # 1. Cookie session (primary — browser admin pages)
+    if request:
+        cookie_tok = request.cookies.get("eisax_admin_session", "")
+        if cookie_tok and _decode_admin_session_token(cookie_tok):
+            return
+    # 2. SECURE_TOKEN header fallback (internal services / CLI)
+    if SECURE_TOKEN and token and token == SECURE_TOKEN:
+        return
+    # 3. Previous signed JWT via header (transition)
+    if token and _decode_admin_session_token(token):
+        return
+    # 4. ADMIN_TOKEN password fallback (legacy)
+    if ADMIN_TOKEN and token and orchestrator.session_mgr.verify_admin_password(token, ADMIN_TOKEN):
+        return
+    if not SECURE_TOKEN and not ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Admin access is not configured")
-    if not orchestrator.session_mgr.verify_admin_password(token, ADMIN_TOKEN):
+    raise HTTPException(status_code=403, detail="Forbidden")
+
+def _require_admin_cookie(request: Request) -> dict:
+    token = request.cookies.get("eisax_admin_session", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Admin session required")
+    try:
+        payload = decode_token(token)
+    except _jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Admin session expired")
+    except _jwt.InvalidTokenError:
         raise HTTPException(status_code=403, detail="Forbidden")
+    if payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return payload
+
+@app.post("/admin/login")
+@limiter.limit("5/minute")
+async def admin_login(request: Request, body: AdminLoginRequest):
+    if not ADMIN_PASSPHRASE or body.password != ADMIN_PASSPHRASE:
+        raise HTTPException(status_code=403, detail="Invalid admin password")
+    session_token = _jwt.encode(
+        {"role": "admin", "exp": datetime.now(timezone.utc) + timedelta(hours=4)},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        key="eisax_admin_session",
+        value=session_token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=14400,
+        path="/",
+    )
+    return response
+
+@app.post("/admin/logout")
+@limiter.limit("10/minute")
+async def admin_logout(request: Request):
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie("eisax_admin_session", path="/")
+    return response
+
 
 @app.get("/admin/sessions")
 @limiter.limit("30/minute")
 async def admin_sessions(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     from collections import defaultdict
     sessions = orchestrator.session_mgr.get_all_sessions_admin()
     grouped = defaultdict(list)
@@ -2205,19 +3317,19 @@ async def admin_sessions(request: Request, access_token: str = Header(None, alia
 @app.get("/admin/session/{session_id}")
 @limiter.limit("60/minute")
 async def admin_session_detail(request: Request, session_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     return orchestrator.session_mgr.get_chat_history(session_id)
 
 @app.get("/admin/stats")
 @limiter.limit("30/minute")
 async def admin_stats(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     return orchestrator.session_mgr.get_admin_stats()
 
 @app.post("/admin/user/{user_id}/block")
 @limiter.limit("30/minute")
 async def block_user(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     orchestrator.session_mgr.set_user_blocked(user_id, True)
     orchestrator.session_mgr.log_admin_action("block_user", user_id)
     return {"status": "blocked", "user_id": user_id}
@@ -2225,7 +3337,7 @@ async def block_user(request: Request, user_id: str, access_token: str = Header(
 @app.post("/admin/user/{user_id}/unblock")
 @limiter.limit("30/minute")
 async def unblock_user(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     orchestrator.session_mgr.set_user_blocked(user_id, False)
     orchestrator.session_mgr.log_admin_action("unblock_user", user_id)
     return {"status": "unblocked", "user_id": user_id}
@@ -2233,7 +3345,7 @@ async def unblock_user(request: Request, user_id: str, access_token: str = Heade
 @app.post("/admin/user/{user_id}/message")
 @limiter.limit("20/minute")
 async def send_admin_message(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     content = body.get("content", "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="content is required")
@@ -2244,13 +3356,13 @@ async def send_admin_message(request: Request, user_id: str, body: dict, access_
 @app.get("/admin/messages")
 @limiter.limit("30/minute")
 async def get_admin_messages(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     return orchestrator.session_mgr.get_admin_message_history()
 
 @app.post("/admin/settings/password")
 @limiter.limit("5/minute")
 async def change_admin_password(request: Request, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     new_password = body.get("new_password", "").strip()
     if len(new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
@@ -2260,7 +3372,7 @@ async def change_admin_password(request: Request, body: dict, access_token: str 
 @app.post("/admin/user/{user_id}/limit")
 @limiter.limit("30/minute")
 async def set_user_limit(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     daily_limit = int(body.get("daily_limit", 0))
     if daily_limit < 0:
         raise HTTPException(status_code=400, detail="daily_limit must be >= 0")
@@ -2271,7 +3383,7 @@ async def set_user_limit(request: Request, user_id: str, body: dict, access_toke
 @app.post("/admin/user/{user_id}/note")
 @limiter.limit("30/minute")
 async def set_user_note(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     note = body.get("note", "")
     orchestrator.session_mgr.set_user_profile(user_id, note=note)
     orchestrator.session_mgr.log_admin_action("set_note", user_id, note[:60] if note else "cleared")
@@ -2280,7 +3392,7 @@ async def set_user_note(request: Request, user_id: str, body: dict, access_token
 @app.post("/admin/user/{user_id}/tier")
 @limiter.limit("30/minute")
 async def set_user_tier(request: Request, user_id: str, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     tier = body.get("tier", "basic")
     if tier not in ("basic", "pro", "vip"):
         raise HTTPException(status_code=400, detail="tier must be basic, pro, or vip")
@@ -2291,7 +3403,7 @@ async def set_user_tier(request: Request, user_id: str, body: dict, access_token
 @app.post("/admin/broadcast")
 @limiter.limit("5/minute")
 async def broadcast_message(request: Request, body: dict, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     content = body.get("content", "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="content is required")
@@ -2302,7 +3414,7 @@ async def broadcast_message(request: Request, body: dict, access_token: str = He
 @app.delete("/admin/user/{user_id}/sessions")
 @limiter.limit("30/minute")
 async def delete_user_sessions(request: Request, user_id: str, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     count = orchestrator.session_mgr.delete_user_sessions(user_id)
     orchestrator.session_mgr.log_admin_action("delete_sessions", user_id, f"{count} sessions deleted")
     return {"status": "deleted", "user_id": user_id, "sessions_deleted": count}
@@ -2310,7 +3422,7 @@ async def delete_user_sessions(request: Request, user_id: str, access_token: str
 @app.post("/admin/ip/{ip}/block")
 @limiter.limit("30/minute")
 async def block_ip_endpoint(request: Request, ip: str, body: dict = {}, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     reason = (body or {}).get("reason", "")
     orchestrator.session_mgr.block_ip(ip, reason)
     orchestrator.session_mgr.log_admin_action("block_ip", ip, reason or "no reason")
@@ -2319,7 +3431,7 @@ async def block_ip_endpoint(request: Request, ip: str, body: dict = {}, access_t
 @app.post("/admin/ip/{ip}/unblock")
 @limiter.limit("30/minute")
 async def unblock_ip_endpoint(request: Request, ip: str, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     orchestrator.session_mgr.unblock_ip(ip)
     orchestrator.session_mgr.log_admin_action("unblock_ip", ip)
     return {"status": "unblocked", "ip": ip}
@@ -2327,19 +3439,19 @@ async def unblock_ip_endpoint(request: Request, ip: str, access_token: str = Hea
 @app.get("/admin/blocked-ips")
 @limiter.limit("30/minute")
 async def get_blocked_ips(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     return orchestrator.session_mgr.get_blocked_ips()
 
 @app.get("/admin/audit-log")
 @limiter.limit("30/minute")
 async def get_audit_log(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     return orchestrator.session_mgr.get_audit_log()
 
 @app.get("/admin/notifications")
 @limiter.limit("60/minute")
 async def get_notifications(request: Request, since: str = "", access_token: str = Header(None, alias="X-Admin-Key")):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     if not since:
         from datetime import datetime, timedelta, timezone
         since = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
@@ -2350,7 +3462,7 @@ async def get_notifications(request: Request, since: str = "", access_token: str
 async def export_users(request: Request, access_token: str = Header(None, alias="X-Admin-Key")):
     from fastapi.responses import StreamingResponse as SR
     import csv
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     from collections import defaultdict
     sessions = orchestrator.session_mgr.get_all_sessions_admin()
     grouped = defaultdict(list)
@@ -2382,29 +3494,43 @@ async def export_users(request: Request, access_token: str = Header(None, alias=
 
 @app.get("/api/history")
 @limiter.limit("60/minute")
-async def get_history(request: Request, user_id: Optional[str] = "admin", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return orchestrator.session_mgr.get_user_sessions(user_id)
+async def get_history(request: Request, user=Depends(_require_jwt)):
+    # User can only see their own sessions; admin sees any user via query param
+    if user.get("role") == "admin":
+        target_uid = request.query_params.get("user_id") or user["sub"]
+    else:
+        target_uid = user["sub"]
+    return orchestrator.session_mgr.get_user_sessions(str(target_uid))
 
 @app.get("/api/history/{session_id}")
 @limiter.limit("60/minute")
-async def get_session_history(request: Request, session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return orchestrator.session_mgr.get_chat_history(session_id)
+async def get_session_history(request: Request, session_id: str, user=Depends(_require_jwt)):
+    history = orchestrator.session_mgr.get_chat_history(session_id)
+    # Enforce ownership: verify the session belongs to the authenticated user
+    sessions = orchestrator.session_mgr.get_user_sessions(str(user["sub"]))
+    owned_ids = {s["session_id"] for s in sessions}
+    if session_id not in owned_ids and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+    return history
 
 @app.delete("/api/history/{session_id}")
 @limiter.limit("20/minute")
-async def delete_session(request: Request, session_id: str, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def delete_session(request: Request, session_id: str, user=Depends(_require_jwt)):
+    sessions = orchestrator.session_mgr.get_user_sessions(str(user["sub"]))
+    owned_ids = {s["session_id"] for s in sessions}
+    if session_id not in owned_ids and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
     orchestrator.session_mgr.delete_session(session_id)
     return {"status": "deleted", "session_id": session_id}
 
 @app.post("/v1/export")
 @limiter.limit("10/minute")
-async def export_chat(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
+async def export_chat(
+    request: Request,
+    user: dict = Depends(_require_jwt),
+    access_token: str = Header(None, alias="X-API-Key"),
+    access_token_alt: str = Header(None, alias="access-token"),
+):
     import re, shutil
     try:
         body = await request.json()
@@ -2515,10 +3641,11 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
         dst = os.path.join(export_dir, filename)
         if src and os.path.exists(src) and src != dst:
             shutil.copy2(src, dst)
+        download_token = _create_download_token(filename, str(user["sub"]))
         return {
             "success": True,
             "filename": filename,
-            "download_url": f"/v1/download/{filename}",
+            "download_url": f"/v1/download/{download_token}",
             "title": title,
             "format": fmt,
             "report_id": result.get("report_id"),
@@ -2528,24 +3655,28 @@ async def export_chat(request: Request, access_token: str = Header(None, alias="
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/v1/download/{filename}")
+@app.get("/v1/download/{token}")
 @limiter.limit("60/minute")
-async def download_file(request: Request, filename: str):
-    """Download exported file — public endpoint so browser links work directly."""
-    import re as _re
+async def download_file(request: Request, token: str, user=Depends(_require_jwt)):
+    """Download exported file — requires authentication."""
     from fastapi.responses import FileResponse
 
-    # Only allow safe filenames: letters, digits, underscores, hyphens, dots
-    if not _re.fullmatch(r"[\w\-]+\.(pdf|docx|xlsx|pptx|csv)", filename, _re.IGNORECASE):
-        raise HTTPException(status_code=400, detail="Invalid filename")
+    token_entry = _DOWNLOAD_TOKENS.get(token)
+    if not token_entry or token_entry.get("expires", 0) <= _time.time():
+        _DOWNLOAD_TOKENS.pop(token, None)
+        raise HTTPException(status_code=404, detail="Download link expired or not found")
 
-    export_dir = "/home/ubuntu/investwise/static/exports"
+    if token_entry.get("user_id") != str(user["sub"]) and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    filename = os.path.basename(token_entry["filename"])
+    export_dir = str(EXPORTS_DIR)
     file_path = os.path.join(export_dir, filename)
 
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(file_path, filename=filename)
+    return FileResponse(file_path, filename=token_entry["filename"])
 
 @app.get("/v1/brain/status")
 @limiter.limit("30/minute")
@@ -2606,7 +3737,7 @@ async def remove_alert(request: Request, alert_id: int, user_id: str = 'anonymou
 @app.get('/v1/version')
 @limiter.limit('60/minute')
 async def app_version(request: Request):
-    return {'version': _APP_VERSION, 'git_sha': _GIT_SHA, 'build_date': '2026-04-10', 'env': 'production'}
+    return {'status': 'ok'}
 
 # ── HTML → PDF Export ──
 class HtmlExportPayload(BaseModel):
@@ -2634,7 +3765,8 @@ async def export_html_to_pdf(
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         html_to_pdf(inject_print_css(payload.html), filepath)
         os.chmod(filepath, 0o644)
-        return {"url": f"/v1/download/{fname}", "download_url": f"/v1/download/{fname}", "filename": fname}
+        download_token = _create_download_token(fname, "admin")
+        return {"url": f"/v1/download/{download_token}", "download_url": f"/v1/download/{download_token}", "filename": fname}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2947,7 +4079,8 @@ async def export_html_pdf(request: Request, payload: HtmlExportPayload, access_t
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         html_to_pdf(inject_print_css(payload.html), filepath)
         os.chmod(filepath, 0o644)
-        return {"url": f"/v1/download/{fname}", "download_url": f"/v1/download/{fname}", "filename": fname}
+        download_token = _create_download_token(fname, "admin")
+        return {"url": f"/v1/download/{download_token}", "download_url": f"/v1/download/{download_token}", "filename": fname}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2955,7 +4088,7 @@ async def export_html_pdf(request: Request, payload: HtmlExportPayload, access_t
 # ══════════════════════════════════════════════════════════════════════════════
 #  B2B AUTH  — /auth/*  and  /admin/*
 # ══════════════════════════════════════════════════════════════════════════════
-from core.auth    import hash_password, verify_password, create_token, decode_token, generate_temp_password
+from core.auth    import hash_password, verify_password, create_token, decode_token, generate_temp_password, JWT_SECRET, JWT_ALGORITHM
 from core.user_db import (init_users_table, create_user, get_user_by_email,
                            get_user_by_id, list_users, update_user, delete_user, record_login)
 
@@ -3058,7 +4191,6 @@ async def auth_login(request: Request, body: LoginRequest):
     )
     return {
         "token":       token,
-        "access_token": SECURE_TOKEN,
         "must_change": bool(user["must_change_pw"]),
         "name":        user["name"],
         "role":        user["role"],
@@ -3247,7 +4379,7 @@ async def run_cleanup(
     days: int = 30,
     access_token: str = Header(None, alias="X-Admin-Key"),
 ):
-    _check_admin(access_token)
+    _check_admin(access_token or "", request)
     result = orchestrator.session_mgr.cleanup_old_sessions(days_to_keep=days)
     return result
 
@@ -3256,23 +4388,20 @@ async def run_cleanup(
 
 @app.get("/admin/logs")
 @limiter.limit("30/minute")
-async def admin_logs_page(
-    request: Request,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-):
-    _token = access_token or access_token_alt
-    if _token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def admin_logs_page(request: Request):
     from fastapi.responses import FileResponse
     return FileResponse(str(STATIC_DIR / "admin_logs.html"))
 
 
 @app.get("/admin/logs/stream")
 @limiter.limit("10/minute")
-async def admin_logs_stream(request: Request, token: str = ""):
-    if token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def admin_logs_stream(
+    request: Request,
+    access_token: str = Header(None, alias="X-Admin-Key"),
+    access_token_alt: str = Header(None, alias="X-API-Key"),
+    token: str = "",
+):
+    _check_admin(access_token or access_token_alt or token or "", request)
     from fastapi.responses import StreamingResponse
     import asyncio as _aio
 
@@ -3309,14 +4438,7 @@ async def admin_logs_stream(request: Request, token: str = ""):
 
 @app.get("/admin/analytics")
 @limiter.limit("30/minute")
-async def admin_analytics_page(
-    request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-    token: str = "",
-):
-    if (access_token or access_token_alt or token) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def admin_analytics_page(request: Request):
     from fastapi.responses import FileResponse
     return FileResponse(str(STATIC_DIR / "admin_analytics.html"))
 
@@ -3329,8 +4451,7 @@ async def admin_analytics_data(
     access_token_alt: str = Header(None, alias="access-token"),
     token: str = "",
 ):
-    if (access_token or access_token_alt or token) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _check_admin(access_token or access_token_alt or token or "", request)
 
     import sqlite3
     import re as _re2
@@ -3408,14 +4529,15 @@ async def admin_analytics_data(
 @limiter.limit("30/minute")
 async def user_usage(
     request: Request,
-    user_id: str = "anonymous",
     days: int = 30,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user_id: Optional[str] = None,
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return orchestrator.session_mgr.get_user_usage_stats(user_id, days=min(days, 90))
+    if user.get("role") == "admin" and user_id:
+        effective_user_id = user_id
+    else:
+        effective_user_id = str(user["sub"])
+    return orchestrator.session_mgr.get_user_usage_stats(effective_user_id, days=min(days, 90))
 
 
 if __name__ == "__main__":
@@ -3443,33 +4565,31 @@ async def redis_health(
 @limiter.limit("30/minute")
 async def get_referral(
     request: Request,
-    user_id:          str = "anonymous",
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user_id: Optional[str] = None,
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    if user.get("role") == "admin" and user_id:
+        effective_user_id = user_id
+    else:
+        effective_user_id = str(user["sub"])
     from core.referrals import get_referral_stats
-    return get_referral_stats(user_id)
+    return get_referral_stats(effective_user_id)
 
 
 @app.post("/v1/referral/apply")
 @limiter.limit("5/minute")
 async def apply_referral_code(
     request: Request,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-    user_id = str(body.get("user_id", "")).strip()
-    code    = str(body.get("code", "")).strip()
-    if not user_id or not code:
-        raise HTTPException(status_code=400, detail="Required: user_id, code")
+    user_id = str(user["sub"])
+    code = str(body.get("code", "")).strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Required: code")
     from core.referrals import apply_referral
     result = apply_referral(user_id, code)
     if not result["success"]:
@@ -3491,11 +4611,9 @@ class WebhookConfig(BaseModel):
 async def register_webhook(
     request: Request,
     body: WebhookConfig,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    effective_user_id = str(user["sub"])
     import sqlite3 as _sl2
     conn = _sl2.connect(str(APP_DB))
     conn.execute("""CREATE TABLE IF NOT EXISTS webhooks (
@@ -3507,9 +4625,9 @@ async def register_webhook(
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)""")
     cur = conn.execute(
         "INSERT INTO webhooks(user_id,url,events,secret) VALUES(?,?,?,?)",
-        (body.user_id, body.url, _json.dumps(body.events), body.secret))
+        (effective_user_id, body.url, _json.dumps(body.events), body.secret))
     wid = cur.lastrowid; conn.commit(); conn.close()
-    logger.info("[webhooks] registered %d for %s → %s", wid, body.user_id, body.url)
+    logger.info("[webhooks] registered %d for %s → %s", wid, effective_user_id, body.url)
     return {"webhook_id": wid, "status": "registered", "url": body.url}
 
 
@@ -3517,18 +4635,19 @@ async def register_webhook(
 @limiter.limit("30/minute")
 async def list_webhooks(
     request: Request,
-    user_id:          str = "anonymous",
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user_id: Optional[str] = None,
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    if user.get("role") == "admin" and user_id:
+        effective_user_id = user_id
+    else:
+        effective_user_id = str(user["sub"])
     import sqlite3 as _sl2
     conn = _sl2.connect(str(APP_DB)); conn.row_factory = _sl2.Row
     try:
         rows = conn.execute(
             "SELECT id,url,events,active,created_at FROM webhooks WHERE user_id=? ORDER BY created_at DESC",
-            (user_id,)).fetchall()
+            (effective_user_id,)).fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []
@@ -3541,12 +4660,9 @@ async def list_webhooks(
 async def delete_webhook(
     request: Request,
     webhook_id: int,
-    user_id:          str = "anonymous",
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    user_id = str(user["sub"])
     import sqlite3 as _sl2
     conn = _sl2.connect(str(APP_DB))
     conn.execute("CREATE TABLE IF NOT EXISTS webhooks (id INTEGER PRIMARY KEY, user_id TEXT, active INTEGER)")
@@ -3570,14 +4686,13 @@ class PortalRequest(BaseModel):
 async def create_checkout(
     request: Request,
     body: CheckoutRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
+    effective_user_id = str(user["sub"])
+    effective_email = user.get("email") or body.email
     try:
         from core.billing import StripeBilling
-        url = StripeBilling().create_checkout_session(body.user_id, body.email, body.tier)
+        url = StripeBilling().create_checkout_session(effective_user_id, effective_email, body.tier)
         return {"checkout_url": url}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -3609,15 +4724,13 @@ async def stripe_webhook(request: Request):
 async def billing_portal(
     request: Request,
     body: PortalRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(_require_jwt),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
+    effective_user_id = str(user["sub"])
     try:
         from core.billing import StripeBilling
         billing = StripeBilling()
-        cid = billing.get_customer_id(body.user_id)
+        cid = billing.get_customer_id(effective_user_id)
         if not cid:
             raise HTTPException(status_code=404, detail="No billing record found for this user")
         url = billing.create_portal_session(cid)
@@ -3664,8 +4777,7 @@ async def get_batch_sentiment(
     access_token_alt: str = Header(None, alias="access-token"),
 ):
     """Analyze sentiment for multiple tickers at once (max 10)."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _check_admin(access_token or access_token_alt or "", request)
     try:
         body = await request.json()
     except Exception:
@@ -3694,8 +4806,7 @@ async def get_market_sentiment(
     access_token_alt: str = Header(None, alias="access-token"),
 ):
     """Aggregate market sentiment from major ETF news (SPY/QQQ/DIA)."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    _check_admin(access_token or access_token_alt or "", request)
     try:
         from core.sentiment import SentimentAnalyzer
         result = await asyncio.get_event_loop().run_in_executor(
