@@ -94,7 +94,21 @@ _REPORT_CACHE_TTL = 600  # seconds
 _div_yield_cache    = _TTLCache(ttl_seconds=3600)   # dividend yields → 1h TTL
 _fundamentals_cache = _TTLCache(ttl_seconds=600)    # fundamentals   → 10min TTL
 
-_ETF_EQUITY_ONLY_SUFFIXES = (".CA",)
+# Suffixes that are always regional equity exchanges — skip ETF detection entirely.
+# MENA markets do not issue ETFs under these suffixes; misclassification causes
+# wrong scorecard weights (40/60 instead of 60/40) and wrong analysis path.
+_ETF_EQUITY_ONLY_SUFFIXES = (
+    ".CA",   # Egypt (EGX)
+    ".AE",   # UAE (DFM/ADX)
+    ".DU",   # UAE (DFM alternate)
+    ".AD",   # UAE (ADX alternate)
+    ".SR",   # Saudi Arabia (Tadawul)
+    ".KW",   # Kuwait (BK)
+    ".QA",   # Qatar (QSE)
+    ".BH",   # Bahrain (BHX)
+    ".MA",   # Morocco (Casablanca)
+    ".TN",   # Tunisia (BVMT)
+)
 
 
 # _safe_div_yield, _VERDICT_TIERS, _consensus_divergence, _fetch_btc_etf_flows

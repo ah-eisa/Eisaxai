@@ -570,7 +570,7 @@ def extract_and_save_user_facts(user_id: str, message: str, reply: str):
             from google.genai import types as _gt
             _cfg = _gt.GenerateContentConfig(max_output_tokens=300, temperature=0.1)
             _resp = _gc.models.generate_content(
-                model="gemini-2.5-flash", contents=_prompt, config=_cfg
+                model="gemini-2.0-flash", contents=_prompt, config=_cfg
             )
             _text = (_resp.text or "").strip().replace("```json","").replace("```","").strip()
             if not _text:

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 try:
     from core.llm_fallback import generate_with_fallback, get_llm_health
     LLM_FALLBACK_ENABLED = True
-    logger.info("[LLM] Fallback chain loaded: Kimi → DeepSeek → Cache")
+    logger.info("[LLM] Fallback chain loaded: DeepSeek → Cache")
 except Exception as _llm_e:
     logger.warning("[LLM] Fallback chain unavailable (%s) — using direct calls", _llm_e)
     LLM_FALLBACK_ENABLED = False
@@ -73,17 +73,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_API_KEY_BACKUP = os.getenv("GEMINI_API_KEY_BACKUP", "")
 """Backup API key for fallback scenarios if primary fails."""
 
-# Primary model: Ultra-fast, economical, for routing and general queries
-# Avg latency: ~200ms | Cost: Low | Use: Intent classification, general chat
-GEMINI_MODEL = "gemini-2.5-flash"
+# Primary model: Gemini 2.0 Flash — stable, fast, cost-efficient
+# (gemini-3.1-flash-lite-preview was retired; replaced with 2.0-flash)
+GEMINI_MODEL = "gemini-2.0-flash"
 
-# Backup model: More capable, for complex reasoning when primary fails
-# Avg latency: ~800ms | Cost: Standard | Use: Fallback analysis, complex prompts
-GEMINI_MODEL_BACKUP = "gemini-2.5-flash"
-
-# ?? Kimi (Moonshot) Configuration - Primary Maestro ?????????????????????
-MOONSHOT_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
-KIMI_MODEL = "kimi-k2.5"
+# Backup: same model — single stable target reduces 403-retry latency
+GEMINI_MODEL_BACKUP = "gemini-2.0-flash"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # GEMINI Configuration — Primary & Backup Models for High Reliability
@@ -187,19 +182,6 @@ class MultiAgentOrchestrator:
                 logger.info("Gemini backup client initialized: %s", GEMINI_MODEL_BACKUP)
         except Exception as e:
             logger.error("Gemini Client init failed: %s", e)
-
-        self.kimi_client = None
-        if MOONSHOT_API_KEY:
-            try:
-                from openai import OpenAI
-                self.kimi_client = OpenAI(
-                    api_key=MOONSHOT_API_KEY,
-                    base_url="https://api.moonshot.ai/v1"
-                )
-                logger.info("[Kimi] Client initialized successfully with model: %s", KIMI_MODEL)
-            except Exception as e:
-                logger.error("[Kimi] Client init failed: %s", e)
-                self.kimi_client = None
 
         # Full async I/O migration: shared AsyncClient for DFM and Bond handlers.
         self.httpx_client = httpx.AsyncClient()
@@ -307,8 +289,8 @@ class MultiAgentOrchestrator:
         Generate LLM response with automatic fallback mechanism.
         
         High-reliability pattern:
-        1. Primary: gemini-3.1-flash-lite (fast, economical)
-        2. Backup: gemini-2.5-flash (slower, more capable)
+        1. Primary: gemini-2.0-flash
+        2. Backup: gemini-2.0-flash
         3. Retry: Up to 2 attempts per model with exponential backoff
         
         Args:
@@ -366,7 +348,7 @@ class MultiAgentOrchestrator:
                 logger.error("[Gemini] Backup (%s) also failed%s: %s — escalating to fallback chain",
                              GEMINI_MODEL_BACKUP, f" [{label}]" if label else "", e2)
 
-        # ── ATTEMPT 3: Kimi → DeepSeek → Cache → Static fallback chain ──
+        # ── ATTEMPT 3: DeepSeek → Cache → Static fallback chain ──
         # Reached when both Gemini primary and backup are exhausted (e.g. 429 quota).
         try:
             from core.llm_fallback import generate_with_fallback_sync
@@ -391,32 +373,8 @@ class MultiAgentOrchestrator:
             raise RuntimeError(f"All LLM providers exhausted [{label}]") from e_chain
 
     def _maestro_route_generate(self, prompt: str) -> str:
-        """Primary router: Kimi maestro, then DeepSeek, then Gemini fallback."""
-        # Primary: Kimi K2.5
-        if self.kimi_client:
-            try:
-                resp = _retry(
-                    lambda: self.kimi_client.chat.completions.create(
-                        model=KIMI_MODEL,
-                        messages=[
-                            {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        # Kimi K2.5 only supports temperature=1 — do not pass other values
-                        temperature=1,
-                        # Force JSON output — prevents prose wrapping around the JSON
-                        response_format={"type": "json_object"},
-                    ),
-                    max_attempts=2,
-                    base_delay=0.3,
-                )
-                content = ((resp.choices[0].message.content or "") if resp and resp.choices else "").strip()
-                if content:
-                    return content
-            except Exception as e:
-                logger.warning("[Router] Kimi failed: %s ? falling back to DeepSeek", e)
-
-        # Fallback 1: DeepSeek (sync httpx; this function is sync by design)
+        """Primary router: DeepSeek maestro, then Gemini fallback."""
+        # Primary: DeepSeek (sync httpx; this function is sync by design)
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
@@ -441,7 +399,7 @@ class MultiAgentOrchestrator:
                     if content:
                         return content
             except Exception as e:
-                logger.warning("[Router] DeepSeek fallback failed: %s ? falling back to Gemini", e)
+                logger.warning("[Router] DeepSeek failed: %s ? falling back to Gemini", e)
 
         # Fallback 2: Gemini
         try:
@@ -451,8 +409,8 @@ class MultiAgentOrchestrator:
         except Exception as e:
             logger.error("[Router] Gemini fallback failed: %s", e)
 
-        # All 3 LLMs failed — return safe fallback JSON instead of crashing
-        logger.error("[Router] All models failed (Kimi/DeepSeek/Gemini) — using GENERAL fallback")
+        # All models failed — return safe fallback JSON instead of crashing
+        logger.error("[Router] All models failed (DeepSeek/Gemini) — using GENERAL fallback")
         return '{"route":"GENERAL","handler":"GENERAL","instruction":"' + \
                prompt[:100].replace('"', '') + '","clarification_question":""}'
 
@@ -541,21 +499,54 @@ class MultiAgentOrchestrator:
         ]
         _status_idx = 0
 
-        # Launch process_message as a background task
-        _task = _aio.create_task(
-            self.process_message(user_id, message, session_id)
-        )
+        # ── Run process_message in a THREAD POOL (not as a coroutine task) ────
+        # process_message makes many synchronous blocking calls (requests.post
+        # to Gemini/DeepSeek, yfinance, etc.). Running it with create_task()
+        # causes those sync calls to monopolise the event loop for 60+ seconds,
+        # preventing the heartbeat loop below from yielding — which makes
+        # Cloudflare drop the SSE connection mid-stream.
+        # Solution: run the entire process_message in a thread via
+        # run_in_executor so the event loop stays free to send heartbeats.
+        import concurrent.futures as _cf
+
+        _loop = _aio.get_event_loop()
+        _future: _aio.Future = _aio.Future()
+
+        def _run_in_thread():
+            """Execute process_message synchronously in a thread pool thread."""
+            import asyncio as _t_aio
+            _t_loop = _t_aio.new_event_loop()
+            try:
+                result = _t_loop.run_until_complete(
+                    self.process_message(user_id, message, session_id)
+                )
+                _loop.call_soon_threadsafe(_future.set_result, result)
+            except Exception as _exc:
+                _loop.call_soon_threadsafe(_future.set_exception, _exc)
+            finally:
+                _t_loop.close()
+
+        _executor = _cf.ThreadPoolExecutor(max_workers=1)
+        _executor.submit(_run_in_thread)
 
         # Send heartbeat status messages while waiting
-        while not _task.done():
+        while not _future.done():
             await _aio.sleep(2.5)
             if _status_idx < len(_status_sequence):
                 yield _sse("status", _status_sequence[_status_idx])
                 _status_idx += 1
+            else:
+                # Status sequence exhausted — keep SSE connection alive with
+                # a comment line. Cloudflare/nginx/browsers drop idle SSE
+                # connections; this prevents that without showing anything to
+                # the user (SSE comments starting with ':' are ignored by the
+                # browser EventSource API and by our custom fetch reader).
+                yield ": heartbeat\n\n"
 
         # Retrieve result (re-raise if task raised exception)
+        _executor.shutdown(wait=False)
         try:
-            _result = _task.result()
+            _result = _future.result()
         except Exception as _te:
             logger.error("[Stream] process_message task failed: %s", _te)
             yield _sse("error", "⚠️ حدث خطأ أثناء المعالجة. حاول مرة أخرى.")
@@ -1037,6 +1028,7 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                         f"**Try one of these to get started:**\n{_bullet}"
                     )
                 logger.info("[onboarding] first session welcome sent to user %s", user_id)
+                self.session_mgr.save_message(session_id, user_id, "user", message)
                 self.session_mgr.save_message(session_id, user_id, "assistant", _welcome)
                 return {
                     "reply": _welcome,

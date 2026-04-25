@@ -88,15 +88,23 @@ async def _check_database() -> ServiceResult:
 async def _check_gemini() -> ServiceResult:
     t0 = time.monotonic()
     try:
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            return _down("GEMINI_API_KEY not set", (time.monotonic() - t0) * 1000)
+        primary_key = os.getenv("GEMINI_API_KEY", "")
+        backup_key = os.getenv("GEMINI_API_KEY_BACKUP", "")
 
-        def _probe() -> str:
+        candidates: list[tuple[str, str]] = []
+        if primary_key:
+            candidates.append(("primary", primary_key))
+        if backup_key and backup_key != primary_key:
+            candidates.append(("backup", backup_key))
+
+        if not candidates:
+            return _down("No Gemini API key configured", (time.monotonic() - t0) * 1000)
+
+        def _probe(api_key: str) -> str:
             from google import genai  # google-genai package
             client = genai.Client(api_key=api_key)
             resp = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents="hi",
             )
             text = resp.text
@@ -104,8 +112,19 @@ async def _check_gemini() -> ServiceResult:
                 raise ValueError("Empty response text")
             return f"response length {len(text)} chars"
 
-        detail = await asyncio.get_event_loop().run_in_executor(None, _probe)
-        return _ok(detail, (time.monotonic() - t0) * 1000)
+        errors: list[str] = []
+        loop = asyncio.get_event_loop()
+        for label, api_key in candidates:
+            try:
+                detail = await loop.run_in_executor(None, _probe, api_key)
+                return _ok(f"{label} key ok ({detail})", (time.monotonic() - t0) * 1000)
+            except Exception as exc:
+                msg = f"{type(exc).__name__}: {exc}"
+                if len(msg) > 220:
+                    msg = msg[:217] + "..."
+                errors.append(f"{label}={msg}")
+
+        return _down("; ".join(errors), (time.monotonic() - t0) * 1000)
     except Exception as exc:
         return _down(f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000)
 
@@ -113,6 +132,7 @@ async def _check_gemini() -> ServiceResult:
 # ── DeepSeek ─────────────────────────────────────────────────────────────────
 
 async def _check_deepseek() -> ServiceResult:
+    """Probe DeepSeek using the lightweight /models endpoint — no tokens consumed."""
     t0 = time.monotonic()
     try:
         api_key = os.getenv("DEEPSEEK_API_KEY", "")
@@ -120,49 +140,15 @@ async def _check_deepseek() -> ServiceResult:
             return _down("DEEPSEEK_API_KEY not set", (time.monotonic() - t0) * 1000)
 
         import httpx
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "deepseek-chat",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 5,
-                },
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://api.deepseek.com/models",
+                headers={"Authorization": f"Bearer {api_key}"},
             )
-            r.raise_for_status()
-            return _ok(f"HTTP {r.status_code}", (time.monotonic() - t0) * 1000)
-    except Exception as exc:
-        return _down(f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000)
-
-
-# ── Kimi (Moonshot) ───────────────────────────────────────────────────────────
-
-async def _check_kimi() -> ServiceResult:
-    t0 = time.monotonic()
-    try:
-        api_key = os.getenv("MOONSHOT_API_KEY", "")
-        if not api_key:
-            return _down("MOONSHOT_API_KEY not set", (time.monotonic() - t0) * 1000)
-
-        import httpx
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                "https://api.moonshot.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "kimi-k2.5",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 5,
-                    "temperature": 1,
-                },
-            )
+            if r.status_code == 401:
+                return _down("Invalid API key (401)", (time.monotonic() - t0) * 1000)
+            if r.status_code == 429:
+                return _degraded("Rate limited (429)", (time.monotonic() - t0) * 1000)
             r.raise_for_status()
             return _ok(f"HTTP {r.status_code}", (time.monotonic() - t0) * 1000)
     except Exception as exc:
@@ -243,7 +229,7 @@ def _get_llm_fallback_stats() -> dict:
     """
     Query the llm_fallback module for provider health status.
 
-    Returns a dict with kimi/deepseek availability and circuit-breaker
+    Returns a dict with active provider availability and circuit-breaker
     failure counts, plus response-cache stats.  Never raises.
     """
     try:
@@ -304,29 +290,29 @@ def _get_last_analysis_at() -> str | None:
 # Overall status aggregation
 # ---------------------------------------------------------------------------
 
-def _aggregate_status(services: dict[str, ServiceResult]) -> tuple[str, str]:
+def _aggregate_status(services: dict[str, ServiceResult]) -> tuple[str, str, list[str]]:
     """
-    Returns (overall_status, summary_string).
+    Returns (overall_status, summary_string, optional_failures).
 
     Rules
     -----
     - database down                          → "down"
-    - all 3 LLMs (gemini, deepseek, kimi) down → "down"
-    - 1-2 LLMs down OR disk/memory degraded → "degraded"
+    - both LLMs (gemini, deepseek) down      → "down"
+    - deepseek down while gemini up          → "degraded"
+    - gemini down while deepseek up          → "ok" (optional dependency)
+    - disk/memory degraded                   → "degraded"
     - everything ok                          → "ok"
     """
     db_status = services["database"]["status"]
-    llm_statuses = {
-        name: services[name]["status"]
-        for name in ("gemini", "deepseek", "kimi")
-    }
-    llms_down = [name for name, s in llm_statuses.items() if s == "down"]
+    gemini_status = services["gemini"]["status"]
+    deepseek_status = services["deepseek"]["status"]
+    optional_failures: list[str] = []
 
     if db_status == "down":
-        return "down", "Critical failure: database is unreachable"
+        return "down", "Critical failure: database is unreachable", optional_failures
 
-    if len(llms_down) == 3:
-        return "down", "Critical failure: all LLM services are down"
+    if gemini_status == "down" and deepseek_status == "down":
+        return "down", "Critical failure: all LLM services are down", optional_failures
 
     degraded_services = [
         name
@@ -334,12 +320,20 @@ def _aggregate_status(services: dict[str, ServiceResult]) -> tuple[str, str]:
         if result["status"] in ("degraded", "down")
     ]
 
+    if gemini_status in ("down", "degraded") and deepseek_status == "ok":
+        optional_failures.append("gemini")
+        degraded_services = [name for name in degraded_services if name != "gemini"]
+
     if degraded_services:
         count = len(degraded_services)
         names = ", ".join(degraded_services)
-        return "degraded", f"{count} service(s) degraded: {names}"
+        return "degraded", f"{count} service(s) degraded: {names}", optional_failures
 
-    return "ok", "All systems operational"
+    if optional_failures:
+        names = ", ".join(optional_failures)
+        return "ok", f"All core systems operational; optional issue(s): {names}", optional_failures
+
+    return "ok", "All systems operational", optional_failures
 
 
 # ---------------------------------------------------------------------------
@@ -365,13 +359,12 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
         _check_database(),
         _check_gemini(),
         _check_deepseek(),
-        _check_kimi(),
         _check_disk(),
         _check_memory(),
         return_exceptions=True,
     )
 
-    service_names = ("database", "gemini", "deepseek", "kimi", "disk", "memory")
+    service_names = ("database", "gemini", "deepseek", "disk", "memory")
     services: dict[str, ServiceResult] = {}
 
     for name, result in zip(service_names, results):
@@ -385,7 +378,7 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
         else:
             services[name] = result
 
-    overall_status, summary = _aggregate_status(services)
+    overall_status, summary, optional_failures = _aggregate_status(services)
 
     # ── New extended fields (each wrapped defensively) ────────────────────
     llm_providers: dict = {}
@@ -424,5 +417,6 @@ async def run_health_check(secure_token: str) -> dict[str, Any]:  # noqa: ARG001
         "llm_providers": llm_providers,
         "redis": redis_status,
         "services": services,
+        "optional_failures": optional_failures,
         "summary": summary,
     }
