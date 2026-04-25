@@ -3225,16 +3225,25 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 
             # ── MENA Pipeline Override ────────────────────────────────────────
             # TradingView cache provides real fundamentals for regional stocks.
-            # Count pipeline fields explicitly; if ≥4 present → medium coverage.
+            # Read directly from _cache_row (avoids None-override bug in fund merge).
+            # If ≥4 valid TV fields present → force "medium" coverage.
             if _cache_row and target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN")) and _data_coverage_level in ("technical_only", "low"):
+                import math as _math_mpo
+                def _mpo_valid(v):
+                    try:
+                        f = float(v)
+                        return not (_math_mpo.isnan(f) or _math_mpo.isinf(f)) and f != 0
+                    except (TypeError, ValueError):
+                        return False
+                _cr_sector = str(_cache_row.get("sector") or "").lower()
                 _tv_valid = sum(1 for v in [
-                    fund.get('pe_ratio') if fund.get('pe_ratio') else None,
-                    fund.get('eps') if fund.get('eps') else None,
-                    fund.get('market_cap') if fund.get('market_cap') else None,
-                    str(fund.get('sector', '')) if str(fund.get('sector', '')).lower() not in ('', 'unknown', 'n/a') else None,
-                    fund.get('dividend_yield') if fund.get('dividend_yield') else None,
-                    fund.get('sma200') if fund.get('sma200') else None,
-                    fund.get('rsi') if float(fund.get('rsi') or 0) > 0 else None,
+                    _cache_row.get("price_earnings_ttm")   if _mpo_valid(_cache_row.get("price_earnings_ttm")) else None,
+                    _cache_row.get("earnings_per_share_diluted_ttm") if _mpo_valid(_cache_row.get("earnings_per_share_diluted_ttm")) else None,
+                    _cache_row.get("market_cap_basic")     if _mpo_valid(_cache_row.get("market_cap_basic")) else None,
+                    _cr_sector                             if _cr_sector not in ("", "unknown", "n/a") else None,
+                    _cache_row.get("dividend_yield_recent") if _mpo_valid(_cache_row.get("dividend_yield_recent")) else None,
+                    _cache_row.get("SMA200")               if _mpo_valid(_cache_row.get("SMA200")) else None,
+                    _cache_row.get("RSI")                  if _mpo_valid(_cache_row.get("RSI")) else None,
                 ] if v is not None)
                 if _tv_valid >= 4:
                     _data_coverage_level = "medium"
@@ -3350,21 +3359,30 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 
             # ── MENA Pipeline Override ────────────────────────────────────────
             # TradingView cache provides real fundamentals for regional stocks.
-            # Count pipeline fields explicitly; if ≥4 present → medium coverage.
+            # Read directly from _cache_row (avoids None-override bug in fund merge).
+            # If ≥4 valid TV fields present → force "medium" coverage.
             if _cache_row and target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN")) and _data_coverage_level in ("technical_only", "low"):
-                _tv_valid = sum(1 for v in [
-                    fund.get('pe_ratio') if fund.get('pe_ratio') else None,
-                    fund.get('eps') if fund.get('eps') else None,
-                    fund.get('market_cap') if fund.get('market_cap') else None,
-                    str(fund.get('sector', '')) if str(fund.get('sector', '')).lower() not in ('', 'unknown', 'n/a') else None,
-                    fund.get('dividend_yield') if fund.get('dividend_yield') else None,
-                    fund.get('sma200') if fund.get('sma200') else None,
-                    fund.get('rsi') if float(fund.get('rsi') or 0) > 0 else None,
+                import math as _math_mpo2
+                def _mpo2_valid(v):
+                    try:
+                        f = float(v)
+                        return not (_math_mpo2.isnan(f) or _math_mpo2.isinf(f)) and f != 0
+                    except (TypeError, ValueError):
+                        return False
+                _cr2_sector = str(_cache_row.get("sector") or "").lower()
+                _tv_valid2 = sum(1 for v in [
+                    _cache_row.get("price_earnings_ttm")   if _mpo2_valid(_cache_row.get("price_earnings_ttm")) else None,
+                    _cache_row.get("earnings_per_share_diluted_ttm") if _mpo2_valid(_cache_row.get("earnings_per_share_diluted_ttm")) else None,
+                    _cache_row.get("market_cap_basic")     if _mpo2_valid(_cache_row.get("market_cap_basic")) else None,
+                    _cr2_sector                            if _cr2_sector not in ("", "unknown", "n/a") else None,
+                    _cache_row.get("dividend_yield_recent") if _mpo2_valid(_cache_row.get("dividend_yield_recent")) else None,
+                    _cache_row.get("SMA200")               if _mpo2_valid(_cache_row.get("SMA200")) else None,
+                    _cache_row.get("RSI")                  if _mpo2_valid(_cache_row.get("RSI")) else None,
                 ] if v is not None)
-                if _tv_valid >= 4:
+                if _tv_valid2 >= 4:
                     _data_coverage_level = "medium"
                     _low_data_compact_mode = False
-                    logger.info("[DataCoverage] %s: pipeline cache %d fields → medium coverage", target, _tv_valid)
+                    logger.info("[DataCoverage] %s: pipeline cache %d fields → medium coverage", target, _tv_valid2)
 
             # ── EisaX News Engine: inject as PRIMARY source (highest quality) ────
             # The engine has curated GCC/MENA + global financial news updated every 15min.

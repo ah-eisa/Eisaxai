@@ -3005,9 +3005,35 @@ async def unified_chat(
         active_file_id = payload.settings.get("active_file_id")
 
     if not payload.files and not active_file_id and _should_resolve_direct_analysis_request(message):
-        from core.services.entity_resolution import resolve_asset_entity
+        from core.services.entity_resolution import EntityResolution, resolve_asset_entity
 
-        resolution = resolve_asset_entity(message)
+        # ── Fast pre-route via local ticker index ─────────────────────────────
+        _chat_resolution: Optional[EntityResolution] = None
+        try:
+            from core.ticker_index import quick_scan as _qs_chat
+            _qs_hit = _qs_chat(message)
+            if _qs_hit and _qs_hit.match_type != "bare_ambiguous":
+                _chat_resolution = EntityResolution(
+                    query_raw=message,
+                    normalized_query=_qs_hit.symbol,
+                    resolution_status="resolved",
+                    symbol=_qs_hit.symbol,
+                    market=_qs_hit.market,
+                    asset_type=_qs_hit.asset_type,
+                    currency=_qs_hit.currency,
+                    resolution_source="ticker_index",
+                    confidence="high",
+                    name=_qs_hit.name,
+                    exchange=_qs_hit.exchange,
+                )
+                logger.info(
+                    "[ticker_index] pre-routed chat '%s' → %s / %s (bypassing entity resolution)",
+                    message, _qs_hit.symbol, _qs_hit.market,
+                )
+        except Exception as _qs_err:
+            logger.debug("[ticker_index] chat scan error (non-fatal): %s", _qs_err)
+
+        resolution = _chat_resolution or resolve_asset_entity(message)
         resolution_payload = resolution.to_dict()
         if not resolution.is_resolved:
             logger.info("[entity-resolution][chat] %s", resolution_payload)

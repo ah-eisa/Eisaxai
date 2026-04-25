@@ -65,6 +65,10 @@ _STOPWORDS: frozenset[str] = frozenset({
     "BUY", "SELL", "HOLD", "RISK", "HIGH", "LOW", "RATE",
     "FUND", "BOND", "GOLD", "OIL", "USD", "AED", "SAR", "EGP",
     "KWD", "QAR", "BHD", "MAD", "TND",
+    # Common English query words that should not be treated as tickers
+    "ANALYZE", "ANALYSIS", "STOCK", "PRICE", "MARKET", "SHOW",
+    "TECHNICAL", "FUNDAMENTAL", "SECTOR", "STRONG", "LATEST",
+    "WHAT", "HOW", "WHEN", "CURRENT", "PLEASE", "GIVE", "REPORT",
 })
 
 
@@ -249,7 +253,7 @@ def _ensure_index() -> None:
 # ── Token extraction ─────────────────────────────────────────────────────────
 _TOKEN_RE = re.compile(
     r'(?:'
-    r'[A-Z][A-Z0-9]{1,7}(?:\.[A-Z]{2})?(?:=F)?'   # equity / commodity
+    r'[A-Z][A-Z0-9]{1,15}(?:\.[A-Z]{2})?(?:=F)?'  # equity / commodity (up to 16 chars for long MENA names)
     r'|\d{4}'                                        # 4-digit KSA codes
     r')'
 )
@@ -286,7 +290,7 @@ def quick_scan(query: str) -> Optional[TickerMatch]:
     upper_query = query.upper()
 
     # Check for EXCHANGE:SYMBOL form first (highest priority)
-    _exch_m = re.search(r'\b([A-Z]{2,10}:[A-Z0-9]{1,8})\b', upper_query)
+    _exch_m = re.search(r'\b([A-Z]{2,12}:[A-Z0-9]{1,15})\b', upper_query)
     if _exch_m:
         hit = _INDEX.get(_exch_m.group(1))
         if hit and hit.match_type == "exchange_prefixed":
