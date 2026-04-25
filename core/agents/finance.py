@@ -31,6 +31,12 @@ from core.agents.finance_helpers import (   # noqa: E402
     _round_scenario_prices,
     _fetch_onchain,
 )
+from core.services.decision_policy import (  # noqa: E402
+    apply_language_locks,
+    classify_data_coverage_level,
+    compact_low_data_generation_inputs,
+    count_valid_fundamental_fields,
+)
 
 # ── yfinance ADX guard (monkey-patch) ────────────────────────────────────────
 # Yahoo Finance has NO data for Abu Dhabi ADX stocks (.AE suffix).
@@ -2038,6 +2044,9 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 else:
                     _entry_timing = 'WAIT'
 
+            # ── English timing preserved before Arabic translation ─────────────
+            _entry_timing_en = _entry_timing  # always English; needed for decision logic
+
             # Arabic timing labels (user-facing Quick View only; English kept in prompt)
             # _is_arabic_request lives in _handle_analytics scope — guard against NameError here
             _is_ar_sc = False
@@ -2055,6 +2064,16 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                     'WAIT': 'انتظر تأكيدًا',
                 }
                 _entry_timing = _TIMING_AR.get(_entry_timing, _entry_timing)
+
+            # ── Persist decision data for _handle_analytics (no regex needed) ──
+            self._last_scorecard_decision = {
+                'verdict':     verdict_sc,
+                'timing_en':   _entry_timing_en,   # English; used for WAIT/BUY logic
+                'timing':      _entry_timing,       # Display form (may be translated)
+                'score':       final,
+                'conviction':  conviction,
+                'emoji':       emoji,
+            }
 
             if _is_crypto_t:
                 # ── Crypto-specific scorecard display ──
@@ -3185,13 +3204,10 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 
             logger.info(f"[Fund] {target}: source={_fund_source}, fields={_fund_useful}")
 
-            # Data coverage level — drives LLM report verbosity
-            _data_coverage_level = (
-                "technical_only" if _fund_useful == 0
-                else "low" if _fund_useful < 2
-                else "medium" if _fund_useful < 4
-                else "high"
-            )
+            # Data coverage level drives compact low-data report behavior.
+            _data_coverage_count = count_valid_fundamental_fields(fund)
+            _data_coverage_level = classify_data_coverage_level(_data_coverage_count)
+            _low_data_compact_mode = _data_coverage_level in ("technical_only", "low")
 
             # ── collect: Analyst Consensus (DeepCrawl primary, yfinance fill) ─
             # Pre-seed from fund dict (get_fundamentals runs its own sequential yfinance)
@@ -3290,6 +3306,15 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 analyst_consensus = fund.get('analyst_consensus', '')
             if not analyst_count:
                 analyst_count = fund.get('analyst_count')
+
+            _data_coverage_count = count_valid_fundamental_fields(
+                fund,
+                dc_data,
+                analyst_target=analyst_target,
+                forward_pe=forward_pe,
+            )
+            _data_coverage_level = classify_data_coverage_level(_data_coverage_count)
+            _low_data_compact_mode = _data_coverage_level in ("technical_only", "low")
 
             # ── EisaX News Engine: inject as PRIMARY source (highest quality) ────
             # The engine has curated GCC/MENA + global financial news updated every 15min.
@@ -4187,7 +4212,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
         _peer_rows = []  # always initialized — populated below if US stock with known peers
         _non_us_suffixes = (".SR", ".AE", ".DU", ".CA", ".KW", ".QA", ".BH")
         _is_us_stock_for_peers = not target.upper().endswith(_non_us_suffixes)
-        _us_peers = _us_peer_map.get(target.upper(), []) if _is_us_stock_for_peers else []
+        _us_peers = [] if _low_data_compact_mode else (_us_peer_map.get(target.upper(), []) if _is_us_stock_for_peers else [])
         if _us_peers:
             try:
                 import yfinance as yf
@@ -4463,7 +4488,7 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
         # Gives DeepSeek real investor sentiment from X/Twitter in the last 48h.
         # If Grok call failed, _x_data is empty → block is skipped silently.
         _x_block = ""
-        if _x_data and _x_data.get("sentiment") and _x_data.get("source") != "grok-unavailable":
+        if not _low_data_compact_mode and _x_data and _x_data.get("sentiment") and _x_data.get("source") != "grok-unavailable":
             _xs   = _x_data.get("sentiment", "")
             _xsc  = _x_data.get("score", 0.0)
             _xsum = _x_data.get("x_summary", "")
@@ -4512,7 +4537,7 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
             from query_engine import QueryEngine as _QE
             _qe2 = _QE(_pc, _pf)
             _peer_sector = fund.get("sector", "")
-            if _peer_sector and target.upper().endswith((".SR", ".AE", ".DU", ".CA", ".KW", ".QA", ".BH")):
+            if not _low_data_compact_mode and _peer_sector and target.upper().endswith((".SR", ".AE", ".DU", ".CA", ".KW", ".QA", ".BH")):
                 _peer_df = _qe2.cross_market(_peer_sector)
                 if _peer_df is not None and not _peer_df.empty:
                     if "market_cap_basic" in _peer_df.columns:
@@ -4573,7 +4598,10 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
                     _etf_meta_early, target, real_price or 0, change_pct or 0,
                     summary, fg_data, macro=_etf_macro_live, var_95=var_95, max_dd=max_dd
                 )
-                _etf_scenarios = _build_etf_sc(_etf_meta_early["etf_type"], real_price or 100, _etf_macro_live)
+                if _low_data_compact_mode:
+                    _etf_scenarios = "ETF scenarios disabled in low-data compact mode."
+                else:
+                    _etf_scenarios = _build_etf_sc(_etf_meta_early["etf_type"], real_price or 100, _etf_macro_live)
                 data_block = _etf_db + "\n\n" + _etf_scenarios
                 logger.info(f"[ETF] {target}: replaced data_block with ETF-specific version ({_etf_meta_early['etf_type']})")
                 # Set sector for ETF if missing — ensures news filter and report show correct sector
@@ -4602,6 +4630,15 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
                     fund["sector"] = _etf_sector_map.get(_etf_meta_early["etf_type"], "ETF")
         except Exception as _etf_db_e:
             logger.debug(f"[ETF] data_block override skipped: {_etf_db_e}")
+
+        data_block = compact_low_data_generation_inputs(
+            data_block,
+            {
+                "coverage_count": _data_coverage_count,
+                "coverage_level": _data_coverage_level,
+                "low_data_mode": _low_data_compact_mode,
+            },
+        )
 
         # ── 5b. Pre-calculate Positioning (used in prompt) ──────────────────
         import math as _math_ep
@@ -4919,8 +4956,22 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
                     _sc_display_ticker, _etf_meta, real_price, _etf_score_result, summary,
                     resolved_ticker=target
                 )
-                scorecard_verdict_hint = f"{_etf_score_result['verdict']} {_etf_score_result['emoji']} (Conviction: {('High' if _etf_score_result['score']>=75 else 'Medium' if _etf_score_result['score']>=60 else 'Low')})"
+                _etf_conv = ('High' if _etf_score_result['score'] >= 75
+                             else 'Medium' if _etf_score_result['score'] >= 60 else 'Low')
+                scorecard_verdict_hint = f"{_etf_score_result['verdict']} {_etf_score_result['emoji']} (Conviction: {_etf_conv})"
                 logger.info(f"[ETF Scorecard] {target}: {scorecard_verdict_hint} score={_etf_score_result['score']}")
+                # Mirror _last_scorecard_decision so _handle_analytics has structured data
+                _etf_v = _etf_score_result['verdict']
+                _etf_et = ('REDUCE INTO STRENGTH' if _etf_v in ('REDUCE', 'SELL', 'AVOID')
+                           else 'BUY NOW — trend confirmed' if _etf_v == 'BUY' else 'WAIT')
+                self._last_scorecard_decision = {
+                    'verdict':   _etf_v,
+                    'timing_en': _etf_et,
+                    'timing':    _etf_et,
+                    'score':     _etf_score_result['score'],
+                    'conviction': _etf_conv,
+                    'emoji':     _etf_score_result['emoji'],
+                }
             else:
                 # ── Stock path (original) ─────────────────────────────────────
                 _pre_scorecard_md = self._build_scorecard_md(
@@ -4953,6 +5004,10 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
             logger.warning(f"[ScorecardHint] exception for {target}: {_sve}")
             _pre_scorecard_md = ""
             scorecard_verdict_hint = None  # Do not default to HOLD on error
+
+        # ── Read structured decision from scorecard (set by _build_scorecard_md) ──
+        # This is the single source of truth — no regex on markdown needed downstream.
+        _scorecard_decision = getattr(self, '_last_scorecard_decision', {})
 
         _scv_parts = (scorecard_verdict_hint or '').split()
         _scorecard_verdict = (_scv_parts[0].upper() if _scv_parts else '') or 'UNKNOWN'
@@ -5119,7 +5174,7 @@ RESEARCH CONTEXT ({_dt.now().strftime("%B %Y")}):
                         "   Format: \"vs [PEER_TICKER]: [valuation sentence]. [competitive position sentence].\"\n"
                         "   Example: \"vs NVDA: AMD trades at 24x fwd P/E vs NVDA's 35x — a 31% discount. AMD leads in CPU market share but lags NVDA's data center GPU dominance (NVDA holds ~80% market share vs AMD ~15%).\"\n"
                         "   ⛔ Do NOT write more than 2 sentences. ⛔ Do NOT include any rating or recommendation.\n"
-                        "   ✅ If peer valuation inputs are missing, explicitly state 'N/A' or 'data unavailable'. Never invent peer numbers.\n"
+                        "   ✅ If peer valuation inputs are missing, explicitly state 'N/A' or 'data coverage is partial'. Never invent peer numbers.\n"
                         "   ⛔ If you truly cannot compare, name the peer and compare qualitatively (margins, growth, market share).\n"
                         "   ⚡ PEER SELECTION: Choose the MOST RELEVANT competitor — for cloud/software companies this may be AMZN (AWS) or META, not necessarily GOOGL. For UAE/Saudi companies compare to the closest regional peer."
                     )
@@ -5130,17 +5185,29 @@ RESEARCH CONTEXT ({_dt.now().strftime("%B %Y")}):
                     _data_mode_block = (
                         "\n🔴 DATA COVERAGE ALERT: FUNDAMENTAL DATA LIMITED\n"
                         "⛔ COMPACT REPORT MODE — MANDATORY:\n"
-                        "- Executive Summary MUST open with: \"⚠️ Fundamental data is largely unavailable — this analysis relies primarily on technical signals.\"\n"
-                        "- Section 2 (Fundamental Analysis): Write 2-3 sentences MAX. State which metrics ARE available. Then: \"Full fundamental analysis is not possible with available data.\"\n"
-                        "- Section 5: Write \"No analyst coverage or consensus data available.\" — do not invent price targets.\n"
-                        "- Section 6 (Peer Comparison): Write \"Peer comparison unavailable — insufficient data coverage for this market.\" — do not invent peer data.\n"
+                        "- Executive Summary MUST open with: \"⚠️ Fundamental data coverage is limited — this analysis relies primarily on price behavior.\"\n"
+                        "- Section 2 (Fundamental Analysis): Write 2-3 sentences MAX. State which metrics ARE available. Then: \"Fundamental visibility is limited; analysis relies primarily on price behavior.\"\n"
+                        "- Section 5: Write \"Analyst consensus and valuation scenarios are disabled in low-data mode.\" Do not create valuation tables.\n"
+                        "- Section 6 (Peer Comparison): Write \"Peer comparison is disabled in low-data mode because fundamental coverage is limited.\" Do not create peer tables.\n"
+                        "- Section 9: Write one concise scenario-sensitivity sentence only. Do not create scenario tables.\n"
+                        "- This overrides any later instruction asking for valuation ranges, peer comparison, or scenario tables.\n"
+                        "- Avoid strong BUY/SELL wording; describe technical moves as positive or negative momentum that requires confirmation.\n"
                         "- Total memo body: maximum 600 words. Be concise.\n"
                     )
 
                 # ── Conviction anchor: cascade Low conviction to all sections ──────────
                 _conviction_anchor_block = ""
                 _scorecard_conviction_level_safe = locals().get("_scorecard_conviction_level", "Medium")
-                _eisax_score_int = int(_eisax_score) if (isinstance(_eisax_score, str) and _eisax_score.isdigit()) else (int(_eisax_score) if isinstance(_eisax_score, int) else 0)
+                # Parse score from _pre_scorecard_md (already built) — _eisax_score is
+                # only defined AFTER this try block, so we cannot reference it here.
+                _eisax_score_int = 0
+                try:
+                    import re as _re_sc_early
+                    _esc_m = _re_sc_early.search(r'EisaX Score:\s*\*\*(\d+)/100\*\*', _pre_scorecard_md)
+                    if _esc_m:
+                        _eisax_score_int = int(_esc_m.group(1))
+                except Exception:
+                    pass
                 if _scorecard_conviction_level_safe == "Low" or _eisax_score_int < 60:
                     _conviction_anchor_block = (
                         f"\n⚠️ LOW CONVICTION SIGNAL: EisaX Score={_eisax_score_int}/100, Conviction={_scorecard_conviction_level_safe}\n"
@@ -5217,7 +5284,7 @@ Your tone MUST follow Fundamental Verdict — not Entry Timing:
 - ⛔ NEVER write a bullish Executive Summary when Fundamental Verdict = REDUCE/SELL.
 
 🔴 LANGUAGE QUALITY RULES:
-- ⛔ NEVER use boilerplate phrases like "according to recent analyst data", "market observers note", "analysts suggest", or "industry experts believe" — these are empty filler. Use the ACTUAL data provided or state explicitly that the data is unavailable.
+- ⛔ NEVER use boilerplate phrases like "according to recent analyst data", "market observers note", "analysts suggest", or "industry experts believe" — these are empty filler. Use the ACTUAL data provided or state explicitly that data coverage is partial.
 - ⛔ NEVER cite a news source that is NOT in the LATEST NEWS section of the data below. Do NOT reference "The Times of India", "Hindustan Times", regional newspapers, blogs, or any outlet from your training knowledge. If you cite a source, it MUST appear verbatim in the LATEST NEWS section.
 - ⛔ NEVER invent or paraphrase headlines not present in the LATEST NEWS data. If no relevant news exists, say "No relevant headlines at time of analysis."
 - ⛔ BE CONSISTENT on valuation: if the Scorecard labels Forward P/E as "🟢 Reasonable", do NOT describe the same P/E as "elevated" in the memo body. Use the same label throughout.
@@ -5442,6 +5509,9 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     _max_tokens = 4500
                     _mode_instruction = ""
 
+                if _low_data_compact_mode:
+                    _max_tokens = min(_max_tokens, 1600)
+
                 if _mode_instruction:
                     prompt = _mode_instruction + "\n\n" + prompt
 
@@ -5493,6 +5563,23 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     r'(\*\*DATE:\*\*\s*)(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+20\d{2}',
                     r'\g<1>' + correct_date, deepseek_reply
                 )
+                if deepseek_reply:
+                    deepseek_reply = apply_language_locks(
+                        deepseek_reply,
+                        {
+                            "coverage_count": _data_coverage_count,
+                            "coverage_level": _data_coverage_level,
+                            "low_data_mode": _low_data_compact_mode,
+                            "recommendation": _scorecard_verdict,
+                            "final_action": (
+                                "WAIT / NO ACTION"
+                                if _low_data_compact_mode and _scorecard_verdict == "HOLD"
+                                else "WATCHLIST / WAIT FOR ENTRY"
+                                if _low_data_compact_mode and _scorecard_verdict == "BUY"
+                                else _scorecard_verdict
+                            ),
+                        },
+                    )
         except Exception as e:
             import traceback
             logger.error(f"[Analytics] DeepSeek failed: {e}")
@@ -6099,7 +6186,7 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             logger.debug(f"[EntryQuality] failed: {_eq_ex}")
             _eq_score2, _eq_label2, _eq_note2 = 50, 'N/A', ''
 
-        # ── Final Technical Signal ─────────────────────────────────────────────
+        # ── Technical Signal (Supporting) ─────────────────────────────────────
         from core.services.scorecard_engine import classify_adx as _sc_classify_adx
         _trend_bull  = bool(real_price and sma200 and real_price > sma200)
         _macd_bull   = float(summary.get('macd', 0) or 0) > float(summary.get('macd_signal', 0) or 0)
@@ -6125,6 +6212,11 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             _final_sig, _final_sig_emoji = "Strong Sell",  "🔴"
         else:
             _final_sig, _final_sig_emoji = "Weak Sell",    "⚠️"
+        if _low_data_compact_mode:
+            if "Buy" in _final_sig:
+                _final_sig, _final_sig_emoji = "Positive momentum (low-data reliability)", "⚠️"
+            elif "Sell" in _final_sig:
+                _final_sig, _final_sig_emoji = "Negative momentum (low-data reliability)", "⚠️"
 
         # ── Market Regime Label ───────────────────────────────────────────────
         _fg_score_r  = int((fg_data or {}).get('score', 50) or 50)
@@ -6145,7 +6237,7 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         )
         _final_tech_block = (
             f"\n\n---\n"
-            f"📡 **Final Technical Signal: {_final_sig} {_final_sig_emoji}**\n"
+            f"📡 **Technical Signal (Supporting): {_final_sig} {_final_sig_emoji}**\n"
             f"*({_trend_lbl} + {_macd_lbl} + {_adx_lbl})*\n"
         )
 
@@ -6322,59 +6414,104 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                         break
                 deepseek_reply = "".join(_kept).strip()
 
-            def _build_quick_view(full_report: str, ticker: str, scorecard_md: str = "") -> str:
-                """Compact 3-line snapshot — verdict · deterministic insight · one risk. Full report follows."""
-                import re as _re_qv
+            def _enforce_verdict_consistency(text: str, verdict: str) -> str:
+                """
+                Strip / relabel banned phrases that contradict the locked verdict.
+                Applied once after LLM output, before Quick View rendering.
+                Returns cleaned text (never raises).
+                """
+                import re as _re_ev
+                v = (verdict or 'HOLD').upper()
 
-                # ── Line 1: Verdict — use outer-scope verdict_sc / _entry_timing ──
-                # These are already resolved by Rule 8A and the decision engine.
-                # Fallback to scorecard markdown regex only if outer scope unavailable.
-                _lbl_fundamental = "الأساسيات:" if _is_arabic_request else "Fundamental:"
-                _lbl_timing      = "التوقيت:"   if _is_arabic_request else "Timing:"
-                _lbl_conviction  = "الثقة:"     if _is_arabic_request else "Conviction:"
-                _lbl_score       = "درجة EisaX:" if _is_arabic_request else "EisaX Score:"
+                # Phrase → safe replacement (preserves tone, kills contradiction)
+                _BUY_PHRASES = [
+                    (r'\bstrong(?:ly)?\s+buy\b',          'consider accumulating'),
+                    (r'\baggressive(?:ly)?\s+entr[yies]+\b','measured entry'),
+                    (r'\baccumulate\s+aggressively\b',     'accumulate gradually'),
+                    (r'\badd\s+(?:more\s+)?exposure\b',    'maintain exposure'),
+                    (r'\bupside\s+breakout\b',             'technical improvement'),
+                    (r'\blong\s+position(?:ing)?\b',       'position monitoring'),
+                ]
+                _SELL_PHRASES = [
+                    (r'\bstrong(?:ly)?\s+(?:bullish|uptrend)\b', 'consolidating'),
+                    (r'\bupside\s+(?:target|breakout|momentum)\b','recovery potential'),
+                    (r'\bbullish\s+momentum\b',                   'momentum shift'),
+                    (r'\badd\s+(?:to\s+)?(?:position|exposure)\b','monitor closely'),
+                ]
 
                 try:
-                    _outer_verdict  = verdict_sc   # from outer _build_scorecard_md scope
-                    _outer_timing   = _entry_timing
-                    _outer_conv     = conviction
-                    _outer_score    = final
-                    _outer_emoji    = emoji
+                    if v in ('HOLD', 'WAIT'):
+                        for pat, repl in _BUY_PHRASES:
+                            text = _re_ev.sub(pat, repl, text, flags=_re_ev.IGNORECASE)
+                        for pat, repl in _SELL_PHRASES[:1]:   # only worst offender for HOLD
+                            text = _re_ev.sub(pat, repl, text, flags=_re_ev.IGNORECASE)
+                    elif v in ('REDUCE', 'SELL', 'AVOID'):
+                        for pat, repl in _SELL_PHRASES:
+                            text = _re_ev.sub(pat, repl, text, flags=_re_ev.IGNORECASE)
+                        for pat, repl in _BUY_PHRASES:
+                            text = _re_ev.sub(pat, repl, text, flags=_re_ev.IGNORECASE)
+                except Exception:
+                    pass  # never corrupt the report
+                return text
+
+            def _build_quick_view(
+                full_report: str,
+                ticker: str,
+                scorecard_md: str = "",
+                final_action_line: str = "",
+                decision_data: dict = None,
+                is_arabic: bool = False,
+            ) -> str:
+                """Compact snapshot — verdict · Final Action · deterministic insight · one risk."""
+                import re as _re_qv
+                _ar = is_arabic
+
+                _lbl_fundamental = "الأساسيات:" if _ar else "Fundamental:"
+                _lbl_timing      = "التوقيت:"   if _ar else "Timing:"
+                _lbl_conviction  = "الثقة:"     if _ar else "Conviction:"
+                _lbl_score       = "درجة EisaX:" if _ar else "EisaX Score:"
+
+                # ── Line 1: Verdict — built from structured decision_data ─────────
+                # decision_data is passed by the caller from self._last_scorecard_decision;
+                # NO closure dependency on _build_scorecard_md locals.
+                dd = decision_data or {}
+                if dd:
                     _verdict_display = (
-                        f"**{ticker} | {_lbl_fundamental} {_outer_verdict} {_outer_emoji}"
-                        f" | {_lbl_timing} {_outer_timing}"
-                        f" | {_lbl_conviction} {_outer_conv}"
-                        f" | {_lbl_score} {_outer_score}/100**"
+                        f"**{ticker}"
+                        f" | {_lbl_fundamental} {dd.get('verdict','HOLD')} {dd.get('emoji','')}"
+                        f" | {_lbl_timing} {dd.get('timing','WAIT')}"
+                        f" | {_lbl_conviction} {dd.get('conviction','Medium')}"
+                        f" | {_lbl_score} {dd.get('score',0)}/100**"
                     )
-                except NameError:
-                    # Fallback: parse from scorecard markdown
+                else:
+                    # No structured data — minimal informative fallback (never "Analysis Complete")
                     _vl = ""
                     if scorecard_md:
                         _vm = _re_qv.search(
-                            r'\*\*' + _re_qv.escape(ticker) + r'\*\*.*?EisaX Score.*?\d+/100',
+                            r'\*\*' + _re_qv.escape(ticker) + r'\*\*[^*]*EisaX Score.*?\d+/100',
                             scorecard_md
                         )
                         if _vm:
                             _vl = _re_qv.sub(r'[*`]', '', _vm.group(0)).strip()
-                    _verdict_display = f"**{_vl}**" if _vl else f"**{ticker} | Analysis Complete**"
+                    if not _vl:
+                        # Last resort: show ticker + score unavailable (no "Analysis Complete")
+                        _vl = f"{ticker} | Score: Unavailable — displaying core metrics only"
+                    _verdict_display = f"**{_vl}**"
 
                 # ── Line 2: Deterministic quick insight from interpretation labels ──
+                _qv_verdict = dd.get('verdict', 'HOLD') if dd else 'HOLD'
                 try:
                     from core.services.phrase_builder import build_quick_insight
-
-                    # Pass the resolved verdict so the phrase reflects BUY+WAIT, not HOLD
                     _qv_decision = {
-                        'verdict':      verdict_sc,
+                        'verdict':      _qv_verdict,
                         'verdict_type': 'Tactical',
                         'constraints':  getattr(_de_result, 'get', lambda k, d=None: d)('constraints', [])
                                         if '_de_result' in dir() else [],
                     }
-                    _qv_snapshot = {"ticker": ticker}
-                    _insight = build_quick_insight(_qv_snapshot, _interpretation_labels or {}, _qv_decision)
+                    _insight = build_quick_insight({"ticker": ticker}, _interpretation_labels or {}, _qv_decision)
                 except Exception as _qv_err:
                     logger.debug("[QuickView] deterministic insight failed: %s", _qv_err)
                     _insight = ""
-                    # Fallback: extract first sentence from Executive Summary
                     _clean = _re_qv.sub(
                         r'MEMORANDUM.*?(?:^---\s*$|\n---\s*\n)',
                         '', full_report[:3000], flags=_re_qv.DOTALL | _re_qv.MULTILINE
@@ -6390,7 +6527,8 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     if not _insight:
                         _plain = _re_qv.sub(r'[#*`>]', '', _clean)
                         _sents = _re_qv.split(r'(?<=[.!?])\s+', _plain.strip())
-                        _insight = _sents[0] if _sents else f"{ticker} analysis complete."
+                        # Never produce "analysis complete" — show data-tied note instead
+                        _insight = _sents[0] if _sents else f"Core metrics displayed for {ticker}."
 
                 # ── Line 3: Top risk label from Section 4 ────────────────────────
                 _risk_patterns = [
@@ -6427,58 +6565,30 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 _insight = ' '.join(_insight.splitlines()).strip()
                 _top_risk = ' '.join(_top_risk.splitlines()).strip()
 
-                # ── Final Action label (Fundamental × Entry Timing) ───────────
-                # This is the single user-facing action — all sections must agree.
-                try:
-                    _locked_v   = (verdict_sc or 'HOLD').upper()
-                    _locked_et  = (_entry_timing or 'WAIT').upper()
-                    if _locked_v in ('REDUCE', 'SELL', 'AVOID'):
-                        _final_action = '🔴 REDUCE / RISK CONTROL'
-                    elif _locked_v == 'BUY' and 'WAIT' in _locked_et:
-                        _final_action = '🟡 WATCHLIST / WAIT FOR ENTRY'
-                    elif _locked_v == 'BUY':
-                        _final_action = '🟢 BUY — Entry Confirmed'
-                    elif _locked_v == 'HOLD' and 'WAIT' in _locked_et:
-                        _final_action = '⚪ WAIT / NO ACTION'
-                    else:
-                        _final_action = '⚪ HOLD — Monitor'
-                    if _is_arabic_request:
-                        _final_action_ar = {
-                            '🔴 REDUCE / RISK CONTROL':      '🔴 تخفيض / إدارة مخاطر',
-                            '🟡 WATCHLIST / WAIT FOR ENTRY': '🟡 قائمة مراقبة / انتظر نقطة دخول',
-                            '🟢 BUY — Entry Confirmed':      '🟢 شراء — نقطة دخول مؤكدة',
-                            '⚪ WAIT / NO ACTION':           '⚪ انتظر / لا إجراء',
-                            '⚪ HOLD — Monitor':             '⚪ احتفظ — مراقبة',
-                        }.get(_final_action, _final_action)
-                        _final_action = _final_action_ar
-                    _final_action_line = (
-                        f"**{'القرار النهائي' if _is_arabic_request else 'Final Action'}:** {_final_action}"
-                    )
-                except Exception:
-                    _final_action_line = ""
+                # ── Final Action label — passed in from outer scope ────────────
+                # Computed in the calling scope where verdict_sc / _entry_timing
+                # are definitively available; passed as `final_action_line` param.
+                _final_action_line = final_action_line
 
-                # ── Contradiction guard for insight line ──────────────────────
-                # If insight text implies an action that contradicts the locked
-                # verdict, relabel it as a supporting technical signal only.
+                # ── Contradiction guard: relabel insight if it conflicts verdict ──
                 try:
-                    _locked_v_g = (verdict_sc or 'HOLD').upper()
-                    _buy_re  = _re_qv.compile(
+                    _buy_re = _re_qv.compile(
                         r'\b(strong buy|buy now|accumulate|add to position|tactical buy|long position)\b',
                         _re_qv.IGNORECASE,
                     )
-                    _red_re  = _re_qv.compile(
+                    _red_re = _re_qv.compile(
                         r'\b(reduce|sell|trim|underweight|exit|short)\b',
                         _re_qv.IGNORECASE,
                     )
-                    _insight_conflict = False
-                    if _locked_v_g in ('HOLD', 'WAIT') and (_buy_re.search(_insight) or _red_re.search(_insight)):
-                        _insight_conflict = True
-                    if _locked_v_g == 'BUY' and _red_re.search(_insight):
-                        _insight_conflict = True
-                    if _locked_v_g in ('REDUCE', 'SELL', 'AVOID') and _buy_re.search(_insight):
-                        _insight_conflict = True
-                    if _insight_conflict:
-                        _ts_label = 'إشارة تقنية' if _is_arabic_request else 'Technical Signal'
+                    _conflict = False
+                    if _qv_verdict in ('HOLD', 'WAIT') and (_buy_re.search(_insight) or _red_re.search(_insight)):
+                        _conflict = True
+                    if _qv_verdict == 'BUY' and _red_re.search(_insight):
+                        _conflict = True
+                    if _qv_verdict in ('REDUCE', 'SELL', 'AVOID') and _buy_re.search(_insight):
+                        _conflict = True
+                    if _conflict:
+                        _ts_label = 'إشارة تقنية (داعمة)' if _ar else 'Technical Signal (Supporting)'
                         _insight = f"[{_ts_label}] {_insight}"
                 except Exception:
                     pass
@@ -6489,14 +6599,21 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 if _insight:
                     _lines.append(f"💡 {_insight}")
                 if _top_risk:
-                    _lines.append(f"⚠️ Top Risk: {_top_risk}")
+                    _lines.append(f"⚠️ {'أبرز مخاطر' if _ar else 'Top Risk'}: {_top_risk}")
 
-                _qv_trailer = "\n\n---\n📄 *التقرير الكامل أدناه*\n" if _is_arabic_request else "\n\n---\n📄 *Full report below*\n"
+                _qv_trailer = "\n\n---\n📄 *التقرير الكامل أدناه*\n" if _ar else "\n\n---\n📄 *Full report below*\n"
                 return (
-                    f"## ⚡ {'نظرة سريعة' if _is_arabic_request else 'Quick View'} — {ticker}\n\n"
+                    f"## ⚡ {'نظرة سريعة' if _ar else 'Quick View'} — {ticker}\n\n"
                     + "\n\n".join(_lines)
                     + _qv_trailer
                 )
+
+            # ── Fix 3: Verdict consistency enforcer (post-LLM, pre-Quick View) ─
+            try:
+                _ev_verdict = (_scorecard_decision.get('verdict') or verdict_sc or 'HOLD')
+                deepseek_reply = _enforce_verdict_consistency(deepseek_reply, _ev_verdict)
+            except Exception as _ev_err:
+                logger.debug("[VerdictEnforcer] skipped: %s", _ev_err)
 
             # ── Apply interpretation guard before rendering Quick View ────────
             try:
@@ -6519,7 +6636,43 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             except Exception as _guard_err:
                 logger.debug("[QuickView] interpretation guard skipped: %s", _guard_err)
 
-            quick_view = _build_quick_view(deepseek_reply, target, _pre_scorecard_md if '_pre_scorecard_md' in dir() else "")
+            # ── Compute Final Action from structured _scorecard_decision ─────
+            # No regex — data comes directly from self._last_scorecard_decision.
+            try:
+                _fa_v  = (_scorecard_decision.get('verdict') or verdict_sc or 'HOLD').upper()
+                _fa_et = (_scorecard_decision.get('timing_en') or 'WAIT').upper()
+                if _fa_v in ('REDUCE', 'SELL', 'AVOID'):
+                    _outer_fa = '🔴 REDUCE / RISK CONTROL'
+                elif _fa_v == 'BUY' and 'WAIT' in _fa_et:
+                    _outer_fa = '🟡 WATCHLIST / WAIT FOR ENTRY'
+                elif _fa_v == 'BUY':
+                    _outer_fa = '🟢 BUY — Entry Confirmed'
+                elif _fa_v == 'HOLD' and 'WAIT' in _fa_et:
+                    _outer_fa = '⚪ WAIT / NO ACTION'
+                else:
+                    _outer_fa = '⚪ HOLD — Monitor'
+                if _is_arabic_request:
+                    _outer_fa = {
+                        '🔴 REDUCE / RISK CONTROL':      '🔴 تخفيض / إدارة مخاطر',
+                        '🟡 WATCHLIST / WAIT FOR ENTRY': '🟡 قائمة مراقبة / انتظر نقطة دخول',
+                        '🟢 BUY — Entry Confirmed':      '🟢 شراء — نقطة دخول مؤكدة',
+                        '⚪ WAIT / NO ACTION':           '⚪ انتظر / لا إجراء',
+                        '⚪ HOLD — Monitor':             '⚪ احتفظ — مراقبة',
+                    }.get(_outer_fa, _outer_fa)
+                _lbl_fa = 'القرار النهائي' if _is_arabic_request else 'Final Action'
+                _outer_final_action_line = f"**{_lbl_fa}:** {_outer_fa}"
+                logger.debug("[QuickView] Final Action: v=%s et=%s → %s", _fa_v, _fa_et, _outer_fa)
+            except Exception as _ofa_err:
+                logger.debug("[QuickView] Final Action compute failed: %s", _ofa_err)
+                _outer_final_action_line = ""
+
+            quick_view = _build_quick_view(
+                deepseek_reply,
+                target,
+                decision_data=_scorecard_decision,
+                final_action_line=_outer_final_action_line,
+                is_arabic=_is_arabic_request,
+            )
             final_reply = quick_view + "\n\n---\n## 📋 Full Report\n\n" + deepseek_reply
         # ── 7. Build Final Reply ───────────────────────────────────────────────
         if deepseek_reply:
