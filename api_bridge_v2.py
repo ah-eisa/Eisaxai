@@ -1111,6 +1111,58 @@ async def staging_public_analyze(
         )
 
 
+@app.get("/staging-api/chart-data")
+@limiter.limit("60/minute")
+async def staging_chart_data(request: Request, ticker: str = ""):
+    """
+    Public price history for Chart.js rendering on the staging frontend.
+    Returns {dates, prices, ticker} for the last 60 trading days.
+    No auth required — rate-limited to 60/min per IP.
+    """
+    _ensure_staging_public_enabled()
+    ticker = (ticker or "").strip().upper()
+    if not ticker or len(ticker) > 20:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    import yfinance as _yf
+    import math as _m
+    from datetime import datetime as _dt, timedelta as _td
+
+    df = None
+    # ── yfinance (works for US, Egypt .CA, Saudi .SR, some Gulf) ────────────
+    try:
+        _end   = _dt.now()
+        _start = _end - _td(days=90)
+        _df = await run_in_threadpool(
+            lambda: _yf.download(ticker, start=_start, end=_end, progress=False, auto_adjust=True)
+        )
+        if _df is not None and not _df.empty:
+            df = _df
+    except Exception:
+        pass
+
+    # ── Fallback: pipeline cache (last single point — skip for chart) ─────────
+    # Only useful for US fallback; for MENA we tried yfinance above.
+
+    if df is None or df.empty:
+        return JSONResponse({"error": "No historical data available", "ticker": ticker})
+
+    tail = df.tail(60)
+    _col = "Close" if "Close" in tail.columns else tail.columns[0]
+    _dates_raw  = list(tail.index)
+    _prices_raw = [float(v) for v in tail[_col].values]
+
+    dates  = [d.strftime("%b %d") for d, p in zip(_dates_raw, _prices_raw)
+              if not (_m.isnan(p) or _m.isinf(p))]
+    prices = [round(p, 3)        for p in _prices_raw
+              if not (_m.isnan(p) or _m.isinf(p))]
+
+    if not prices:
+        return JSONResponse({"error": "No valid price data", "ticker": ticker})
+
+    return {"dates": dates, "prices": prices, "ticker": ticker}
+
+
 @app.get("/staging-api/quick")
 @limiter.limit("60/minute")
 async def staging_quick_snapshot(request: Request, q: str = ""):
