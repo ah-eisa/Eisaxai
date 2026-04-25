@@ -1111,6 +1111,137 @@ async def staging_public_analyze(
         )
 
 
+@app.get("/staging-api/quick")
+@limiter.limit("60/minute")
+async def staging_quick_snapshot(request: Request, q: str = ""):
+    """
+    Fast pipeline-cache snapshot for a ticker — returns in <2s.
+    Used by the frontend to show Quick View while full analysis loads.
+
+    Returns: ticker, name, market, price, change, rsi, sma200,
+             pe_ratio, div_yield, market_cap, sector, rsi_signal,
+             sma_signal, quick_signal (BULLISH/NEUTRAL/BEARISH)
+    """
+    _ensure_staging_public_enabled()
+    q = (q or "").strip().upper()
+    if not q or len(q) > 20:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    try:
+        from pipeline import CacheManager as _QC
+        import math as _qm
+
+        _MARKETS_SUFFIX = {
+            "uae": ".AE", "ksa": ".SR", "egypt": ".CA",
+            "kuwait": ".KW", "qatar": ".QA", "bahrain": ".BH",
+            "morocco": ".MA", "tunisia": ".TN",
+            "america": "", "crypto": "-USD",
+        }
+
+        def _vf(v):
+            try:
+                f = float(v)
+                return None if (_qm.isnan(f) or _qm.isinf(f) or f == 0) else f
+            except (TypeError, ValueError):
+                return None
+
+        qcm = _QC()
+        # Strip suffix to get bare ticker for cache lookup
+        bare = q.split("-")[0]
+        for sfx in (".AE", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN"):
+            if bare.endswith(sfx):
+                bare = bare[: -len(sfx)]
+                break
+
+        row = None
+        mkt_found = None
+        for mkt, sfx in _MARKETS_SUFFIX.items():
+            df, _ = qcm.get_latest(mkt)
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+            df["_bare"] = df["ticker"].astype(str).str.split(":").str[-1].str.upper()
+            hits = df[df["_bare"] == bare]
+            if not hits.empty:
+                row = hits.iloc[0].to_dict()
+                mkt_found = mkt
+                break
+
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Ticker '{q}' not found in pipeline cache")
+
+        sfx = _MARKETS_SUFFIX.get(mkt_found, "")
+        full_ticker = bare + sfx
+
+        price  = _vf(row.get("close"))
+        change = round(float(row.get("change") or 0), 2)
+        rsi    = _vf(row.get("RSI"))
+        sma50  = _vf(row.get("SMA50"))
+        sma200 = _vf(row.get("SMA200"))
+        pe     = _vf(row.get("price_earnings_ttm"))
+        divy   = _vf(row.get("dividend_yield_recent"))
+        mc     = _vf(row.get("market_cap_basic"))
+        sector = str(row.get("sector") or "").strip() or None
+        macd   = _vf(row.get("MACD.macd"))
+        macd_s = _vf(row.get("MACD.signal"))
+
+        # RSI signal
+        if rsi is not None:
+            if rsi < 30:
+                rsi_signal = "oversold"
+            elif rsi > 70:
+                rsi_signal = "overbought"
+            else:
+                rsi_signal = "neutral"
+        else:
+            rsi_signal = "unknown"
+
+        # SMA200 signal
+        if price and sma200:
+            sma_signal = "above" if price > sma200 else "below"
+        else:
+            sma_signal = "unknown"
+
+        # Simple composite quick signal (3 independent signals → majority vote)
+        _bull, _bear = 0, 0
+        if rsi_signal == "oversold":      _bull += 1
+        elif rsi_signal == "overbought":  _bear += 1
+        if sma_signal == "above":         _bull += 1
+        elif sma_signal == "below":       _bear += 1
+        if macd is not None and macd_s is not None:
+            if macd > macd_s:  _bull += 1
+            else:              _bear += 1
+        if change > 1.5:       _bull += 0.5
+        elif change < -1.5:    _bear += 0.5
+
+        if _bull >= 2:         quick_signal = "BULLISH"
+        elif _bear >= 2:       quick_signal = "BEARISH"
+        else:                  quick_signal = "NEUTRAL"
+
+        return {
+            "ticker":      full_ticker,
+            "name":        str(row.get("name") or bare),
+            "market":      mkt_found.upper() if mkt_found else "UNKNOWN",
+            "price":       round(price, 4) if price else None,
+            "change":      change,
+            "rsi":         round(rsi, 1) if rsi else None,
+            "rsi_signal":  rsi_signal,
+            "sma50":       round(sma50, 4) if sma50 else None,
+            "sma200":      round(sma200, 4) if sma200 else None,
+            "sma_signal":  sma_signal,
+            "pe_ratio":    round(pe, 2) if pe else None,
+            "div_yield":   round(divy, 2) if divy else None,
+            "market_cap":  round(mc / 1e9, 2) if mc else None,
+            "sector":      sector,
+            "quick_signal": quick_signal,
+        }
+    except HTTPException:
+        raise
+    except Exception as _qe:
+        logger.warning("[quick] error for %s: %s", q, _qe)
+        raise HTTPException(status_code=500, detail="Quick snapshot unavailable")
+
+
 @app.post("/staging-api/lead")
 @limiter.limit("20/minute")
 async def staging_public_lead(request: Request, payload: StagingLeadPayload):
