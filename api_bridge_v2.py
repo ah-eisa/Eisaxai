@@ -403,6 +403,10 @@ def _staging_extract_verdict(markdown: str, report_kind: str, result_type: str =
         ]
     else:
         verdict_patterns = [
+            # Quick View headline: "Fundamental: HOLD 🟡" / "الأساسيات: REDUCE"
+            r'\bFundamental:\s*\*?\*?\s*(BUY|HOLD|SELL|REDUCE|AVOID|ACCUMULATE|WATCHLIST)\b',
+            r'\bالأساسيات:\s*\*?\*?\s*(BUY|HOLD|SELL|REDUCE|AVOID|ACCUMULATE)\b',
+            # Scorecard / table cell fallback
             r"\|\s*(BUY|HOLD|SELL|WATCHLIST|ACCUMULATE|REDUCE)\b",
             r"\bVerdict Type:\s*([A-Za-z -]+)\b",
         ]
@@ -504,7 +508,7 @@ def _staging_extract_insights(markdown: str, report_kind: str, summary: str, res
     candidates = []
     tracked_lines = [
         _staging_extract_marked_line(markdown, ["Top Risk:", "Risk Level:", "Risk Profile:"]),
-        _staging_extract_marked_line(markdown, ["Final Technical Signal:", "Decision Discipline Layer", "Alpha driver:"]),
+        _staging_extract_marked_line(markdown, ["Technical Signal (Supporting):", "Decision Discipline Layer", "Alpha driver:"]),
         _staging_extract_marked_line(markdown, ["Next Earnings:", "NEAR-TERM CATALYST", "Decision Boundary:"]),
     ]
     for line in tracked_lines:

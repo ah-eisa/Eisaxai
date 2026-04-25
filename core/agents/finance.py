@@ -1907,14 +1907,6 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
 
             sc_data['bullish_count'] = _bullish_c
             sc_data['bearish_count'] = _bearish_c
-            
-            import logging
-            logging.warning(f"SC_DEBUG {sc_data.get('ticker')}: "
-                            f"beta={sc_data.get('beta')}, "
-                            f"bearish_c={sc_data.get('bearish_count')}, "
-                            f"bullish_c={sc_data.get('bullish_count')}, "
-                            f"sma200={sc_data.get('sma200')}, "
-                            f"price={sc_data.get('price')}")
             result = calculate_score(sc_data)
             if not result:
                 return ""
@@ -6948,20 +6940,54 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 return {"type": "chat.reply", "reply": final_reply, "data": {"agent": "finance"}}
 
         # ── 8. Fallback: structured reply without DeepSeek ─────────────────────
-        verdict = ("ACCUMULATE" if summary['trend'] == "Bullish" and summary['momentum'] == "Bullish"
-                   else "REDUCE" if summary['trend'] == "Bearish" and summary['momentum'] == "Bearish"
-                   else "HOLD")
+        # Use scorecard decision if available, else derive from summary signals
+        _fb_sd = getattr(self, '_last_scorecard_decision', {})
+        verdict = (_fb_sd.get('verdict') or
+                   ("ACCUMULATE" if summary['trend'] == "Bullish" and summary['momentum'] == "Bullish"
+                    else "REDUCE" if summary['trend'] == "Bearish" and summary['momentum'] == "Bearish"
+                    else "HOLD"))
+        _fb_score     = _fb_sd.get('score', 0)
+        _fb_timing_en = _fb_sd.get('timing_en', 'WAIT')
+        _fb_emoji     = _fb_sd.get('emoji', '🟡')
+        _fb_conv      = _fb_sd.get('conviction', 'Medium')
+
+        # Build Final Action for fallback
+        _fb_v_up = verdict.upper()
+        _fb_et_up = _fb_timing_en.upper()
+        if _fb_v_up in ('REDUCE', 'SELL', 'AVOID'):
+            _fb_fa = '🔴 REDUCE / RISK CONTROL'
+        elif _fb_v_up == 'BUY' and 'WAIT' in _fb_et_up:
+            _fb_fa = '🟡 WATCHLIST / WAIT FOR ENTRY'
+        elif _fb_v_up == 'BUY':
+            _fb_fa = '🟢 BUY — Entry Confirmed'
+        elif 'WAIT' in _fb_et_up:
+            _fb_fa = '⚪ WAIT / NO ACTION'
+        else:
+            _fb_fa = '⚪ HOLD — Monitor'
+
+        # Quick View block — always present, even in fallback
+        _fb_qv = (
+            f"## ⚡ Quick View — {target}\n\n"
+            f"**{target} | Fundamental: {verdict} {_fb_emoji}"
+            f" | Timing: {_fb_timing_en}"
+            f" | Conviction: {_fb_conv}"
+            f" | EisaX Score: {_fb_score}/100**\n\n"
+            f"**Final Action:** {_fb_fa}\n\n"
+            f"💡 Full analysis unavailable — displaying core metrics only.\n\n"
+            f"---\n📄 *Full report below*\n\n"
+        )
+
         reply = (
-            header +
-            f"## Fundamentals\n"
+            header + _fb_qv +
+            f"## Core Metrics\n\n"
+            f"### Fundamentals\n"
             f"- Revenue Growth: {_P(fund.get('revenue_growth'))} | EPS Growth: {_P(fund.get('eps_growth'))}\n"
             f"- Net Margin: {_P(fund.get('net_margin'))} | ROE: {_P(fund.get('roe'))}\n"
             f"- P/E: {_X(fund.get('pe_ratio'))} | EV/EBITDA: {_X(fund.get('ev_ebitda'))}\n"
             f"- Market Cap: {_B(fund.get('market_cap'))} | Cash: {_B(fund.get('cash'))}\n\n"
-            f"## Technicals\n"
+            f"### Technicals\n"
             f"- Trend: {summary['trend']} | RSI: {summary['rsi']:.1f} | MACD: {summary['momentum']}\n"
-            f"- VaR(95%): {var_95*100:.2f}% | Max DD: {max_dd*100:.2f}%\n\n"
-            f"**EisaX Verdict: {verdict}**"
+            f"- VaR(95%): {var_95*100:.2f}% | Max DD: {max_dd*100:.2f}%"
         )
 
         # Fact-check block (fallback)
