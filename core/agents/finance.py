@@ -3223,6 +3223,24 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             _data_coverage_level = classify_data_coverage_level(_data_coverage_count)
             _low_data_compact_mode = _data_coverage_level in ("technical_only", "low")
 
+            # ── MENA Pipeline Override ────────────────────────────────────────
+            # TradingView cache provides real fundamentals for regional stocks.
+            # Count pipeline fields explicitly; if ≥4 present → medium coverage.
+            if _cache_row and target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN")) and _data_coverage_level in ("technical_only", "low"):
+                _tv_valid = sum(1 for v in [
+                    fund.get('pe_ratio') if fund.get('pe_ratio') else None,
+                    fund.get('eps') if fund.get('eps') else None,
+                    fund.get('market_cap') if fund.get('market_cap') else None,
+                    str(fund.get('sector', '')) if str(fund.get('sector', '')).lower() not in ('', 'unknown', 'n/a') else None,
+                    fund.get('dividend_yield') if fund.get('dividend_yield') else None,
+                    fund.get('sma200') if fund.get('sma200') else None,
+                    fund.get('rsi') if float(fund.get('rsi') or 0) > 0 else None,
+                ] if v is not None)
+                if _tv_valid >= 4:
+                    _data_coverage_level = "medium"
+                    _low_data_compact_mode = False
+                    logger.info("[DataCoverage] %s: pipeline cache %d fields → medium coverage", target, _tv_valid)
+
             # ── collect: Analyst Consensus (DeepCrawl primary, yfinance fill) ─
             # Pre-seed from fund dict (get_fundamentals runs its own sequential yfinance)
             analyst_target = fund.get('analyst_target') or None
@@ -3329,6 +3347,24 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
             )
             _data_coverage_level = classify_data_coverage_level(_data_coverage_count)
             _low_data_compact_mode = _data_coverage_level in ("technical_only", "low")
+
+            # ── MENA Pipeline Override ────────────────────────────────────────
+            # TradingView cache provides real fundamentals for regional stocks.
+            # Count pipeline fields explicitly; if ≥4 present → medium coverage.
+            if _cache_row and target.upper().endswith((".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN")) and _data_coverage_level in ("technical_only", "low"):
+                _tv_valid = sum(1 for v in [
+                    fund.get('pe_ratio') if fund.get('pe_ratio') else None,
+                    fund.get('eps') if fund.get('eps') else None,
+                    fund.get('market_cap') if fund.get('market_cap') else None,
+                    str(fund.get('sector', '')) if str(fund.get('sector', '')).lower() not in ('', 'unknown', 'n/a') else None,
+                    fund.get('dividend_yield') if fund.get('dividend_yield') else None,
+                    fund.get('sma200') if fund.get('sma200') else None,
+                    fund.get('rsi') if float(fund.get('rsi') or 0) > 0 else None,
+                ] if v is not None)
+                if _tv_valid >= 4:
+                    _data_coverage_level = "medium"
+                    _low_data_compact_mode = False
+                    logger.info("[DataCoverage] %s: pipeline cache %d fields → medium coverage", target, _tv_valid)
 
             # ── EisaX News Engine: inject as PRIMARY source (highest quality) ────
             # The engine has curated GCC/MENA + global financial news updated every 15min.

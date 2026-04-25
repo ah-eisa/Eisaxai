@@ -3682,6 +3682,87 @@ async def download_file(request: Request, token: str, user=Depends(_require_jwt)
 
     return FileResponse(file_path, filename=token_entry["filename"])
 
+@app.get("/v1/autocomplete")
+async def autocomplete_tickers(q: str = "", limit: int = 12):
+    """
+    Search pipeline cache for ticker/name matches.
+    Returns up to `limit` results matching the query prefix.
+    Used by the frontend autocomplete dropdown.
+    """
+    q = (q or "").strip()
+    if not q or len(q) > 25:
+        return {"results": []}
+    try:
+        import sys as _sys_ac, os as _os_ac
+        _sys_ac.path.insert(0, _os_ac.path.dirname(_os_ac.path.abspath(__file__)))
+        from pipeline import CacheManager as _ACCache
+        _ac_cache = _ACCache()
+        q_up = q.upper()
+
+        _SUFFIX = {
+            "uae": ".AE", "ksa": ".SR", "egypt": ".CA",
+            "kuwait": ".KW", "qatar": ".QA", "bahrain": ".BH",
+            "morocco": ".MA", "tunisia": ".TN",
+            "america": "", "crypto": "-USD", "commodities": "",
+        }
+
+        seen_tickers: set = set()
+        results: list = []
+
+        def _extract_rows(df, mkt: str, mask) -> None:
+            sfx = _SUFFIX.get(mkt, "")
+            for _, row in df[mask].iterrows():
+                bare = row["_bare"]
+                full = f"{bare}{sfx}" if sfx else bare
+                if full in seen_tickers:
+                    continue
+                seen_tickers.add(full)
+                results.append({
+                    "ticker": full,
+                    "name":   str(row.get("name", bare)),
+                    "market": mkt.upper(),
+                    "price":  round(float(row.get("close", 0) or 0), 3),
+                    "change": round(float(row.get("change", 0) or 0), 2),
+                })
+
+        _markets = ["uae", "ksa", "egypt", "kuwait", "qatar", "bahrain",
+                    "morocco", "tunisia", "america", "crypto"]
+
+        # ── Pass 1: prefix matches (startswith) ──────────────────────────────
+        _dfs: dict = {}
+        for mkt in _markets:
+            if len(results) >= limit:
+                break
+            _df, _ = _ac_cache.get_latest(mkt)
+            if _df is None or _df.empty:
+                continue
+            _df = _df.copy()
+            _df["_bare"] = _df["ticker"].astype(str).str.split(":").str[-1].str.upper()
+            _name_col   = _df["name"].astype(str).str.upper()
+            _mask = _df["_bare"].str.startswith(q_up) | _name_col.str.startswith(q_up)
+            _extract_rows(_df[_mask].head(5), mkt, slice(None))
+            _dfs[mkt] = _df  # cache for pass 2
+
+        # ── Pass 2: substring matches (contains) — fills remaining slots ─────
+        if len(results) < limit:
+            for mkt in _markets:
+                if len(results) >= limit:
+                    break
+                _df = _dfs.get(mkt)
+                if _df is None:
+                    _df_raw, _ = _ac_cache.get_latest(mkt)
+                    if _df_raw is None or _df_raw.empty:
+                        continue
+                    _df = _df_raw.copy()
+                    _df["_bare"] = _df["ticker"].astype(str).str.split(":").str[-1].str.upper()
+                _name_col = _df["name"].astype(str).str.upper()
+                _mask2 = _df["_bare"].str.contains(q_up, na=False) | _name_col.str.contains(q_up, na=False)
+                _extract_rows(_df[_mask2].head(4), mkt, slice(None))
+
+        return {"results": results[:limit]}
+    except Exception as _ace:
+        return {"results": []}
+
 @app.get("/v1/brain/status")
 @limiter.limit("30/minute")
 async def brain_status(request: Request, access_token: str = Header(None, alias="X-API-Key")):
