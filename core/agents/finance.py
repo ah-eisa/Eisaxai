@@ -1926,9 +1926,17 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 from core.services.interpretation_engine import (
                     build_interpretation_labels as _build_interp_labels_de,
                 )
+                _de_price   = float(sc_data.get('price') or 0)
+                _de_sma200  = float(sc_data.get('sma200') or 0)
+                _de_avgvol  = float(sc_data.get('avg_volume') or 0)
                 _de_labels = _build_interp_labels_de(
                     adx=float(sc_data.get('adx') or 0),
                     rsi=float(sc_data.get('rsi') or 50),
+                    price=_de_price,
+                    entry_price=_de_sma200 or None,    # SMA200 as entry-zone reference
+                    div_yield=float(sc_data.get('dividend_yield') or 0) or None,
+                    volume_today=_de_avgvol or None,   # proxy; gives "normal" conviction
+                    volume_avg=_de_avgvol or None,
                 )
                 _upside_for_de = (
                     (sc_data['target'] - sc_data['price']) / sc_data['price'] * 100
