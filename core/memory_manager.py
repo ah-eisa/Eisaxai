@@ -551,14 +551,13 @@ def extract_and_save_user_facts(user_id: str, message: str, reply: str):
             break
 
     # ── AI-powered deep extraction (runs in background thread — non-blocking) ──
+    # Uses DeepSeek directly — Gemini keys are currently unavailable.
     def _ai_extract_bg():
         try:
-            from google import genai as _genai
-            import json as _json
-            _api_key = os.getenv("GEMINI_API_KEY", "")
-            if not _api_key:
+            import json as _json, os as _os_mem, requests as _req_mem
+            _ds_key = _os_mem.getenv("DEEPSEEK_API_KEY", "")
+            if not _ds_key:
                 return
-            _gc = _genai.Client(api_key=_api_key)
             _prompt = (
                 "Extract user facts from this conversation. Return ONLY valid JSON, no markdown.\n"
                 f"User: {message[:500]}\nAssistant: {reply[:800]}\n\n"
@@ -567,12 +566,18 @@ def extract_and_save_user_facts(user_id: str, message: str, reply: str):
                 '"sector_focus":null,"investment_goal":null,"time_horizon":null,'
                 '"preferred_markets":null,"language":"ar or en"}'
             )
-            from google.genai import types as _gt
-            _cfg = _gt.GenerateContentConfig(max_output_tokens=300, temperature=0.1)
-            _resp = _gc.models.generate_content(
-                model="gemini-2.0-flash", contents=_prompt, config=_cfg
+            _r = _req_mem.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
+                json={"model": "deepseek-chat",
+                      "messages": [{"role": "user", "content": _prompt}],
+                      "max_tokens": 300, "temperature": 0.1},
+                timeout=10,
             )
-            _text = (_resp.text or "").strip().replace("```json","").replace("```","").strip()
+            _text = (_r.json().get("choices", [{}])[0]
+                              .get("message", {})
+                              .get("content", "") or "").strip()
+            _text = _text.replace("```json","").replace("```","").strip()
             if not _text:
                 return
             _facts = _json.loads(_text)

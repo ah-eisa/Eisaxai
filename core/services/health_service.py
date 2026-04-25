@@ -101,12 +101,25 @@ async def _check_gemini() -> ServiceResult:
             return _down("No Gemini API key configured", (time.monotonic() - t0) * 1000)
 
         def _probe(api_key: str) -> str:
-            from google import genai  # google-genai package
+            # Probe via DeepSeek (Gemini keys currently unavailable — 403)
+            import requests as _req_hs, os as _os_hs
+            _ds_key = _os_hs.getenv("DEEPSEEK_API_KEY", "")
+            if _ds_key:
+                _r = _req_hs.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
+                    json={"model": "deepseek-chat",
+                          "messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 3},
+                    timeout=8,
+                )
+                if _r.status_code == 200:
+                    return "DeepSeek probe ok"
+                raise ValueError(f"DeepSeek HTTP {_r.status_code}")
+            # Fallback: try Gemini (may fail with 403 if key expired)
+            from google import genai
             client = genai.Client(api_key=api_key)
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents="hi",
-            )
+            resp = client.models.generate_content(model="gemini-2.0-flash", contents="hi")
             text = resp.text
             if not text:
                 raise ValueError("Empty response text")

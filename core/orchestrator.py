@@ -315,7 +315,9 @@ class MultiAgentOrchestrator:
         except Exception:
             _gen_cfg = None
 
-        # ── ATTEMPT 1: Primary Model (Fast & Economical) ──
+        # ── ATTEMPT 1: Primary Model ──
+        # 403 = auth failure (bad/expired key) — no point retrying; skip immediately.
+        _gemini_403 = False
         try:
             resp = _retry(
                 lambda: self.gemini_client.models.generate_content(
@@ -327,11 +329,16 @@ class MultiAgentOrchestrator:
             )
             return (resp.text or "").strip()
         except Exception as e:
-            logger.warning("[Gemini] Primary (%s) failed%s: %s — attempting backup",
-                           GEMINI_MODEL, f" [{label}]" if label else "", e)
+            _err_str = str(e).lower()
+            if "403" in _err_str or "forbidden" in _err_str or "api_key_invalid" in _err_str:
+                _gemini_403 = True
+                logger.warning("[Gemini] Primary 403/auth — skipping backup, routing to DeepSeek")
+            else:
+                logger.warning("[Gemini] Primary (%s) failed%s: %s — attempting backup",
+                               GEMINI_MODEL, f" [{label}]" if label else "", e)
 
-        # ── ATTEMPT 2: Backup Model (Slower but More Capable) ──
-        if self.gemini_client_backup:
+        # ── ATTEMPT 2: Backup Model (skip if primary got 403 — same key/issue) ──
+        if self.gemini_client_backup and not _gemini_403:
             try:
                 resp = _retry(
                     lambda: self.gemini_client_backup.models.generate_content(
