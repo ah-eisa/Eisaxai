@@ -3710,23 +3710,13 @@ async def export_html_pdf(request: Request, payload: HtmlExportPayload, access_t
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── B2B Auth + Admin User Management (extracted to api/routes/auth.py) ────
+# JWT constants needed by admin login (lines above)
+from core.auth import JWT_SECRET, JWT_ALGORITHM, decode_token as _decode_token_for_resolve
+from core.user_db import init_users_table
+init_users_table()  # idempotent — creates users table if not exists
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  B2B AUTH  — /auth/*  and  /admin/*
-# ══════════════════════════════════════════════════════════════════════════════
-from core.auth    import hash_password, verify_password, create_token, decode_token, generate_temp_password, JWT_SECRET, JWT_ALGORITHM
-from core.user_db import (init_users_table, create_user, get_user_by_email,
-                           get_user_by_id, list_users, update_user, delete_user, record_login)
-
-# Initialise users table on startup (idempotent)
-init_users_table()
-
-def _require_admin(payload: dict = Depends(_require_jwt)) -> dict:
-    if payload.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admins only")
-    return payload
-
-
+# _resolve_user_context used by /v1/upload-portfolio
 def _resolve_user_context(
     access_token: Optional[str] = None,
     access_token_alt: Optional[str] = None,
@@ -3735,7 +3725,7 @@ def _resolve_user_context(
     bearer = (authorization or "").removeprefix("Bearer ").strip()
     if bearer and not bearer.startswith("eixa_") and bearer != SECURE_TOKEN:
         try:
-            payload = decode_token(bearer)
+            payload = _decode_token_for_resolve(bearer)
         except _jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expired")
         except _jwt.InvalidTokenError:
@@ -3754,211 +3744,8 @@ def _resolve_user_context(
     auth["role"] = "admin" if auth["user_id"] == "admin" else "user"
     return auth
 
-
-# ── Pydantic models ───────────────────────────────────────────────────────────
-class LoginRequest(BaseModel):
-    email:    str
-    password: str
-
-class ChangePasswordRequest(BaseModel):
-    old_password: str
-    new_password: str
-
-class CreateUserRequest(BaseModel):
-    email:    str
-    name:     str
-    role:     str = "user"   # "user" | "admin"
-
-class UpdateUserRequest(BaseModel):
-    name:      Optional[str] = None
-    role:      Optional[str] = None
-    is_active: Optional[int] = None
-
-
-class APIKeyCreateRequest(BaseModel):
-    name: str = "Default"
-    tier: str = "basic"
-    daily_limit: int = 0
-
-
-class APIKeyValidateRequest(BaseModel):
-    key: Optional[str] = None
-
-
-# ── Auth endpoints ─────────────────────────────────────────────────────────────
-@app.post("/auth/login")
-@limiter.limit("10/minute")
-async def auth_login(request: Request, body: LoginRequest):
-    user = get_user_by_email(body.email)
-    if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user["is_active"]:
-        raise HTTPException(status_code=403, detail="Account disabled")
-    record_login(user["id"])
-    token = create_token(
-        user["id"], user["email"], user["role"],
-        must_change=bool(user["must_change_pw"])
-    )
-    return {
-        "token":       token,
-        "must_change": bool(user["must_change_pw"]),
-        "name":        user["name"],
-        "role":        user["role"],
-    }
-
-
-@app.post("/auth/change-password")
-@limiter.limit("5/minute")
-async def auth_change_password(request: Request, body: ChangePasswordRequest, payload: dict = Depends(_require_jwt)):
-    user = get_user_by_id(int(payload["sub"]))
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if not verify_password(body.old_password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Wrong current password")
-    if len(body.new_password) < 8:
-        raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
-    update_user(user["id"], password_hash=hash_password(body.new_password), must_change_pw=0)
-    token = create_token(user["id"], user["email"], user["role"], must_change=False)
-    return {"token": token, "message": "Password changed"}
-
-
-@app.get("/auth/me")
-@limiter.limit("60/minute")
-async def auth_me(request: Request, payload: dict = Depends(_require_jwt)):
-    user = get_user_by_id(int(payload["sub"]))
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return {
-        "id":    user["id"],
-        "email": user["email"],
-        "name":  user["name"],
-        "role":  user["role"],
-    }
-
-
-@app.post("/v1/keys")
-@limiter.limit("20/minute")
-async def create_api_key(
-    request: Request,
-    body: APIKeyCreateRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-    authorization: str = Header(None, alias="Authorization"),
-):
-    from core.api_keys import generate_key
-
-    auth = _resolve_user_context(access_token, access_token_alt, authorization)
-    raw_key = generate_key(str(auth["user_id"]), body.name, body.tier, body.daily_limit)
-    return {
-        "key": raw_key,
-        "key_prefix": raw_key[:12],
-        "user_id": str(auth["user_id"]),
-        "name": body.name,
-        "tier": body.tier,
-        "daily_limit": body.daily_limit,
-        "method": auth["method"],
-    }
-
-
-@app.get("/v1/keys")
-@limiter.limit("20/minute")
-async def get_api_keys(
-    request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-    authorization: str = Header(None, alias="Authorization"),
-):
-    from core.api_keys import list_user_keys
-
-    auth = _resolve_user_context(access_token, access_token_alt, authorization)
-    return {
-        "user_id": str(auth["user_id"]),
-        "keys": list_user_keys(str(auth["user_id"])),
-    }
-
-
-@app.delete("/v1/keys/{key_id}")
-@limiter.limit("20/minute")
-async def delete_api_key(
-    request: Request,
-    key_id: int,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-    authorization: str = Header(None, alias="Authorization"),
-):
-    from core.api_keys import revoke_key
-
-    auth = _resolve_user_context(access_token, access_token_alt, authorization)
-    revoke_key(key_id, str(auth["user_id"]))
-    return {"ok": True, "key_id": key_id}
-
-
-@app.post("/v1/keys/validate")
-@limiter.limit("20/minute")
-async def validate_api_key_endpoint(
-    request: Request,
-    body: Optional[APIKeyValidateRequest] = None,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
-    authorization: str = Header(None, alias="Authorization"),
-):
-    resolved = _resolve_auth(
-        x_api_key=(body.key if body else None) or access_token,
-        access_token=access_token_alt,
-        authorization=authorization,
-    )
-    return {"valid": True, **resolved}
-
-
-# ── Admin endpoints ────────────────────────────────────────────────────────────
-@app.post("/admin/users")
-@limiter.limit("10/minute")
-async def admin_create_user(request: Request, body: CreateUserRequest, _: dict = Depends(_require_admin)):
-    if get_user_by_email(body.email):
-        raise HTTPException(status_code=409, detail="Email already exists")
-    temp_pw = generate_temp_password()
-    uid = create_user(
-        email=body.email,
-        name=body.name,
-        password_hash=hash_password(temp_pw),
-        role=body.role,
-        must_change_pw=True,
-    )
-    return {"id": uid, "email": body.email, "name": body.name, "temp_password": temp_pw}
-
-
-@app.get("/admin/users")
-@limiter.limit("30/minute")
-async def admin_list_users(request: Request, _: dict = Depends(_require_admin)):
-    return list_users()
-
-
-@app.patch("/admin/users/{user_id}")
-@limiter.limit("20/minute")
-async def admin_update_user(request: Request, user_id: int, body: UpdateUserRequest, _: dict = Depends(_require_admin)):
-    changes = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not update_user(user_id, **changes):
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"ok": True}
-
-
-@app.delete("/admin/users/{user_id}")
-@limiter.limit("10/minute")
-async def admin_delete_user(request: Request, user_id: int, _: dict = Depends(_require_admin)):
-    if not delete_user(user_id):
-        raise HTTPException(status_code=404, detail="User not found")
-    return {"ok": True}
-
-
-@app.post("/admin/users/{user_id}/reset-password")
-@limiter.limit("10/minute")
-async def admin_reset_password(request: Request, user_id: int, _: dict = Depends(_require_admin)):
-    user = get_user_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    temp_pw = generate_temp_password()
-    update_user(user_id, password_hash=hash_password(temp_pw), must_change_pw=1)
-    return {"temp_password": temp_pw}
+from api.routes.auth import router as auth_router
+app.include_router(auth_router)
 
 
 # ── Health Check ──────────────────────────────────────────────────────────────
