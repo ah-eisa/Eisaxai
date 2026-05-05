@@ -21,6 +21,7 @@ import uvicorn
 import io
 import jwt as _jwt
 import re as _re
+import copy as _copy
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -152,6 +153,11 @@ tts_service = TTSService()
 SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 _ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
 _STAGING_UPSTREAM_BASE = os.getenv("STAGING_UPSTREAM_BASE", "http://127.0.0.1:8000").rstrip("/")
+_STAGING_ADMIN_USERS = {
+    item.strip().lower()
+    for item in os.getenv("EISAX_ADMIN_USERS", "Admin,admin").split(",")
+    if item.strip()
+}
 _STAGING_LEADS_PATH = Path(
     os.getenv(
         "STAGING_LEADS_PATH",
@@ -165,6 +171,72 @@ _FILE_CACHE_DIR = str(FILE_CACHE_DIR)
 _FILE_STORE_TTL = 3600  # seconds
 _DOWNLOAD_TOKENS = {}
 os.makedirs(_FILE_CACHE_DIR, exist_ok=True)
+
+
+def _parse_guest_tokens() -> dict[str, str]:
+    """Map configured guest tokens to revocable usernames without exposing tokens."""
+    entries = []
+    if os.getenv("EISAX_GUEST_TOKEN"):
+        entries.append(f"guest:{os.getenv('EISAX_GUEST_TOKEN')}")
+    entries.extend(part.strip() for part in os.getenv("EISAX_GUEST_TOKENS", "").split(",") if part.strip())
+    tokens: dict[str, str] = {}
+    for idx, entry in enumerate(entries, start=1):
+        if ":" in entry:
+            username, token = entry.split(":", 1)
+        else:
+            username, token = f"guest_{idx}", entry
+        username = (username or f"guest_{idx}").strip()
+        token = (token or "").strip()
+        if token:
+            tokens[token] = username
+    return tokens
+
+
+def _resolve_guest_token(request: Request) -> Optional[str]:
+    supplied = (
+        request.headers.get("X-Guest-Token")
+        or request.query_params.get("guest_token")
+        or request.query_params.get("demo_token")
+        or ""
+    ).strip()
+    if not supplied:
+        return None
+    import hmac as _hmac
+    for configured, username in _parse_guest_tokens().items():
+        if _hmac.compare_digest(supplied, configured):
+            return username
+    return None
+
+
+def _resolve_staging_access(request: Request) -> dict:
+    auth_user = (request.headers.get("X-Auth-User") or "").strip()
+    token_user = _resolve_guest_token(request)
+    if token_user:
+        return {"role": "guest", "username": token_user, "demo": True, "method": "guest_token"}
+    if auth_user:
+        if auth_user.lower() in _STAGING_ADMIN_USERS:
+            return {"role": "admin", "username": auth_user, "demo": False, "method": "basic_auth"}
+        return {"role": "guest", "username": auth_user, "demo": True, "method": "basic_auth"}
+    # Preserve internal/backend callers that bypass the public nginx layer.
+    host = (request.headers.get("host") or "").lower()
+    client_host = getattr(request.client, "host", "") if request.client else ""
+    if host.startswith(("127.0.0.1", "localhost")) or client_host in {"127.0.0.1", "::1", "localhost"}:
+        return {"role": "admin", "username": "internal", "demo": False, "method": "internal"}
+    return {"role": "guest", "username": "public-demo", "demo": True, "method": "public"}
+
+
+def _is_guest_access(access_context: Optional[dict], restrict_for_trial: bool = False) -> bool:
+    return bool(restrict_for_trial or ((access_context or {}).get("role") == "guest"))
+
+
+def _safe_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except Exception:
+        return default
+
+
+_GUEST_LIMIT_MESSAGE = "This guest demo has reached its analysis limit. Please contact EisaX for extended access."
 
 def _evict_old_files():
     """Remove file cache entries older than TTL."""
@@ -308,1026 +380,27 @@ class PilotReportPayload(BaseModel):
     report_type: str = Field(..., min_length=4, max_length=32)
 
 
-class StagingLeadPayload(BaseModel):
-    email: str = Field(..., max_length=320)
-    name: Optional[str] = Field(default=None, max_length=120)
-    query: Optional[str] = Field(default=None, max_length=500)
-    report_kind: Optional[str] = Field(default=None, max_length=40)
-
-
-def _ensure_staging_public_enabled():
-    if _ENVIRONMENT != "staging":
-        raise HTTPException(status_code=404, detail="Not found")
-
-
-def _staging_client_id(request: Request) -> str:
-    raw_ip = (
-        request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        or request.headers.get("X-Real-IP")
-        or str(request.client.host)
-    )
-    safe_ip = _re.sub(r"[^0-9a-fA-F:.]", "", raw_ip) or "unknown"
-    return f"staging:{safe_ip}"
-
-
-def _staging_proxy_headers() -> dict:
-    return {"X-API-Key": SECURE_TOKEN}
-
-
-def _staging_clean_text(text: str) -> str:
-    cleaned = str(text or "")
-    cleaned = _re.sub(r"```.*?```", " ", cleaned, flags=_re.S)
-    cleaned = _re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", cleaned)
-    cleaned = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
-    cleaned = cleaned.replace("|", " ")
-    cleaned = _re.sub(r"[#>*_`]+", " ", cleaned)
-    cleaned = _re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
-
-
-def _staging_extract_section(markdown: str, markers: list[str]) -> str:
-    lines = (markdown or "").splitlines()
-    for idx, line in enumerate(lines):
-        normalized = _staging_clean_text(line).lower()
-        if not normalized:
-            continue
-        if any(marker.lower() in normalized for marker in markers):
-            chunk = []
-            for next_line in lines[idx + 1:]:
-                if next_line.strip().startswith("#"):
-                    break
-                chunk.append(next_line)
-            body = "\n".join(chunk).strip()
-            if body:
-                return body
-    return ""
-
-
-def _staging_extract_sentences(text: str) -> list[str]:
-    sentences = []
-    for raw in _re.split(r"(?<=[.!?])\s+", _staging_clean_text(text)):
-        candidate = raw.strip(" -")
-        if len(candidate) >= 40 and candidate not in sentences:
-            sentences.append(candidate)
-    return sentences
-
-
-def _staging_extract_marked_line(markdown: str, patterns: list[str]) -> Optional[str]:
-    for line in (markdown or "").splitlines():
-        cleaned = _staging_clean_text(line)
-        if not cleaned:
-            continue
-        lowered = cleaned.lower()
-        if any(pattern.lower() in lowered for pattern in patterns):
-            return cleaned
-    return None
-
-
-def _staging_extract_verdict(markdown: str, report_kind: str, result_type: str = "") -> str:
-    # ── Construction results use a dedicated vocabulary ──────────────────
-    if result_type == "construction":
-        md = markdown or ""
-        if _re.search(r"CONDITIONAL APPROVAL", md, _re.I):
-            return "CONDITIONAL APPROVAL"
-        if _re.search(r"EXCEEDS RISK|exceeds.*drawdown|drawdown.*exceeds", md, _re.I):
-            return "EXCEEDS RISK LIMIT"
-        if _re.search(r"APPROVED|within mandate|within.*constraint", md, _re.I):
-            return "PORTFOLIO READY"
-        return "WITHIN MANDATE"
-
-    if report_kind == "portfolio":
-        verdict_patterns = [
-            r"\bRating:\s*(Conservative|Balanced|Aggressive|Speculative)\b",
-            r"\bRisk Level:\s*([A-Za-z-]+)\b",
-            r"\bRisk Profile:\s*([A-Za-z-]+)\b",
-        ]
-    else:
-        verdict_patterns = [
-            # Quick View headline: "Fundamental: HOLD 🟡" / "الأساسيات: REDUCE"
-            r'\bFundamental:\s*\*?\*?\s*(BUY|HOLD|SELL|REDUCE|AVOID|ACCUMULATE|WATCHLIST)\b',
-            r'\bالأساسيات:\s*\*?\*?\s*(BUY|HOLD|SELL|REDUCE|AVOID|ACCUMULATE)\b',
-            # Scorecard / table cell fallback
-            r"\|\s*(BUY|HOLD|SELL|WATCHLIST|ACCUMULATE|REDUCE)\b",
-            r"\bVerdict Type:\s*([A-Za-z -]+)\b",
-        ]
-    for pattern in verdict_patterns:
-        match = _re.search(pattern, markdown or "", flags=_re.I)
-        if match:
-            return match.group(1).strip().upper() if report_kind == "stock" else match.group(1).strip()
-    return "Analysis Ready" if report_kind == "stock" else "Portfolio Review Ready"
-
-
-def _staging_extract_confidence(markdown: str) -> Optional[str]:
-    percent_match = _re.search(r"\bConfidence:\s*(\d+%)", markdown or "", flags=_re.I)
-    if percent_match:
-        return percent_match.group(1)
-    conviction_match = _re.search(r"\bConviction:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
-    if conviction_match:
-        return conviction_match.group(1).strip().title()
-    return None
-
-
-def _staging_extract_risk_level(markdown: str) -> Optional[str]:
-    top_risk = _re.search(r"Top Risk:\s*.*?Severity:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
-    if top_risk:
-        return top_risk.group(1).strip().title()
-    total_risk = _re.search(r"Risk profile \(total beta\):\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
-    if total_risk:
-        return total_risk.group(1).strip().title()
-    risk_level = _re.search(r"\bRisk Level:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
-    if risk_level:
-        return risk_level.group(1).strip().title()
-    risk_profile = _re.search(r"\bRisk Profile:\s*([A-Za-z-]+)", markdown or "", flags=_re.I)
-    if risk_profile:
-        return risk_profile.group(1).strip().title()
-    return None
-
-
-def _staging_extract_summary(markdown: str, report_kind: str, result_type: str = "") -> str:
-    # ── Construction: pull from Portfolio Overview / Strategy Readiness ──────
-    if result_type == "construction":
-        overview = _staging_extract_section(markdown, ["Portfolio Overview", "Strategy Readiness"])
-        for paragraph in _re.split(r"\n\s*\n", overview or ""):
-            cleaned = _staging_clean_text(paragraph)
-            # skip tables, bullets, headings, short lines
-            if cleaned and len(cleaned) > 40 and not cleaned.startswith("|") and not cleaned.startswith("-") and not cleaned.startswith("#"):
-                # Return max 2 sentences
-                sentences = _re.findall(r"[^.!?]+[.!?]+", cleaned)
-                return " ".join(sentences[:2]).strip() or cleaned[:280]
-        # Fallback: first meaningful line from whole report
-        for line in (markdown or "").splitlines():
-            c = _staging_clean_text(line)
-            if c and len(c) > 40 and not c.startswith("|") and not c.startswith("-") and not c.startswith("#"):
-                return c[:280]
-        return "Portfolio constructed and ready for review."
-
-    markers = ["Executive Summary", "Executive Assessment"]
-    section = _staging_extract_section(markdown, markers)
-    for paragraph in _re.split(r"\n\s*\n", section or markdown or ""):
-        cleaned = _staging_clean_text(paragraph)
-        if cleaned and not cleaned.lower().startswith("metric "):
-            return cleaned
-    return _staging_clean_text(markdown)[:280]
-
-
-def _staging_extract_insights(markdown: str, report_kind: str, summary: str, result_type: str = "") -> list[str]:
-    # ── Construction insights: return / volatility / concentration ───────────
-    if result_type == "construction":
-        insights: list[str] = []
-        # 1) Expected return
-        ret_m = _re.search(r"Expected Annual Return[:\s]+([0-9.]+%[^.\n]{0,60})", markdown or "", _re.I)
-        if ret_m:
-            insights.append("Expected annual return: " + ret_m.group(1).strip().rstrip(","))
-        # 2) Volatility / Sharpe / drawdown
-        vol_m = _re.search(r"Annual Volatility[:\s]+([0-9.]+%[^.\n]{0,80})", markdown or "", _re.I)
-        shr_m = _re.search(r"Sharpe Ratio[:\s]+([0-9.]+[^.\n]{0,60})", markdown or "", _re.I)
-        if vol_m and shr_m:
-            insights.append(f"Volatility {vol_m.group(1).strip().rstrip(',')} · Sharpe {shr_m.group(1).strip()}")
-        elif vol_m:
-            insights.append("Annual volatility: " + vol_m.group(1).strip().rstrip(","))
-        # 3) Concentration / correlation risk from the report
-        conc_m = _re.search(
-            r"(Concentration[^.\n]{10,120}|correlation[^.\n]{10,120}|Effective N[^.\n]{10,120})",
-            markdown or "", _re.I
-        )
-        if conc_m:
-            insights.append(_staging_clean_text(conc_m.group(1)))
-        # Fill with fallbacks if fewer than 3
-        fallbacks = [
-            "Allocation generated and ready for review.",
-            "Open the full report for detailed asset rationale.",
-            "Risk constraints and implementation plan included.",
-        ]
-        for fb in fallbacks:
-            if len(insights) >= 3:
-                break
-            if fb not in insights:
-                insights.append(fb)
-        return insights[:3]
-
-    candidates = []
-    tracked_lines = [
-        _staging_extract_marked_line(markdown, ["Top Risk:", "Risk Level:", "Risk Profile:"]),
-        _staging_extract_marked_line(markdown, ["Technical Signal (Supporting):", "Decision Discipline Layer", "Alpha driver:"]),
-        _staging_extract_marked_line(markdown, ["Next Earnings:", "NEAR-TERM CATALYST", "Decision Boundary:"]),
-    ]
-    for line in tracked_lines:
-        if line and line not in candidates:
-            candidates.append(line)
-    for sentence in _staging_extract_sentences(summary):
-        if sentence not in candidates:
-            candidates.append(sentence)
-    if report_kind == "portfolio":
-        portfolio_note = _staging_extract_marked_line(markdown, ["EisaX Risk Assessment", "Portfolio Assessment"])
-        if portfolio_note and portfolio_note not in candidates:
-            candidates.append(portfolio_note)
-    return candidates[:3] or [
-        "Live analysis completed and ready for deeper review.",
-        "Open the full report to inspect the detailed assumptions.",
-        "Use the email form below to request the institutional report.",
-    ]
-
-
-def _staging_prepare_query(query: str) -> str:
-    normalized = (query or "").strip()
-    if not normalized:
-        return normalized
-
-    analyze_match = _re.match(r"(?i)^analyze\s+(.+)$", normalized)
-    if analyze_match:
-        subject = analyze_match.group(1).strip()
-        return (
-            f"Analyze {subject} for an investment decision. "
-            "Respond in concise institutional tone and keep the answer under 350 words. "
-            "Include a clear BUY, HOLD, or SELL verdict, a short executive summary, risk level, "
-            "confidence if available, and exactly three key insights."
-        )
-
-    if _re.search(r"(?i)\bportfolio\b", normalized):
-        return (
-            f"{normalized}. Respond in institutional tone with a concise allocation rationale, risk framing, "
-            "and portfolio construction logic."
-        )
-
-    return normalized
-
-
-def _resolution_error_response(resolution: dict) -> JSONResponse:
-    status = resolution.get("resolution_status") or "unresolved"
-    normalized_query = resolution.get("normalized_query") or resolution.get("query_raw") or "this request"
-    if status == "ambiguous":
-        detail = f"'{normalized_query}' is ambiguous. Please specify the exact instrument."
-    else:
-        detail = f"Unable to resolve '{normalized_query}' safely. Please use the exact ticker."
-    payload = {"ok": False, "detail": detail, **resolution}
-    return JSONResponse(status_code=400, content=payload)
-
-
-_INTENT_ASSET_ANALYSIS = "asset_analysis"
-_INTENT_PORTFOLIO_ANALYSIS = "portfolio_analysis"
-_INTENT_PORTFOLIO_CONSTRUCTION = "portfolio_construction"
-_INTENT_FIXED_INCOME = "fixed_income"
-
-
-def _classify_request_intent(message: str, *, has_file: bool = False) -> str:
-    raw = (message or "").strip()
-    if has_file:
-        return _INTENT_PORTFOLIO_ANALYSIS
-    if not raw:
-        return _INTENT_ASSET_ANALYSIS
-
-    lowered = raw.lower()
-    portfolio_analysis_keywords = [
-        "upload",
-        "csv",
-        "xlsx",
-        "xls",
-        "my portfolio",
-        "my holdings",
-        "my positions",
-        "analyze portfolio",
-        "analyze my portfolio",
-        "portfolio analysis",
-        "portfolio review",
-        "portfolio risk",
-        "holdings analysis",
-        "upload portfolio",
-    ]
-    portfolio_analysis_keywords_ar = [
-        "محفظتي",
-        "محفظتى",
-        "حلل محفظتي",
-        "حلل محفظتى",
-        "تحليل محفظتي",
-        "تحليل محفظتى",
-        "ارفع",
-        "رفع ملف",
-        "csv",
-        "اكسل",
-        "إكسل",
-    ]
-    if any(keyword in lowered for keyword in portfolio_analysis_keywords):
-        return _INTENT_PORTFOLIO_ANALYSIS
-    if any(keyword in raw for keyword in portfolio_analysis_keywords_ar):
-        return _INTENT_PORTFOLIO_ANALYSIS
-
-    construction_keywords = [
-        "portfolio",
-        "build",
-        "create",
-        "construct",
-        "design",
-        "allocate",
-        "rebalance",
-        "re-balance",
-        "allocation",
-        "max down",
-        "max drawdown",
-        "risk tolerance",
-        "drawdown",
-        "aggressive",
-        "conservative",
-        "balanced",
-        "moderate",
-        "equities",
-        "stocks",
-        "saudi",
-        "us equities",
-        "american equities",
-    ]
-    construction_keywords_ar = [
-        "محفظة",
-        "محفظه",
-        "ابني",
-        "ابنى",
-        "ابنِ",
-        "كوّن",
-        "كون",
-        "خصص",
-        "خصّص",
-        "وزع",
-        "وزّع",
-        "أعد موازنة",
-        "اعد موازنة",
-        "موازنة",
-        "عدواني",
-        "عدوانيه",
-        "محافظ",
-        "متوازن",
-        "مخاطرة",
-        "مخاطر",
-    ]
-
-    english_hits = sum(1 for keyword in construction_keywords if keyword in lowered)
-    arabic_hits = sum(1 for keyword in construction_keywords_ar if keyword in raw)
-    if english_hits >= 2 or arabic_hits >= 1:
-        return _INTENT_PORTFOLIO_CONSTRUCTION
-
-    try:
-        from portfolio_pipeline import is_pipeline_request as _is_pipeline_request
-
-        if _is_pipeline_request(raw):
-            return _INTENT_PORTFOLIO_CONSTRUCTION
-    except Exception:
-        pass
-
-    # Fixed income / sukuk / bond / ISIN detection
-    try:
-        from core.fixed_income import is_fixed_income_query as _is_fi_query
-
-        if _is_fi_query(raw):
-            return _INTENT_FIXED_INCOME
-    except Exception:
-        pass
-
-    return _INTENT_ASSET_ANALYSIS
-
-
-def _portfolio_analysis_prompt_response(query: str) -> str:
-    subject = (query or "your portfolio").strip()
-    return (
-        "## Portfolio Analysis Intake\n\n"
-        f"To analyze {subject}, upload a CSV or Excel portfolio file and I will run a holdings-based risk and exposure review.\n\n"
-        "### Required next step\n"
-        "- Upload a `.csv`, `.xlsx`, or `.xls` file with your holdings.\n\n"
-        "### What the analysis will cover\n"
-        "- Position concentration and allocation gaps\n"
-        "- Risk exposure by asset and market\n"
-        "- Portfolio-level observations and next-step actions\n"
-    )
-
-
-def _should_resolve_direct_analysis_request(message: str) -> bool:
-    raw = (message or "").strip()
-    if not raw:
-        return False
-    if _classify_request_intent(raw) != _INTENT_ASSET_ANALYSIS:
-        return False
-    if not _re.search(
-        r"(?i)^\s*(?:please\s+)?(?:analyze|analysis of|full analysis of|quick analysis of|brief analysis of)\b",
-        raw,
-    ) and not _re.search(r"^\s*(?:حلل|حللي|حللى|تحليل)\b", raw):
-        return False
-
-    lowered = raw.lower()
-    blockers = [" and ", " vs ", " versus ", ",", "\n", "portfolio", "compare", "محفظة", "قارن"]
-    return not any(token in lowered for token in blockers)
-
-
-def _staging_shape_result(
-    *,
-    query: str,
-    report_text: str,
-    report_kind: str,
-    mode: str,
-    download_url: Optional[str] = None,
-    html_report: Optional[str] = None,
-    report_json: Optional[dict] = None,
-    resolution: Optional[dict] = None,
-    result_type: str = "",
-) -> dict:
-    summary = _staging_extract_summary(report_text, report_kind=report_kind, result_type=result_type)
-    confidence = _staging_extract_confidence(report_text)
-    payload = {
-        "ok": True,
-        "mode": mode,
-        "query": query,
-        "report_kind": report_kind,
-        "result_type": result_type or report_kind,
-        "summary": summary,
-        "verdict": _staging_extract_verdict(report_text, report_kind=report_kind, result_type=result_type),
-        "risk_level": _staging_extract_risk_level(report_text),
-        "confidence": confidence,
-        "insights": _staging_extract_insights(report_text, report_kind=report_kind, summary=summary, result_type=result_type),
-        "download_url": download_url,
-        "teaser": (report_text[:500] + "...") if len(report_text) > 500 else report_text,
-        "full_report": html_report or report_text,
-        "report_json": report_json,
-    }
-    if resolution:
-        payload["resolution"] = resolution
-    return payload
-
-
-def _staging_fallback_payload(query: str, file_name: Optional[str] = None) -> dict:
-    subject = file_name or query or "your request"
-    fallback_report = (
-        "## Agent Preview\n\n"
-        f"The live analysis service is temporarily unavailable, so this staging page is showing a fallback preview for {subject}.\n\n"
-        "### What You Can Expect\n"
-        "- Institutional summary with verdict and risk framing.\n"
-        "- Three key insights surfaced from the live agent workflow.\n"
-        "- A full report handoff path after lead capture.\n"
-    )
-    return _staging_shape_result(
-        query=query or f"Analyze {file_name}" if file_name else "Analyze request",
-        report_text=fallback_report,
-        report_kind="portfolio" if file_name else "stock",
-        mode="fallback",
-    )
-
-
-def _staging_proxy_chat(query: str, user_id: str) -> dict:
-    import requests as _requests
-
-    response = _requests.post(
-        f"{_STAGING_UPSTREAM_BASE}/v1/chat",
-        headers={**_staging_proxy_headers(), "Content-Type": "application/json"},
-        json={"message": _staging_prepare_query(query), "user_id": user_id},
-        timeout=120,
-    )
-    try:
-        body = response.json()
-    except Exception:
-        body = {"detail": response.text[:500]}
-    return {"status_code": response.status_code, "body": body}
-
-
-def _staging_proxy_upload(file_name: str, file_bytes: bytes, user_id: str) -> dict:
-    import requests as _requests
-
-    response = _requests.post(
-        f"{_STAGING_UPSTREAM_BASE}/v1/upload-portfolio",
-        headers=_staging_proxy_headers(),
-        files={"file": (file_name, file_bytes)},
-        data={"user_id": user_id},
-        timeout=120,
-    )
-    try:
-        body = response.json()
-    except Exception:
-        body = {"detail": response.text[:500]}
-    return {"status_code": response.status_code, "body": body}
-
-
-def _staging_upstream_error(status_code: int, body: dict, default_message: str) -> HTTPException:
-    if status_code == 429:
-        return HTTPException(status_code=429, detail="The live agent is busy right now. Please retry in a moment.")
-    if status_code == 413:
-        return HTTPException(status_code=413, detail="The uploaded file is too large for the current staging limit.")
-    if status_code == 400:
-        return HTTPException(status_code=400, detail=body.get("error") or body.get("detail") or default_message)
-    return HTTPException(status_code=502, detail=default_message)
-
-
-@app.get("/staging-api/health")
-@limiter.limit("30/minute")
-async def staging_public_health(request: Request):
-    _ensure_staging_public_enabled()
-    return {"status": "ok"}
-
-
-# ── Market Updates — public read, admin generate ──────────────────────────────
-
-@app.get("/staging-api/updates")
-@limiter.limit("60/minute")
-async def api_updates_latest(request: Request):
-    """Return latest daily + weekly updates with LinkedIn-formatted text."""
-    import json as _json
-    from core.services.market_updates import get_latest_updates
-    result = get_latest_updates()
-    if not result:
-        return JSONResponse({"daily": None, "weekly": None}, status_code=200)
-    print("DEBUG /api/updates response:", _json.dumps(result)[:1000])
-    return result
-
-
-@app.get("/staging-api/updates/daily")
-@limiter.limit("60/minute")
-async def api_updates_daily(request: Request):
-    from core.services.market_updates import get_latest_updates
-    result = get_latest_updates()
-    daily = result.get("daily")
-    if not daily:
-        return JSONResponse({"detail": "No daily update available yet"}, status_code=404)
-    return daily
-
-
-@app.get("/staging-api/updates/weekly")
-@limiter.limit("60/minute")
-async def api_updates_weekly(request: Request):
-    from core.services.market_updates import get_latest_updates
-    result = get_latest_updates()
-    weekly = result.get("weekly")
-    if not weekly:
-        return JSONResponse({"detail": "No weekly update available yet"}, status_code=404)
-    return weekly
-
-
-@app.post("/staging-api/updates/generate")
-@limiter.limit("5/minute")
-async def api_updates_generate(request: Request):
-    """Admin-only: trigger generation of daily + weekly updates."""
-    _require_admin_cookie(request)
-    import asyncio as _aio
-    from core.services.market_updates import generate_daily_update, generate_weekly_update
-    loop = _aio.get_event_loop()
-    daily  = await loop.run_in_executor(None, generate_daily_update)
-    weekly = await loop.run_in_executor(None, generate_weekly_update)
-    return {"status": "generated", "daily": daily, "weekly": weekly}
-
-
-@app.post("/staging-api/analyze")
-@limiter.limit("12/minute")
-async def staging_public_analyze(
-    request: Request,
-    query: str = Form(""),
-    symbol: str = Form(""),
-    skip_resolution: bool = Form(False),
-    report_language: str = Form("en"),
-    language: str = Form(""),
-    file: UploadFile = File(None),
-):
-    _ensure_staging_public_enabled()
-    normalized_query = (query or "").strip()
-    selected_symbol = (symbol or "").strip().upper()
-    preferred_language = (report_language or language or "en").strip().lower() or "en"
-    intent = _classify_request_intent(normalized_query, has_file=file is not None)
-    if not normalized_query and not file and not selected_symbol:
-        raise HTTPException(status_code=400, detail="Enter a request or upload a portfolio file.")
-
-    user_id = _staging_client_id(request)
-    try:
-        if file is not None:
-            file_bytes = await file.read()
-            live_payload = await run_in_threadpool(
-                _staging_proxy_upload,
-                file.filename or "portfolio.csv",
-                file_bytes,
-                user_id,
-            )
-            if live_payload["status_code"] >= 500:
-                raise RuntimeError(f"upstream upload error {live_payload['status_code']}")
-            if live_payload["status_code"] >= 400:
-                raise _staging_upstream_error(
-                    live_payload["status_code"],
-                    live_payload["body"],
-                    "Portfolio analysis is temporarily unavailable.",
-                )
-            report_text = live_payload["body"].get("analysis") or ""
-            if not report_text:
-                raise HTTPException(status_code=502, detail="Portfolio analysis returned no content.")
-            return _staging_shape_result(
-                query=normalized_query or f"Analyze {file.filename}",
-                report_text=report_text,
-                report_kind="portfolio",
-                mode="live",
-                download_url=None,
-            )
-
-        from core.services.entity_resolution import EntityResolution, is_exact_ticker, resolve_asset_entity
-        from core.services.market_route_handler import handle_stock_analysis as _handle_stock_analysis
-        from portfolio_builder import detect_and_build as _detect_and_build
-
-        if skip_resolution and selected_symbol:
-            exact_symbol = is_exact_ticker(selected_symbol)
-            if not exact_symbol:
-                return _resolution_error_response(
-                    {
-                        "query_raw": normalized_query or selected_symbol,
-                        "normalized_query": selected_symbol,
-                        "resolution_status": "unresolved",
-                    }
-                )
-            resolution = EntityResolution(
-                query_raw=normalized_query or selected_symbol,
-                normalized_query=selected_symbol,
-                resolution_status="resolved",
-                symbol=exact_symbol.symbol,
-                market=exact_symbol.market,
-                asset_type=exact_symbol.asset_type,
-                currency=exact_symbol.currency,
-                resolution_source="exact_symbol",
-                confidence="high",
-                name=exact_symbol.name,
-                local_name=exact_symbol.local_name,
-                exchange=exact_symbol.exchange,
-                universe_source=exact_symbol.source_tag,
-            )
-        elif intent == _INTENT_PORTFOLIO_ANALYSIS:
-            if not file:
-                return _staging_shape_result(
-                    query=normalized_query,
-                    report_text=_portfolio_analysis_prompt_response(normalized_query),
-                    report_kind="portfolio",
-                    mode="guided",
-                    download_url=None,
-                )
-        elif intent == _INTENT_PORTFOLIO_CONSTRUCTION:
-            logger.info(
-                "[intent-gate][staging] portfolio construction routed to builder: %s",
-                normalized_query,
-            )
-            report_text = await run_in_threadpool(_detect_and_build, normalized_query)
-            if not report_text:
-                raise HTTPException(status_code=502, detail="Portfolio builder returned no content.")
-            return _staging_shape_result(
-                query=normalized_query,
-                report_text=report_text,
-                report_kind="portfolio",
-                result_type="construction",
-                mode="live",
-                download_url=None,
-            )
-        elif intent == _INTENT_FIXED_INCOME:
-            logger.info(
-                "[intent-gate][staging] fixed-income query routed to finance agent: %s",
-                normalized_query,
-            )
-            try:
-                from core.agents.finance import FinancialAgent as _FinancialAgent
-
-                _fi_agent = _FinancialAgent()
-                _fi_result = await run_in_threadpool(
-                    _fi_agent.think,
-                    normalized_query,
-                    {"session_id": f"staging-fi-{int(_time.time() * 1000)}"},
-                    {"model": os.getenv("MODEL_NAME", "")},
-                )
-                report_text = _fi_result.get("reply") or ""
-                if not report_text:
-                    raise HTTPException(status_code=502, detail="Fixed income analysis returned no content.")
-                return _staging_shape_result(
-                    query=normalized_query,
-                    report_text=report_text,
-                    report_kind="fixed_income",
-                    result_type="fixed_income",
-                    mode="live",
-                    download_url=None,
-                )
-            except HTTPException:
-                raise
-            except Exception as _fi_err:
-                logger.error("[fixed-income][staging] error: %s", _fi_err, exc_info=True)
-                raise HTTPException(status_code=502, detail=f"Fixed income analysis failed: {_fi_err}")
-        else:
-            # ── Fast pre-route: local ticker index (O(1)) before LLM resolution ──
-            _idx_resolution: Optional[EntityResolution] = None
-            try:
-                from core.ticker_index import quick_scan as _quick_scan
-                _idx_hit = _quick_scan(normalized_query or selected_symbol)
-                if _idx_hit:
-                    _idx_resolution = EntityResolution(
-                        query_raw=normalized_query,
-                        normalized_query=_idx_hit.symbol,
-                        resolution_status="resolved",
-                        symbol=_idx_hit.symbol,
-                        market=_idx_hit.market,
-                        asset_type=_idx_hit.asset_type,
-                        currency=_idx_hit.currency,
-                        resolution_source="ticker_index",
-                        confidence="high",
-                        name=_idx_hit.name,
-                        exchange=_idx_hit.exchange,
-                    )
-                    logger.info(
-                        "[ticker_index] pre-routed '%s' → %s / %s (bypassing entity resolution)",
-                        normalized_query, _idx_hit.symbol, _idx_hit.market,
-                    )
-            except Exception as _idx_err:
-                logger.debug("[ticker_index] scan error (non-fatal): %s", _idx_err)
-                _idx_resolution = None
-
-            resolution = _idx_resolution or resolve_asset_entity(normalized_query)
-        resolution_payload = resolution.to_dict()
-        if not resolution.is_resolved:
-            logger.info("[entity-resolution] %s", resolution_payload)
-            return _resolution_error_response(resolution_payload)
-
-        stock_instruction = resolution.analysis_instruction
-        logger.info(
-            "[entity-resolution] raw='%s' normalized='%s' -> %s / %s via %s (%s)",
-            normalized_query or selected_symbol,
-            resolution.normalized_query,
-            resolution.symbol,
-            resolution.market,
-            resolution.resolution_source,
-            resolution.confidence,
-        )
-        started_at = _time.perf_counter()
-        session_id = f"staging-{int(_time.time() * 1000)}"
-        orchestrator.session_mgr.get_or_create_session(
-            user_id,
-            session_id=session_id,
-            ip=request.headers.get("X-Real-IP") or str(request.client.host),
-            user_agent=request.headers.get("User-Agent", ""),
-        )
-        live_payload = await _handle_stock_analysis(
-            orchestrator=orchestrator,
-            session_id=session_id,
-            user_id=user_id,
-            message=stock_instruction,
-            instruction=stock_instruction,
-            user_ctx={
-                "market": resolution.market,
-                "asset_type": resolution.asset_type,
-                "currency": resolution.currency,
-                "resolution_source": resolution.resolution_source,
-                "resolution_confidence": resolution.confidence,
-            },
-        )
-        report_text = live_payload.get("reply") or ""
-        if not report_text:
-            raise HTTPException(status_code=502, detail="Analysis returned no content.")
-        report_json = None
-        try:
-            from core.services.pilot_report_json import build_pilot_report_json
-
-            generated_at = datetime.now().astimezone().isoformat()
-            report_json = build_pilot_report_json(
-                symbol=resolution.symbol,
-                market=resolution.market,
-                language=preferred_language,
-                report_text=report_text,
-                analysis_data=live_payload.get("data") or {},
-                system_version=_APP_VERSION,
-                model_primary="DeepSeek V3",
-                generated_at=generated_at,
-                data_as_of=generated_at,
-                latency_seconds=max(0, int(round(_time.perf_counter() - started_at))),
-            )
-        except Exception as exc:
-            logger.warning("[staging-api] pilot json unavailable for '%s': %s", normalized_query, exc)
-        return _staging_shape_result(
-            query=normalized_query or selected_symbol,
-            report_text=report_text,
-            report_kind="stock",
-            mode="live",
-            download_url=live_payload.get("download_url"),
-            html_report=report_text,
-            report_json=report_json,
-            resolution=resolution_payload,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning("[staging-api] analyze degraded for '%s': %s", normalized_query or getattr(file, "filename", "portfolio"), exc)
-        return JSONResponse(
-            status_code=200,
-            content=_staging_fallback_payload(
-                normalized_query,
-                file_name=getattr(file, "filename", None),
-            ),
-        )
-
-
-@app.get("/staging-api/chart-data")
-@limiter.limit("60/minute")
-async def staging_chart_data(request: Request, ticker: str = ""):
-    """
-    Public price history for Chart.js rendering on the staging frontend.
-    Returns {dates, prices, ticker} for the last 60 trading days.
-    No auth required — rate-limited to 60/min per IP.
-    """
-    _ensure_staging_public_enabled()
-    ticker = (ticker or "").strip().upper()
-    if not ticker or len(ticker) > 20:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
-
-    import yfinance as _yf
-    import math as _m
-    from datetime import datetime as _dt, timedelta as _td
-
-    df = None
-    # ── yfinance (works for US, Egypt .CA, Saudi .SR, some Gulf) ────────────
-    try:
-        _end   = _dt.now()
-        _start = _end - _td(days=90)
-        _df = await run_in_threadpool(
-            lambda: _yf.download(ticker, start=_start, end=_end, progress=False, auto_adjust=True)
-        )
-        if _df is not None and not _df.empty:
-            df = _df
-    except Exception:
-        pass
-
-    # ── Fallback: pipeline cache (last single point — skip for chart) ─────────
-    # Only useful for US fallback; for MENA we tried yfinance above.
-
-    if df is None or df.empty:
-        return JSONResponse({"error": "No historical data available", "ticker": ticker})
-
-    tail = df.tail(60)
-    _col = "Close" if "Close" in tail.columns else tail.columns[0]
-    _dates_raw  = list(tail.index)
-    _prices_raw = [float(v) for v in tail[_col].values]
-
-    dates  = [d.strftime("%b %d") for d, p in zip(_dates_raw, _prices_raw)
-              if not (_m.isnan(p) or _m.isinf(p))]
-    prices = [round(p, 3)        for p in _prices_raw
-              if not (_m.isnan(p) or _m.isinf(p))]
-
-    if not prices:
-        return JSONResponse({"error": "No valid price data", "ticker": ticker})
-
-    return {"dates": dates, "prices": prices, "ticker": ticker}
-
-
-@app.get("/staging-api/quick")
-@limiter.limit("60/minute")
-async def staging_quick_snapshot(request: Request, q: str = ""):
-    """
-    Fast pipeline-cache snapshot for a ticker — returns in <2s.
-    Used by the frontend to show Quick View while full analysis loads.
-
-    Returns: ticker, name, market, price, change, rsi, sma200,
-             pe_ratio, div_yield, market_cap, sector, rsi_signal,
-             sma_signal, quick_signal (BULLISH/NEUTRAL/BEARISH)
-    """
-    _ensure_staging_public_enabled()
-    q = (q or "").strip().upper()
-    if not q or len(q) > 20:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
-
-    try:
-        from pipeline import CacheManager as _QC
-        import math as _qm
-
-        _MARKETS_SUFFIX = {
-            "uae": ".AE", "ksa": ".SR", "egypt": ".CA",
-            "kuwait": ".KW", "qatar": ".QA", "bahrain": ".BH",
-            "morocco": ".MA", "tunisia": ".TN",
-            "america": "", "crypto": "-USD",
-        }
-
-        def _vf(v):
-            try:
-                f = float(v)
-                return None if (_qm.isnan(f) or _qm.isinf(f) or f == 0) else f
-            except (TypeError, ValueError):
-                return None
-
-        qcm = _QC()
-        # Strip suffix to get bare ticker for cache lookup
-        bare = q.split("-")[0]
-        for sfx in (".AE", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN"):
-            if bare.endswith(sfx):
-                bare = bare[: -len(sfx)]
-                break
-
-        row = None
-        mkt_found = None
-        for mkt, sfx in _MARKETS_SUFFIX.items():
-            df, _ = qcm.get_latest(mkt)
-            if df is None or df.empty:
-                continue
-            df = df.copy()
-            df["_bare"] = df["ticker"].astype(str).str.split(":").str[-1].str.upper()
-            hits = df[df["_bare"] == bare]
-            if not hits.empty:
-                row = hits.iloc[0].to_dict()
-                mkt_found = mkt
-                break
-
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"Ticker '{q}' not found in pipeline cache")
-
-        sfx = _MARKETS_SUFFIX.get(mkt_found, "")
-        full_ticker = bare + sfx
-
-        price  = _vf(row.get("close"))
-        change = round(float(row.get("change") or 0), 2)
-        rsi    = _vf(row.get("RSI"))
-        sma50  = _vf(row.get("SMA50"))
-        sma200 = _vf(row.get("SMA200"))
-        pe     = _vf(row.get("price_earnings_ttm"))
-        divy   = _vf(row.get("dividend_yield_recent"))
-        mc     = _vf(row.get("market_cap_basic"))
-        sector = str(row.get("sector") or "").strip() or None
-        macd   = _vf(row.get("MACD.macd"))
-        macd_s = _vf(row.get("MACD.signal"))
-
-        # RSI signal
-        if rsi is not None:
-            if rsi < 30:
-                rsi_signal = "oversold"
-            elif rsi > 70:
-                rsi_signal = "overbought"
-            else:
-                rsi_signal = "neutral"
-        else:
-            rsi_signal = "unknown"
-
-        # SMA200 signal
-        if price and sma200:
-            sma_signal = "above" if price > sma200 else "below"
-        else:
-            sma_signal = "unknown"
-
-        # Simple composite quick signal (3 independent signals → majority vote)
-        _bull, _bear = 0, 0
-        if rsi_signal == "oversold":      _bull += 1
-        elif rsi_signal == "overbought":  _bear += 1
-        if sma_signal == "above":         _bull += 1
-        elif sma_signal == "below":       _bear += 1
-        if macd is not None and macd_s is not None:
-            if macd > macd_s:  _bull += 1
-            else:              _bear += 1
-        if change > 1.5:       _bull += 0.5
-        elif change < -1.5:    _bear += 0.5
-
-        if _bull >= 2:         quick_signal = "BULLISH"
-        elif _bear >= 2:       quick_signal = "BEARISH"
-        else:                  quick_signal = "NEUTRAL"
-
-        return {
-            "ticker":      full_ticker,
-            "name":        str(row.get("name") or bare),
-            "market":      mkt_found.upper() if mkt_found else "UNKNOWN",
-            "price":       round(price, 4) if price else None,
-            "change":      change,
-            "rsi":         round(rsi, 1) if rsi else None,
-            "rsi_signal":  rsi_signal,
-            "sma50":       round(sma50, 4) if sma50 else None,
-            "sma200":      round(sma200, 4) if sma200 else None,
-            "sma_signal":  sma_signal,
-            "pe_ratio":    round(pe, 2) if pe else None,
-            "div_yield":   round(divy, 2) if divy else None,
-            "market_cap":  round(mc / 1e9, 2) if mc else None,
-            "sector":      sector,
-            "quick_signal": quick_signal,
-        }
-    except HTTPException:
-        raise
-    except Exception as _qe:
-        logger.warning("[quick] error for %s: %s", q, _qe)
-        raise HTTPException(status_code=500, detail="Quick snapshot unavailable")
-
-
-@app.post("/staging-api/lead")
-@limiter.limit("20/minute")
-async def staging_public_lead(request: Request, payload: StagingLeadPayload):
-    _ensure_staging_public_enabled()
-    email = (payload.email or "").strip().lower()
-    if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-        raise HTTPException(status_code=400, detail="Enter a valid email address.")
-
-    lead_record = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "email": email,
-        "name": (payload.name or "").strip() or None,
-        "query": (payload.query or "").strip() or None,
-        "report_kind": (payload.report_kind or "").strip() or None,
-        "ip": (
-            request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-            or request.headers.get("X-Real-IP")
-            or str(request.client.host)
-        ),
-        "user_agent": request.headers.get("User-Agent", "")[:300],
-    }
-    with _STAGING_LEADS_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(_json.dumps(lead_record, ensure_ascii=False) + "\n")
-    return {"ok": True, "message": "Lead captured."}
+# ── Staging API + Guest Admin routers (extracted to api/routers/staging.py) ──
+from api.routers.staging import (
+    staging_router,
+    guest_admin_router,
+    _resolution_error_response,
+    _should_resolve_direct_analysis_request,
+    # Re-exports for backward compat (tests + callers)
+    _guest_trial_check,
+    _guest_trial_increment_success,
+    _GUEST_LIMIT_MESSAGE,
+)
+app.include_router(staging_router)
+app.include_router(guest_admin_router)
 
 @app.get("/")
 async def root():
     return RedirectResponse(url="https://eisax.com", status_code=301)
 
 @app.get("/v1/chart-data")
-@limiter.limit("30/minute")
-async def chart_data(request: Request, ticker: str = "NVDA", access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+@limiter.limit("60/minute")
+async def chart_data(request: Request, ticker: str = "NVDA"):
     import yfinance as yf
     from datetime import datetime, timedelta
     df = None
@@ -3752,6 +2825,7 @@ async def export_chat(
     fmt = body.get("format", "pdf")
     messages = body.get("messages", [])
     title = body.get("title", "EisaX Report")
+    _polish = body.get("polish", False)  # gate: full editorial pass only when requested
     smart = [m for m in messages if m.get("role") == "assistant" 
              and len(m.get("content","")) > 200
              and not any(x in m.get("content","") for x in ["Hello!", "Hi!", "How can I help", "مرحباً", "أهلاً"])]
@@ -3826,6 +2900,37 @@ async def export_chat(
 
             combined = "\n\n".join(m.get("content", "") for m in smart)
 
+            # Full institutional editorial pass — gated by polish=true (Layer 3)
+            if _polish:
+                _pdf_report_id = body.get("report_id", "")
+                _polished_from_cache = None
+                if _pdf_report_id:
+                    try:
+                        from core.polish_cache import get as _pc_get, set as _pc_set
+                        _polished_from_cache = _pc_get(f"llm:{_pdf_report_id}")
+                    except Exception:
+                        pass
+                if _polished_from_cache:
+                    combined = _polished_from_cache
+                    logger.info("[editorial.full] PDF using cached polished report (%d chars)", len(combined))
+                else:
+                    try:
+                        from core.editorial import full_editorial_pass as _editorial_full
+                        _raw_len_pdf = len(combined)
+                        combined = _editorial_full(combined)
+                        logger.info(
+                            "[editorial] editorial_mode=llm_full raw_len=%d rule_clean_len=%d "
+                            "latency_ms=N/A endpoint=/v1/export",
+                            _raw_len_pdf, len(combined),
+                        )
+                        if _pdf_report_id:
+                            try:
+                                _pc_set(f"llm:{_pdf_report_id}", combined)
+                            except Exception:
+                                pass
+                    except Exception as _ed_err:
+                        logger.warning("[editorial.full] PDF pass skipped: %s", _ed_err)
+
             pdf_result = generate_cio_pdf(combined, out_path, ticker=ticker, title=title, lang=_lang)
             report_id = pdf_result[1] if isinstance(pdf_result, tuple) and len(pdf_result) > 1 else None
             result = {"success": True, "filename": filename, "report_id": report_id}
@@ -3890,6 +2995,119 @@ async def download_file(request: Request, token: str, user=Depends(_require_jwt)
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(file_path, filename=token_entry["filename"])
+
+@app.post("/v1/polish-report")
+@limiter.limit("6/minute")
+async def polish_report(request: Request):
+    """
+    Condensed 13-section institutional report from a previously analysed report.
+
+    Request body (JSON):
+      { "report_id": "<id>", "ticker": "<ticker>", "verdict": "<official verdict>", "language": "en|ar" }
+
+    Flow:
+      1. Check polish_cache llm:{language}:{report_id} → return instantly (fallback=false).
+      2. Retrieve rule-based text from polish_cache rule:{report_id}.
+      3. Resolve official verdict: body.verdict → regex-extract from base_text.
+      4. Call polish_condensed(base_text, ticker, verdict) — LLM produces condensed version
+         with a hard verdict-lock rule injected into the system prompt.
+      5. _polish_guard checks: length + verdict (official) + ticker + numbers.
+         Pass  → cache llm:{language}:{report_id}, return {ok, fallback: false, polished_report}
+         Fail  → do NOT cache, return {ok, fallback: true, reason, clean_report: null}
+         Frontend must NOT replace visible report when fallback=true.
+
+    Logs: [polish-report] rejected report_id=<id> reason=<reason> cached=false
+    """
+    if _resolve_staging_access(request).get("role") == "guest":
+        raise HTTPException(status_code=403, detail="Not available in demo access")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required: {report_id}")
+
+    report_id = (body.get("report_id") or "").strip()
+    ticker     = (body.get("ticker") or "").strip().upper()
+    verdict    = (body.get("verdict") or "").strip().upper()
+    language   = (body.get("language") or "en").strip().lower()
+    if language not in ("en", "ar"):
+        language = "en"
+    logger.info("[polish-report] language=%s report_id=%s", language, report_id or "(missing)")
+    if not report_id or len(report_id) > 64:
+        raise HTTPException(status_code=400, detail="report_id required (max 64 chars)")
+
+    try:
+        from core.polish_cache import get as _pc_get, set as _pc_set
+    except Exception as _imp_err:
+        raise HTTPException(status_code=500, detail=f"Polish cache unavailable: {_imp_err}")
+
+    # ── 1. Cache hit ──────────────────────────────────────────────────────────
+    _cache_key = f"llm:{language}:{report_id}"
+    _cached_llm = _pc_get(_cache_key)
+    logger.info("[polish-cache] lookup key=%s hit=%s", _cache_key, "true" if _cached_llm else "false")
+    if _cached_llm:
+        return {
+            "ok": True,
+            "report_id": report_id,
+            "polished_report": _cached_llm,
+            "fallback": False,
+            "from_cache": True,
+        }
+
+    # ── 2. Load rule-based source ─────────────────────────────────────────────
+    base_text = _pc_get(f"rule:{report_id}")
+    if not base_text:
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found — run /staging-api/analyze first to generate report_id",
+        )
+
+    # ── 3. Resolve official verdict (body → regex fallback from cached text) ──
+    if not verdict:
+        import re as _re
+        _vdict_re = _re.compile(
+            r'\b(STRONG BUY|STRONG SELL|BUY|SELL|HOLD|REDUCE|ACCUMULATE|AVOID)\b', _re.I
+        )
+        _vm = _vdict_re.search(base_text)
+        if _vm:
+            verdict = _vm.group(0).upper()
+            logger.debug("[polish-report] verdict inferred from base_text: %s", verdict)
+
+    # ── 4. Condensed institutional pass ──────────────────────────────────────
+    from core.editorial import polish_condensed as _polish_condensed
+    polished, is_fallback, fallback_reason = await run_in_threadpool(
+        _polish_condensed, base_text, ticker, verdict, language
+    )
+
+    # ── 5. Cache only on success; never cache a rejected/fallback output ──────
+    if not is_fallback:
+        logger.info("[polish-cache] store key=%s", _cache_key)
+        _pc_set(_cache_key, polished)
+        logger.info(
+            "[polish-report] editorial_mode=polish_condensed report_id=%s "
+            "polished_len=%d verdict=%s fallback=false",
+            report_id, len(polished), verdict or "?",
+        )
+        return {
+            "ok": True,
+            "report_id": report_id,
+            "polished_report": polished,
+            "fallback": False,
+            "from_cache": False,
+        }
+    else:
+        logger.warning(
+            "[polish-report] rejected report_id=%s reason=%s cached=false",
+            report_id, fallback_reason,
+        )
+        return {
+            "ok": True,
+            "report_id": report_id,
+            "fallback": True,
+            "reason": fallback_reason,
+            "clean_report": None,   # guard rejected — do not replace visible report
+            "from_cache": False,
+        }
+
 
 @app.get("/v1/autocomplete")
 async def autocomplete_tickers(q: str = "", limit: int = 12):
@@ -3971,6 +3189,120 @@ async def autocomplete_tickers(q: str = "", limit: int = 12):
         return {"results": results[:limit]}
     except Exception as _ace:
         return {"results": []}
+
+
+@app.get("/v1/quick")
+@limiter.limit("60/minute")
+async def v1_quick_snapshot(request: Request, q: str = ""):
+    """
+    Fast pipeline-cache snapshot — public, no auth, rate-limited.
+    Returns price/RSI/SMA/PE/yield/sector/signal in <2s.
+    Used by ai.eisax.com Quick View card while full analysis loads.
+    """
+    q = (q or "").strip().upper()
+    if not q or len(q) > 20:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+
+    try:
+        from pipeline import CacheManager as _QCV
+        import math as _qmv
+
+        _MKTS_SFX = {
+            "uae": ".AE", "ksa": ".SR", "egypt": ".CA",
+            "kuwait": ".KW", "qatar": ".QA", "bahrain": ".BH",
+            "morocco": ".MA", "tunisia": ".TN",
+            "america": "", "crypto": "-USD",
+        }
+
+        def _vfv(v):
+            try:
+                f = float(v)
+                return None if (_qmv.isnan(f) or _qmv.isinf(f) or f == 0) else f
+            except (TypeError, ValueError):
+                return None
+
+        bare = q.split("-")[0]
+        for sfx in (".AE", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN"):
+            if bare.endswith(sfx):
+                bare = bare[: -len(sfx)]
+                break
+
+        qcmv = _QCV()
+        row = None
+        mkt_found = None
+        for mkt, sfx in _MKTS_SFX.items():
+            df, _ = qcmv.get_latest(mkt)
+            if df is None or df.empty:
+                continue
+            df = df.copy()
+            df["_bare"] = df["ticker"].astype(str).str.split(":").str[-1].str.upper()
+            hits = df[df["_bare"] == bare]
+            if not hits.empty:
+                row = hits.iloc[0].to_dict()
+                mkt_found = mkt
+                break
+
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"Ticker '{q}' not found")
+
+        sfx = _MKTS_SFX.get(mkt_found, "")
+        full_ticker = bare + sfx
+
+        price  = _vfv(row.get("close"))
+        change = round(float(row.get("change") or 0), 2)
+        rsi    = _vfv(row.get("RSI"))
+        sma50  = _vfv(row.get("SMA50"))
+        sma200 = _vfv(row.get("SMA200"))
+        pe     = _vfv(row.get("price_earnings_ttm"))
+        divy   = _vfv(row.get("dividend_yield_recent"))
+        mc     = _vfv(row.get("market_cap_basic"))
+        sector = str(row.get("sector") or "").strip() or None
+        macd   = _vfv(row.get("MACD.macd"))
+        macd_s = _vfv(row.get("MACD.signal"))
+
+        if rsi is not None:
+            rsi_signal = "oversold" if rsi < 30 else ("overbought" if rsi > 70 else "neutral")
+        else:
+            rsi_signal = "unknown"
+
+        sma_signal = ("above" if price > sma200 else "below") if (price and sma200) else "unknown"
+
+        _bull, _bear = 0, 0
+        if rsi_signal == "oversold":     _bull += 1
+        elif rsi_signal == "overbought": _bear += 1
+        if sma_signal == "above":        _bull += 1
+        elif sma_signal == "below":      _bear += 1
+        if macd is not None and macd_s is not None:
+            if macd > macd_s: _bull += 1
+            else:             _bear += 1
+        if change > 1.5:   _bull += 0.5
+        elif change < -1.5: _bear += 0.5
+
+        quick_signal = "BULLISH" if _bull >= 2 else ("BEARISH" if _bear >= 2 else "NEUTRAL")
+
+        return {
+            "ticker":      full_ticker,
+            "name":        str(row.get("name") or bare),
+            "market":      mkt_found.upper() if mkt_found else "UNKNOWN",
+            "price":       round(price, 4) if price else None,
+            "change":      change,
+            "rsi":         round(rsi, 1) if rsi else None,
+            "rsi_signal":  rsi_signal,
+            "sma50":       round(sma50, 4) if sma50 else None,
+            "sma200":      round(sma200, 4) if sma200 else None,
+            "sma_signal":  sma_signal,
+            "pe_ratio":    round(pe, 2) if pe else None,
+            "div_yield":   round(divy, 2) if divy else None,
+            "market_cap":  round(mc / 1e9, 2) if mc else None,
+            "sector":      sector,
+            "quick_signal": quick_signal,
+        }
+    except HTTPException:
+        raise
+    except Exception as _qve:
+        logger.warning("[v1/quick] error for %s: %s", q, _qve)
+        raise HTTPException(status_code=500, detail="Quick snapshot unavailable")
+
 
 @app.get("/v1/brain/status")
 @limiter.limit("30/minute")
@@ -4388,22 +3720,6 @@ from core.user_db import (init_users_table, create_user, get_user_by_email,
 
 # Initialise users table on startup (idempotent)
 init_users_table()
-
-_bearer = HTTPBearer(auto_error=False)
-
-
-def _require_jwt(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
-    """FastAPI dependency — validates Bearer JWT and returns payload."""
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        payload = decode_token(credentials.credentials)
-    except _jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except _jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return payload
-
 
 def _require_admin(payload: dict = Depends(_require_jwt)) -> dict:
     if payload.get("role") != "admin":
