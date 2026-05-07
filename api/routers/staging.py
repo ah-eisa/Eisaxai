@@ -1403,6 +1403,14 @@ async def staging_public_analyze(
                 "currency": resolution.currency,
                 "resolution_source": resolution.resolution_source,
                 "resolution_confidence": resolution.confidence,
+                # Propagate the user's preferred report language so the
+                # FinancialAgent's prompt builder produces an Arabic
+                # report when the dropdown is set to AR. Without this,
+                # the analysis pipeline always falls back to English
+                # because language detection on a normalized "analyze
+                # 2222.SR" instruction always reads as English.
+                "language": preferred_language,
+                "report_language": preferred_language,
             },
         )
         report_text = live_payload.get("reply") or ""

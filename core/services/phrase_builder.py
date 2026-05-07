@@ -183,10 +183,61 @@ def format_approved_phrase_block(phrase_map: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+_AR_INSIGHT = {
+    # Decision-aware
+    "Income is attractive; HOLD stance appropriate pending trend confirmation.":
+        "الدخل التوزيعي جذّاب؛ يبقى الاحتفاظ ملائماً ريثما يتأكد الاتجاه الفني.",
+    "Elevated risk signals warrant a REDUCE stance; await improved conditions before re-entering.":
+        "إشارات المخاطر المرتفعة ترجّح التخفيف؛ ننتظر تحسّن الظروف قبل العودة لزيادة المركز.",
+    "Risk-reward is unfavorable; AVOID positioning until key technical and fundamental conditions improve.":
+        "نسبة المخاطرة إلى العائد غير مواتية؛ يُفضّل التجنّب حتى تتحسّن الظروف الفنية والأساسية.",
+    # Signal-only
+    "Momentum is overbought within a weak trend regime, making near-term entry unfavorable.":
+        "الزخم في منطقة الشراء المفرط داخل اتجاه ضعيف، مما يجعل الدخول قصير الأجل غير ملائم.",
+    "Timing remains weak: price is extended above the preferred entry zone while ADX stays below trend-confirmation levels.":
+        "التوقيت يبقى ضعيفاً: السعر متجاوز نطاق الدخول المفضّل، ومؤشر ADX دون مستويات تأكيد الاتجاه.",
+    "Timing remains poor: price is extended above the preferred entry zone despite established trend strength.":
+        "التوقيت ضعيف: السعر متجاوز نطاق الدخول المفضّل رغم قوة الاتجاه القائم.",
+    "Income is attractive, but trend confirmation remains weak.":
+        "الدخل التوزيعي جذّاب، لكن تأكيد الاتجاه الفني لا يزال ضعيفاً.",
+    "Momentum is weakening and trend confirmation is absent; the setup does not yet support aggressive entry.":
+        "الزخم في تراجع وتأكيد الاتجاه غائب؛ المشهد لا يدعم الدخول الجريء بعد.",
+    "Trend confirmation is absent; await ADX strengthening before adding directional exposure.":
+        "تأكيد الاتجاه غائب؛ ننتظر تحسّن مؤشر ADX قبل زيادة الانكشاف الاتجاهي.",
+}
+
+def _ar_localise(phrase: str) -> str:
+    """Translate well-known insight phrases to natural Arabic; pass through others."""
+    if not phrase:
+        return phrase
+    out = _AR_INSIGHT.get(phrase, phrase)
+    # Light pattern translations for HOLD/BUY templated returns
+    out = (out
+        .replace("Position maintained — ", "المركز قائم — ")
+        .replace("Await clearer confirmation before adding or reducing exposure.",
+                 "ننتظر تأكيداً أوضح قبل زيادة المركز أو تقليصه.")
+        .replace("Trend confirmation is absent; HOLD stance reflects ",
+                 "تأكيد الاتجاه غائب؛ قرار الاحتفاظ يعكس ")
+        .replace("Setup supports a BUY: trend is ",
+                 "المشهد يدعم الشراء: الاتجاه ")
+        .replace("Fundamental BUY — strong business quality and upside justify the position.",
+                 "شراء أساسي — جودة الأعمال والإمكانية التصاعدية تبرّر اتخاذ المركز.")
+        .replace("Entry timing is suboptimal", "توقيت الدخول دون المثالي")
+        .replace("wait for a pullback before adding.",
+                 "ننتظر تراجعاً قبل الزيادة.")
+        .replace("momentum is", "الزخم")
+        .replace("entry quality is", "جودة الدخول")
+        .replace("conditions are mixed", "الظروف مختلطة")
+        .replace("with ", "مع ")
+    )
+    return out
+
+
 def build_quick_insight(
     snapshot: dict,
     interpretation_labels: dict[str, str],
     decision: dict | None = None,
+    lang: str = "en",
 ) -> str:
     """
     Always returns a non-empty, data-tied phrase. NO generic fallback.
@@ -194,6 +245,10 @@ def build_quick_insight(
     When *decision* (from build_decision()) is supplied, the phrase is
     enriched with the verdict and its primary constraint so the reader
     understands WHY the stance was taken.
+
+    When ``lang == "ar"`` the English phrase produced internally is
+    post-processed through a curated Arabic phrase map so the Quick
+    View matches the LLM-generated body language.
     """
     trend_strength = interpretation_labels.get("TrendStrength", "")
     entry_quality  = interpretation_labels.get("EntryQuality", "")

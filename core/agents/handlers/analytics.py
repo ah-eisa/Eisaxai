@@ -41,8 +41,19 @@ class AnalyticsMixin:
         )
 
         # === DETECT LANGUAGE (for full Arabic report) ===
+        # Priority 1: explicit user_ctx.language from the API caller (e.g.
+        # the dropdown on agent.eisax.com). Without this, the staging
+        # endpoint normalizes the user's Arabic query to "analyze 2222.SR"
+        # before reaching this handler, so character-counting on the
+        # instruction always reads as English and the AR option is silently
+        # ignored.
+        _ctx_lang = ""
+        try:
+            _ctx_lang = str(((mem or {}).get("user_ctx") or {}).get("language", "")).strip().lower()
+        except Exception:
+            _ctx_lang = ""
         _arabic_chars = sum(1 for c in msg if '\u0600' <= c <= '\u06FF')
-        _is_arabic_request = _arabic_chars >= 2  # 2+ Arabic characters = Arabic request
+        _is_arabic_request = (_ctx_lang == "ar") or (_arabic_chars >= 2)
         _analysis_mode = (mode or "full").strip().lower()
         if _analysis_mode not in {"quick", "full", "cio"}:
             _analysis_mode = "full"
@@ -2766,7 +2777,33 @@ CONSISTENCY RULES (MANDATORY):
 Use actual numbers. Be specific. Institutional tone.
 {"CRITICAL: This is an ENERGY sector stock. Oil prices are the PRIMARY driver. You MUST discuss oil price impact throughout the report, include the sensitivity table, and reference Brent crude at $" + str(round(_oil_data.get('price',0),2)) + "/bbl." if _is_energy else ""}
 {"CURRENCY: Use " + _currency_sym + " (" + _currency_lbl + ") for ALL price references — NOT USD." if _currency_lbl != "USD" else ""}
-{"LANGUAGE: The user's request was in Arabic. Write the FULL report in Arabic. IMPORTANT: Use the SAME number of sections, SAME level of detail, and ALL 9 sections — do NOT simplify or shorten because it is in Arabic. Arabic and English reports must be identical in depth and structure. Section 6 (Peer Comparison) must still be exactly 2 sentences with competitor ticker and valuation numbers in Arabic. USE THESE EXACT ARABIC SECTION HEADINGS — no variations: ### 1. الملخص التنفيذي | ### 2. أطروحة الاستثمار | ### 3. التحليل الفني | ### 4. إشارات المخاطر | ### 5. التقييم والسعر المستهدف | ### 6. المقارنة مع الأقران | ### 7. القرار والتوقيت | ### 8. ما الذي يغيّر هذا القرار | ### 9. ما الذي قد يثبت خطأ هذا الرأي. Verdict labels in Arabic: شراء / احتفاظ / تخفيف / بيع. Timing labels: شراء الآن / انتظر تأكيدًا / شراء تدريجي عند التراجع / خفّف مع الارتفاع." if _is_arabic_request else "LANGUAGE: Write in English."}
+{"""LANGUAGE: اكتب التقرير الكامل باللغة العربية الفصحى الاحترافية المستخدمة في التحليل المالي المؤسسي (مثل تقارير HSBC الشرق الأوسط، الأهلي كابيتال، الراجحي المالية، EFG-Hermes). لا تقم بترجمة حرفية للنص الإنجليزي.
+
+أسلوب الكتابة المطلوب:
+• استخدم المصطلحات المالية العربية الراسخة وليس النقل الصوتي. أمثلة: "التدفقات النقدية الحرة" وليس "free cash flow"؛ "العائد على حقوق الملكية" وليس "ROE"؛ "نسبة السعر إلى الأرباح" وليس "P/E ratio" (يمكن إضافة الاختصار بين قوسين عند أول استخدام فقط).
+• اكتب جملاً مكتملة ومترابطة، لا قوائم رصاصية مقطّعة أو ترجمة Google.
+• تجنّب كلمات مثل "الـ stock" و "الـ market" و "بشكل" و "بالنسبة لـ" — بدلاً منها استخدم: "السهم"، "السوق"، تركيب الجملة العربي الطبيعي.
+• الأرقام تبقى بالأرقام العربية الغربية (123 وليس ١٢٣) لأنها أوضح في السياق المالي.
+• العملات تكتب باسمها العربي مع الرمز عند الحاجة: "27.20 ريال سعودي" أو "27.20 ﷼".
+• لا تخلط الإنجليزي مع العربي إلا للرموز الفنية (الـ ticker، أسماء المؤشرات الفنية الفنية مثل ADX، RSI).
+
+البنية: نفس الـ 9 أقسام بنفس العمق والتفصيل تماماً مثل الإصدار الإنجليزي. لا تختصر لأن العربية أصعب.
+
+عناوين الأقسام (استخدمها حرفياً):
+### 1. الملخص التنفيذي
+### 2. أطروحة الاستثمار
+### 3. التحليل الفني
+### 4. إشارات المخاطر
+### 5. التقييم والسعر المستهدف
+### 6. مقارنة الأقران
+### 7. القرار والتوقيت
+### 8. العوامل التي قد تغيّر هذا القرار
+### 9. ما قد يثبت خطأ هذا التقييم
+
+تسميات القرار (verdict): شراء قوي / شراء / تجميع تدريجي / احتفاظ / تخفيف / بيع.
+تسميات التوقيت (timing): شراء فوري / انتظار التأكيد / تجميع تدريجي عند التراجع / تخفيف عند الارتفاع.
+
+القسم 6 (مقارنة الأقران) يبقى جملتين فقط مع رمز الشركة المنافسة وأرقام التقييم.""" if _is_arabic_request else "LANGUAGE: Write in English."}
 {"🚨 EXTREME PRICE MOVE ALERT — " + _crash_direction + " (" + f"{change_pct:+.2f}%" + " single-day move detected): This MUST be the FIRST thing addressed in Section 1 (Executive Summary). In Section 4 (Key Risks), you MUST investigate and explain the likely cause: check if this is an ex-dividend drop, rights issue (capital increase), trading halt lifted, forced selling, major news event, or circuit-breaker trigger. State the most probable cause based on available data. Do NOT treat this as a normal trading day — this is an exceptional event requiring forensic analysis." if _is_crash else ""}
 IMPORTANT RULES:
 - Do NOT mention dividend yield unless above 0.5%
@@ -2917,11 +2954,23 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         _oil_badge = f" | **🛢️ Brent: ${_oil_data.get('price',0):.2f}**" if _is_energy and _oil_data.get('price') else ""
         _display_ticker = (_original_target if "_original_target" in dir() and _original_target != target else target)
         _price_header_label = "Cached Price" if (_report_snapshot and _report_snapshot.is_cached("price")) else "Live Price"
+        # Localise header labels when the report language is Arabic so
+        # the static frame matches the LLM-generated body language.
+        if _is_arabic_request:
+            _hdr_title  = "تقرير EisaX التحليلي"
+            _hdr_price  = "السعر المخزّن" if _price_header_label == "Cached Price" else "السعر الحي"
+            _hdr_sector = "القطاع"
+            _hdr_score  = "درجة EisaX"
+        else:
+            _hdr_title  = "EisaX Intelligence Report"
+            _hdr_price  = _price_header_label
+            _hdr_sector = "Sector"
+            _hdr_score  = "EisaX Score"
         header = (
-            f"# EisaX Intelligence Report: {_display_ticker}\n\n"
-            f"**🔴 {_price_header_label}:** {price_str} | "
-            f"**Sector:** {fund.get('sector', 'N/A')} | "
-            f"**EisaX Score:** {_eisax_score}/100"
+            f"# {_hdr_title}: {_display_ticker}\n\n"
+            f"**🔴 {_hdr_price}:** {price_str} | "
+            f"**{_hdr_sector}:** {fund.get('sector', 'N/A')} | "
+            f"**{_hdr_score}:** {_eisax_score}/100"
             + (f" | **{_exch_label}**" if _exch_label else "")
             + _oil_badge
             + "\n\n---\n\n"
@@ -3546,11 +3595,23 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         else:
             _regime, _regime_emoji, _regime_color = "NEUTRAL",     "⚪", "gray"
         _fg_lbl_r = "Extreme Fear" if _fg_score_r <= 20 else "Fear" if _fg_score_r <= 40 else "Neutral" if _fg_score_r <= 60 else "Greed" if _fg_score_r <= 80 else "Extreme Greed"
-        _regime_block = (
-            f"\n\n---\n"
-            f"{_regime_emoji} **Market Regime: {_regime}**\n"
-            f"*(Fear & Greed: {_fg_score_r} — {_fg_lbl_r} | Trend: {'Bullish' if _trend_bull_r else 'Bearish'})*\n"
-        )
+        if _is_arabic_request:
+            _AR_REGIME = {"RISK-OFF": "تجنّب المخاطر", "RISK-ON": "إقبال على المخاطر",
+                          "CAUTIOUS": "حذِر", "NEUTRAL": "محايد"}
+            _AR_FG = {"Extreme Fear": "خوف شديد", "Fear": "خوف", "Neutral": "محايد",
+                      "Greed": "طمع", "Extreme Greed": "طمع شديد"}
+            _regime_block = (
+                f"\n\n---\n"
+                f"{_regime_emoji} **حالة السوق: {_AR_REGIME.get(_regime, _regime)}**\n"
+                f"*(مؤشر الخوف والطمع: {_fg_score_r} — {_AR_FG.get(_fg_lbl_r, _fg_lbl_r)} | "
+                f"الاتجاه: {'صاعد' if _trend_bull_r else 'هابط'})*\n"
+            )
+        else:
+            _regime_block = (
+                f"\n\n---\n"
+                f"{_regime_emoji} **Market Regime: {_regime}**\n"
+                f"*(Fear & Greed: {_fg_score_r} — {_fg_lbl_r} | Trend: {'Bullish' if _trend_bull_r else 'Bearish'})*\n"
+            )
         _final_tech_block = (
             f"\n\n---\n"
             f"📡 **Technical Signal (Supporting): {_final_sig} {_final_sig_emoji}**\n"
@@ -3795,12 +3856,45 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 # decision_data is passed by the caller from self._last_scorecard_decision;
                 # NO closure dependency on _build_scorecard_md locals.
                 dd = decision_data or {}
+                # Arabic value translations so the Quick View doesn't show
+                # "ACCUMULATE / WAIT / Medium" inside Arabic labels.
+                _AR_VERDICT_MAP = {
+                    "STRONG BUY": "شراء قوي",
+                    "BUY":        "شراء",
+                    "ACCUMULATE": "تجميع تدريجي",
+                    "HOLD":       "احتفاظ",
+                    "REDUCE":     "تخفيف",
+                    "SELL":       "بيع",
+                    "AVOID":      "تجنّب",
+                }
+                _AR_TIMING_MAP = {
+                    "BUY NOW":               "شراء فوري",
+                    "WAIT":                  "انتظار التأكيد",
+                    "WAIT FOR CONFIRMATION": "انتظار التأكيد",
+                    "ACCUMULATE ON DIPS":    "تجميع تدريجي عند التراجع",
+                    "REDUCE ON RALLY":       "تخفيف عند الارتفاع",
+                    "EXIT":                  "الخروج",
+                }
+                _AR_CONV_MAP = {
+                    "HIGH":   "عالية",
+                    "MEDIUM": "متوسطة",
+                    "LOW":    "منخفضة",
+                }
                 if dd:
+                    _v = str(dd.get('verdict', 'HOLD')).upper()
+                    _t = str(dd.get('timing',  'WAIT')).upper()
+                    _c = str(dd.get('conviction', 'Medium')).upper()
+                    if _ar:
+                        _v_disp = _AR_VERDICT_MAP.get(_v, _v)
+                        _t_disp = _AR_TIMING_MAP.get(_t, _t)
+                        _c_disp = _AR_CONV_MAP.get(_c, _c)
+                    else:
+                        _v_disp, _t_disp, _c_disp = dd.get('verdict','HOLD'), dd.get('timing','WAIT'), dd.get('conviction','Medium')
                     _verdict_display = (
                         f"**{ticker}"
-                        f" | {_lbl_fundamental} {dd.get('verdict','HOLD')} {dd.get('emoji','')}"
-                        f" | {_lbl_timing} {dd.get('timing','WAIT')}"
-                        f" | {_lbl_conviction} {dd.get('conviction','Medium')}"
+                        f" | {_lbl_fundamental} {_v_disp} {dd.get('emoji','')}"
+                        f" | {_lbl_timing} {_t_disp}"
+                        f" | {_lbl_conviction} {_c_disp}"
                         f" | {_lbl_score} {dd.get('score',0)}/100**"
                     )
                 else:
@@ -3829,6 +3923,9 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                                         if '_de_result' in dir() else [],
                     }
                     _insight = build_quick_insight({"ticker": ticker}, _interpretation_labels or {}, _qv_decision)
+                    if _ar:
+                        from core.services.phrase_builder import _ar_localise as _ar_loc_qv
+                        _insight = _ar_loc_qv(_insight)
                 except Exception as _qv_err:
                     logger.debug("[QuickView] deterministic insight failed: %s", _qv_err)
                     _insight = ""
@@ -3967,17 +4064,20 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     _outer_fa = '🟡 WATCHLIST / WAIT FOR ENTRY'
                 elif _fa_v == 'BUY':
                     _outer_fa = '🟢 BUY — Entry Confirmed'
+                elif _fa_v == 'ACCUMULATE':
+                    _outer_fa = '🟡 ACCUMULATE — Scale In Gradually'
                 elif _fa_v == 'HOLD' and 'WAIT' in _fa_et:
                     _outer_fa = '⚪ WAIT / NO ACTION'
                 else:
                     _outer_fa = '⚪ HOLD — Monitor'
                 if _is_arabic_request:
                     _outer_fa = {
-                        '🔴 REDUCE / RISK CONTROL':      '🔴 تخفيض / إدارة مخاطر',
-                        '🟡 WATCHLIST / WAIT FOR ENTRY': '🟡 قائمة مراقبة / انتظر نقطة دخول',
-                        '🟢 BUY — Entry Confirmed':      '🟢 شراء — نقطة دخول مؤكدة',
-                        '⚪ WAIT / NO ACTION':           '⚪ انتظر / لا إجراء',
-                        '⚪ HOLD — Monitor':             '⚪ احتفظ — مراقبة',
+                        '🔴 REDUCE / RISK CONTROL':           '🔴 تخفيف / إدارة مخاطر',
+                        '🟡 WATCHLIST / WAIT FOR ENTRY':      '🟡 قائمة مراقبة / انتظار نقطة دخول',
+                        '🟢 BUY — Entry Confirmed':            '🟢 شراء — نقطة دخول مؤكدة',
+                        '🟡 ACCUMULATE — Scale In Gradually':  '🟡 تجميع تدريجي — دخول على دفعات',
+                        '⚪ WAIT / NO ACTION':                 '⚪ انتظار / لا إجراء',
+                        '⚪ HOLD — Monitor':                   '⚪ احتفاظ — مراقبة',
                     }.get(_outer_fa, _outer_fa)
                 _lbl_fa = 'القرار النهائي' if _is_arabic_request else 'Final Action'
                 _outer_final_action_line = f"**{_lbl_fa}:** {_outer_fa}"
@@ -3993,7 +4093,8 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 final_action_line=_outer_final_action_line,
                 is_arabic=_is_arabic_request,
             )
-            final_reply = quick_view + "\n\n---\n## 📋 Full Report\n\n" + deepseek_reply
+            _full_report_hdr = "📋 التقرير الكامل" if _is_arabic_request else "📋 Full Report"
+            final_reply = quick_view + f"\n\n---\n## {_full_report_hdr}\n\n" + deepseek_reply
         # ── 7. Build Final Reply ───────────────────────────────────────────────
         if deepseek_reply:
             try:
@@ -4054,7 +4155,7 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                         _heatmap_block = f"\n\n> {_hmap['message']}\n"
 
                     # ── #5 Blended Score Trend Chart ───────────────────────────
-                    _trend = _get_trend(target)
+                    _trend = _get_trend(target, lang=("ar" if _is_arabic_request else "en"))
                     if _trend.get("message"):
                         _trend_chart_block = f"\n\n> {_trend['message']}\n"
 

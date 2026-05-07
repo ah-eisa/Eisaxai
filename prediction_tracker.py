@@ -162,10 +162,13 @@ def get_portfolio_heatmap(ticker: str, sector: str, lookback_days: int = 30) -> 
     return result
 
 
-def get_score_trend_chart(ticker: str, lookback_days: int = 60) -> dict:
+def get_score_trend_chart(ticker: str, lookback_days: int = 60, lang: str = "en") -> dict:
     """
     Returns ASCII sparkline of blended score history for the ticker.
     Requires at least 3 data points to be meaningful.
+
+    ``lang='ar'`` produces an Arabic-localised message; the sparkline
+    glyphs and numeric values are unchanged.
     """
     result = {"points": [], "chart": "", "message": ""}
     try:
@@ -195,19 +198,33 @@ def get_score_trend_chart(ticker: str, lookback_days: int = 60) -> dict:
         _last3_avg  = sum(scores[-3:]) / 3
         _trend_delta = _last3_avg - _first3_avg
         if _trend_delta >= 5:
-            trend_label, trend_icon = "improving", "📈"
+            trend_label_en, trend_label_ar, trend_icon = "improving",     "تحسّن",   "📈"
         elif _trend_delta <= -5:
-            trend_label, trend_icon = "deteriorating", "📉"
+            trend_label_en, trend_label_ar, trend_icon = "deteriorating", "تراجع",   "📉"
         else:
-            trend_label, trend_icon = "stable", "➡️"
+            trend_label_en, trend_label_ar, trend_icon = "stable",        "مستقر",   "➡️"
+
+        _AR_VERDICTS = {
+            "STRONG BUY": "شراء قوي", "BUY": "شراء", "ACCUMULATE": "تجميع تدريجي",
+            "HOLD": "احتفاظ", "REDUCE": "تخفيف", "SELL": "بيع", "AVOID": "تجنّب",
+        }
+        _last_v = (verdicts[-1] or "").upper()
+        _last_v_ar = _AR_VERDICTS.get(_last_v, _last_v)
 
         result["points"] = scores
         result["chart"] = spark
-        result["message"] = (
-            f"{trend_icon} **Score Trend ({len(scores)} analyses):** `{spark}` "
-            f"({scores[0]}→{scores[-1]}) — **{trend_label}** "
-            f"| Last verdict: **{verdicts[-1]}**"
-        )
+        if lang == "ar":
+            result["message"] = (
+                f"{trend_icon} **اتجاه الدرجة ({len(scores)} تحليلات):** `{spark}` "
+                f"({scores[0]}→{scores[-1]}) — **{trend_label_ar}** "
+                f"| آخر قرار: **{_last_v_ar}**"
+            )
+        else:
+            result["message"] = (
+                f"{trend_icon} **Score Trend ({len(scores)} analyses):** `{spark}` "
+                f"({scores[0]}→{scores[-1]}) — **{trend_label_en}** "
+                f"| Last verdict: **{verdicts[-1]}**"
+            )
     except Exception as e:
         logger.warning(f"[PredTracker] get_score_trend_chart failed: {e}")
     return result
