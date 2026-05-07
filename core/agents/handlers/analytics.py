@@ -1590,7 +1590,7 @@ GROWTH:
 - Revenue Growth YoY: {_P(fund.get('revenue_growth'))}
 - EPS Growth YoY: {_P(fund.get('eps_growth'))}
 - Revenue (TTM): {_B(fund.get('revenue'))}
-- EPS (TTM): ${fund.get('eps', 'N/A')}
+- EPS (TTM): {_currency_sym}{fund.get('eps', 'N/A')}
 
 PROFITABILITY:
 - Gross Margin: {_P(fund.get('gross_margin'))}
@@ -1644,10 +1644,10 @@ BALANCE SHEET:
 EARNINGS:
 - Last Earnings Date: {fund.get('last_earnings_date', 'N/A')}
 - NEXT EARNINGS DATE: {next_earnings or 'N/A'}
-- EPS Actual vs Est (last): ${fund.get('last_eps_actual', 'N/A')} vs ${fund.get('last_eps_estimate', 'N/A')}
+- EPS Actual vs Est (last): {_currency_sym}{fund.get('last_eps_actual', 'N/A')} vs {_currency_sym}{fund.get('last_eps_estimate', 'N/A')}
 - Earnings Surprise: {fund.get('earnings_surprise_pct', 'N/A')}%
-- Next Quarter EPS Estimate: ${ev_out.get('eps_est_avg', 'N/A')} (range: ${ev_out.get('eps_est_low','?')} – ${ev_out.get('eps_est_high','?')})
-- Next Quarter Revenue Estimate: {f"${ev_out['rev_est_avg']/1e9:.1f}B" if ev_out.get('rev_est_avg') else 'N/A'} (range: {f"${ev_out['rev_est_low']/1e9:.1f}B" if ev_out.get('rev_est_low') else '?'} – {f"${ev_out['rev_est_high']/1e9:.1f}B" if ev_out.get('rev_est_high') else '?'})
+- Next Quarter EPS Estimate: {_currency_sym}{ev_out.get('eps_est_avg', 'N/A')} (range: {_currency_sym}{ev_out.get('eps_est_low','?')} – {_currency_sym}{ev_out.get('eps_est_high','?')})
+- Next Quarter Revenue Estimate: {f"{_currency_sym}{ev_out['rev_est_avg']/1e9:.1f}B" if ev_out.get('rev_est_avg') else 'N/A'} (range: {f"{_currency_sym}{ev_out['rev_est_low']/1e9:.1f}B" if ev_out.get('rev_est_low') else '?'} – {f"{_currency_sym}{ev_out['rev_est_high']/1e9:.1f}B" if ev_out.get('rev_est_high') else '?'})
 
 MARKET SENTIMENT (Fear & Greed Index):
 - Score: {fg_data.get('score', 'N/A')} / 100

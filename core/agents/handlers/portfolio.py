@@ -47,6 +47,7 @@ class PortfolioMixin:
         
         # Try to resolve via local ticker resolver if not a known format
         if not any(ticker.endswith(s) for s in ['.SR', '.CA', '.AE', '.DU', '.KW', '.QA', '-USD']):
+            from core.agents.finance import _ticker_resolver
             local = _ticker_resolver.resolve_single(ticker)
             if local:
                 ticker = local
@@ -91,6 +92,7 @@ class PortfolioMixin:
         
         # Resolve local tickers
         if not any(ticker.endswith(s) for s in ['.SR', '.CA', '.AE', '.DU', '.KW', '.QA', '-USD']):
+            from core.agents.finance import _ticker_resolver
             local = _ticker_resolver.resolve_single(ticker)
             if local:
                 ticker = local

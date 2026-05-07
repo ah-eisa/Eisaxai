@@ -5,6 +5,7 @@ import logging
 import os
 import state
 import config
+import core.portfolio_manager as pm
 from datetime import datetime
 from core.intent_classifier import IntentClassifier
 from core.fixed_income import (

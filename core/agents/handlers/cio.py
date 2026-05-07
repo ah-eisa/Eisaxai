@@ -263,6 +263,11 @@ class CIOMixin:
 """
 
         # ── Fetch CURRENT dividend yields — parallel + cached ─────────────────
+        # Lazy import — finance.py imports this mixin at class-body time,
+        # so a module-top "from core.agents.finance import _div_yield_cache"
+        # would be circular. Bound here gives the same shared TTLCache.
+        from core.agents.finance import _div_yield_cache
+
         def _fetch_one_yield(ticker_str: str) -> float:
             """Fetch current market dividend yield (NOT yield-on-cost). Cached 1h."""
             cached = _div_yield_cache.get(f"dy_{ticker_str}")

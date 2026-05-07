@@ -5,6 +5,7 @@ import logging
 import os
 import state
 import config
+import core.portfolio_manager as pm
 from datetime import datetime
 logger = logging.getLogger(__name__)
 
