@@ -322,21 +322,32 @@ class ScorecardMixin:
                 _total_ret_r8a = _upside_r8a + _div_y_r8a
                 _r8a_promote = False
                 _r8a_tier    = None
+                _r8a_target  = None    # 'BUY' or 'ACCUMULATE'
                 if final >= 80 and _total_ret_r8a >= 12.0:
-                    _r8a_promote, _r8a_tier = True, "high-quality (≥80, TR≥12%)"
+                    _r8a_promote, _r8a_tier, _r8a_target = True, "high-quality (≥80, TR≥12%)", "BUY"
                 elif final >= 70 and _total_ret_r8a >= 15.0:
-                    _r8a_promote, _r8a_tier = True, "good-quality (≥70, TR≥15%)"
+                    _r8a_promote, _r8a_tier, _r8a_target = True, "good-quality (≥70, TR≥15%)", "BUY"
                 elif final >= 60 and _total_ret_r8a >= 20.0:
-                    _r8a_promote, _r8a_tier = True, "acceptable (≥60, TR≥20%)"
-                if _r8a_promote and verdict_sc not in ('BUY', 'STRONG BUY'):
-                    verdict_sc = 'BUY'
-                    conviction = 'High' if final >= 80 else 'Medium'
-                    emoji      = '🟢'
+                    _r8a_promote, _r8a_tier, _r8a_target = True, "acceptable (≥60, TR≥20%)", "BUY"
+                # ACCUMULATE tier — quality is decent and total return is
+                # positive but doesn't clear the BUY bar. Gives the user
+                # a clear "scale in gradually" signal instead of the
+                # binary HOLD/BUY split.
+                elif final >= 65 and _total_ret_r8a >= 8.0 and _total_ret_r8a < 15.0:
+                    _r8a_promote, _r8a_tier, _r8a_target = True, "accumulate (≥65, TR 8-15%)", "ACCUMULATE"
+                if _r8a_promote and verdict_sc not in ('BUY', 'STRONG BUY', 'ACCUMULATE'):
+                    verdict_sc = _r8a_target
+                    if _r8a_target == "BUY":
+                        conviction = 'High' if final >= 80 else 'Medium'
+                        emoji = '🟢'
+                    else:  # ACCUMULATE
+                        conviction = 'Medium' if final >= 70 else 'Low'
+                        emoji = '🟡'
                     sc_data['_rule8a_applied'] = True
                     logger.info(
                         f"[Rule8A] {target}: Score={final}, Upside={_upside_r8a:.1f}%, "
                         f"DivYield={_div_y_r8a:.2f}%, TotalReturn={_total_ret_r8a:.1f}% "
-                        f"→ Fundamental=BUY [{_r8a_tier}] (was {_de_result['verdict']})"
+                        f"→ Fundamental={_r8a_target} [{_r8a_tier}] (was {_de_result['verdict']})"
                     )
             except Exception as _de_err:
                 import logging as _de_log
@@ -373,11 +384,12 @@ class ScorecardMixin:
 
             # Display mapping — internal codes → institutional-grade client-facing labels
             _VERDICT_DISPLAY = {
-                "REDUCE": "Positioning: Underweight",
-                "SELL":   "Risk Stance: Avoid",
-                "BUY":    "BUY",
-                "HOLD":   "HOLD",
-                "AVOID":  "Risk Stance: Avoid",
+                "REDUCE":     "Positioning: Underweight",
+                "SELL":       "Risk Stance: Avoid",
+                "BUY":        "BUY",
+                "HOLD":       "HOLD",
+                "AVOID":      "Risk Stance: Avoid",
+                "ACCUMULATE": "ACCUMULATE",
             }
             _DECISION_TYPE_LABELS = {
                 "contrarian_early": "Contrarian Early",

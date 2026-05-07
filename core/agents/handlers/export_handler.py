@@ -168,7 +168,7 @@ class ExportMixin:
                 _bv = str(verdict).upper().strip()
                 if _bv == "STRONG BUY":
                     _bv = "BUY"
-                if _bv not in ("BUY", "HOLD", "SELL", "REDUCE", "AVOID"):
+                if _bv not in ("BUY", "HOLD", "SELL", "REDUCE", "AVOID", "ACCUMULATE"):
                     _bv = "HOLD"
             else:
                 # Defensive scrape — strip false-positive phrases first.
