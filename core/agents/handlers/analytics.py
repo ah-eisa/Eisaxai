@@ -31,6 +31,9 @@ class AnalyticsMixin:
             _safe_div_yield,
             _yf_with_retry,
             _ticker_resolver,
+            _pd,
+            deepcrawl_stock,
+            get_live_news,
             apply_language_locks,
             classify_data_coverage_level,
             compact_low_data_generation_inputs,
@@ -1378,7 +1381,8 @@ class AnalyticsMixin:
         _btc_etf_signal = ""
         if _is_crypto_asset:
             try:
-                _onchain_data = self._fetch_onchain(target)
+                from core.agents.finance import _fetch_onchain as _onchain_fn
+                _onchain_data = _onchain_fn(target)
                 logger.info(f"[OnChain] {target}: ATH=${_onchain_data.get('ath',0)}, HashRate={_onchain_data.get('hash_rate_eh',0)}EH/s, ActiveAddr={_onchain_data.get('active_addresses',0)}")
             except Exception as _oc_e:
                 logger.warning(f"[OnChain] Failed for {target}: {_oc_e}")
@@ -3383,7 +3387,8 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         )
         _bullish_count = int(sc_data.get('bullish_count') or 0)
         _bearish_count = int(sc_data.get('bearish_count') or 0)
-        _decision_conf = self._compute_decision_confidence(
+        from core.agents.finance import _compute_decision_confidence as _cdc_fn
+        _decision_conf = _cdc_fn(
             score=_score_ps,
             bullish_count=_bullish_count,
             bearish_count=_bearish_count,
@@ -3684,8 +3689,12 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     )
             except Exception as _comp_e:
                 logger.debug(f"[Compress] skipped: {_comp_e}")
-            deepseek_reply = self._soften_execution_language(deepseek_reply)
-            deepseek_reply = self._round_scenario_prices(deepseek_reply, _currency_sym)
+            from core.agents.finance import (
+                _soften_execution_language as _soften_fn,
+                _round_scenario_prices as _round_fn,
+            )
+            deepseek_reply = _soften_fn(deepseek_reply)
+            deepseek_reply = _round_fn(deepseek_reply, _currency_sym)
             # ── TG1/TG6: Deduplicate repeated sentences across the full report ──────
             try:
                 _dedup_lines = []
