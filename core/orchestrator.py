@@ -239,6 +239,22 @@ class MultiAgentOrchestrator:
         return "full"
 
     def _resolve_analysis_ticker(self, message: str = "", instruction: str = "") -> str | None:
+        # Priority 1: an explicit dotted/futures ticker already present in the
+        # message or instruction (e.g. 2222.SR, EMAAR.DU, ADNOCGAS.AE, GC=F).
+        # The instruction passed in by staging.py is post-entity-resolution, so
+        # it almost always contains the canonical symbol — using it first
+        # avoids the ticker_resolver's name-fuzzy matches (e.g. "ADNOC Gas"
+        # mis-resolving to NG=F natural-gas futures).
+        combined_raw = f"{message or ''} {instruction or ''}"
+        explicit = re.search(
+            r"\b([A-Z0-9]{1,10}(?:\.[A-Za-z]{2,4}|=[A-Z]))\b",
+            combined_raw,
+        )
+        if explicit:
+            return explicit.group(1).upper()
+
+        # Priority 2: name-based ticker_resolver (handles "Aramco" → 2222.SR,
+        # "Apple" → AAPL, etc.).
         try:
             try:
                 from core.ticker_resolver import resolve_ticker as _resolve
@@ -251,12 +267,19 @@ class MultiAgentOrchestrator:
         except Exception as exc:
             logger.debug("[AnalysisCache] ticker resolver failed: %s", exc)
 
-        combined = f"{message or ''} {instruction or ''}".upper()
-        candidates = re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", combined)
-        skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
+        # Priority 3: bare-symbol regex fallback. Allow digits so a plain
+        # message like "ANALYZE NVDA" still picks NVDA (and not the discarded
+        # "ANALYZE" stop-word).
+        combined = combined_raw.upper()
+        candidates = re.findall(r"\b([A-Z0-9]{2,10}(?:=[A-Z])?)\b", combined)
+        skip = {
+            "AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE", "ANALYSIS",
+            "BUY", "SELL", "HOLD", "ASAP", "USER", "INTO", "FROM", "ABOUT", "NEW",
+        }
         for ticker in candidates:
-            if ticker not in skip:
-                return ticker
+            if ticker in skip or ticker.isdigit():
+                continue
+            return ticker
         return None
 
     def build_analysis_cache_key(
