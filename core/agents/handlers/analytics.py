@@ -4019,11 +4019,19 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     _pred_verdict = str(verdict_sc or verdict or "HOLD").upper()
                     if _pred_price > 0 and target:
                         _log_pred(target, _pred_verdict, _pred_price, _pred_target)
-                    _score_result = locals().get("result")
-                    _sc_fund = int(getattr(_score_result, "__getitem__", lambda i: [None, 0, {}])(1) if _score_result else 0) if isinstance(_score_result, (list, tuple)) and len(_score_result) > 1 else 0
-                    _sc_blend = int(sc_data.get("blended_score", 0) or 0)
-                    _sc_tech = int(sc_data.get("tech_score", 0) or 0)
-                    _log_score(target, _sc_fund, _sc_tech, _sc_blend, _pred_verdict)
+                    # Use the canonical EisaX score that the scorecard
+                    # already computed (`final`) instead of digging it back
+                    # out of the `result` tuple — the previous nested-getattr
+                    # expression silently fell through to 0 on every run, so
+                    # score_history was full of zero rows that broke the
+                    # velocity / trend chart calculations.
+                    _sc_fund  = int(final) if 'final' in dir() and final else 0
+                    _sc_blend = int(sc_data.get("blended_score") or final or 0)
+                    _sc_tech  = int(sc_data.get("tech_score") or 0)
+                    if _sc_fund > 0 or _sc_blend > 0:
+                        _log_score(target, _sc_fund, _sc_tech, _sc_blend, _pred_verdict)
+                    else:
+                        logger.debug(f"[PredTracker] skipping log_score for {target}: zero scores")
 
                     # ── #1 Score Velocity ──────────────────────────────────────
                     _velocity = _get_velocity(target)
