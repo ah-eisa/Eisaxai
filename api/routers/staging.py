@@ -1511,6 +1511,19 @@ async def staging_chart_data(request: Request, ticker: str = ""):
     except Exception:
         pass
 
+    # Fallback: investing.com for UAE/local market tickers (DFM/ADX, Saudi, EGX, etc.)
+    if df is None or df.empty:
+        try:
+            from core.market_data_engine import UAE_INVESTING, _fetch_investing
+            info = UAE_INVESTING.get(ticker)
+            if info:
+                _start_str = (_dt.now() - _td(days=90)).strftime("%Y-%m-%d")
+                _df = await run_in_threadpool(_fetch_investing, ticker, info, _start_str)
+                if _df is not None and not _df.empty:
+                    df = _df
+        except Exception:
+            pass
+
     if df is None or df.empty:
         return JSONResponse({"error": "No historical data available", "ticker": ticker})
 
