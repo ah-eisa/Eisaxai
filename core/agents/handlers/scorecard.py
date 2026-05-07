@@ -299,21 +299,44 @@ class ScorecardMixin:
                 verdict_sc    = _de_result['verdict']
                 decision_type = _classify_decision_type(verdict_sc, _de_labels)
 
-                # ── RULE 8A — Final enforcement in _build_scorecard_md ────────
-                # Even after decision engine, if score ≥ 75 AND upside ≥ 20%:
-                # Fundamental Verdict = BUY. Weak technicals = Entry Timing only.
+                # ── RULE 8A — Total-Return tiered enforcement ─────────────────
+                # Use TOTAL RETURN (price upside + dividend yield), not price
+                # upside alone, so mature dividend-rich stocks (Aramco, Gulf
+                # banks, telcos) aren't permanently stuck at HOLD just because
+                # their price-to-target gap is small. Threshold tightens as
+                # quality drops, so weak-quality names still need a big gap.
                 _upside_r8a = (
                     (sc_data['target'] - sc_data['price']) / sc_data['price'] * 100
                     if sc_data.get('target') and sc_data.get('price') else 0.0
                 )
-                if final >= 75 and _upside_r8a >= 20.0 and verdict_sc not in ('BUY', 'STRONG BUY'):
+                # _safe_div_yield returns decimal (0.05 = 5%); convert to %.
+                # Defensive cap at 10% — data sources occasionally hit the
+                # _safe_div_yield 30% ceiling for corrupt rows (e.g. Aramco
+                # has ~5% but yfinance can return 30.0). A real common-stock
+                # sustainable yield above 10% is exceedingly rare; capping
+                # here prevents the Rule 8A promotion from being gamed by
+                # bad upstream data.
+                _div_y_raw = float(sc_data.get('dividend_yield') or 0.0)
+                _div_y_r8a = _div_y_raw * 100 if _div_y_raw <= 1.0 else _div_y_raw
+                _div_y_r8a = min(_div_y_r8a, 10.0)
+                _total_ret_r8a = _upside_r8a + _div_y_r8a
+                _r8a_promote = False
+                _r8a_tier    = None
+                if final >= 80 and _total_ret_r8a >= 12.0:
+                    _r8a_promote, _r8a_tier = True, "high-quality (≥80, TR≥12%)"
+                elif final >= 70 and _total_ret_r8a >= 15.0:
+                    _r8a_promote, _r8a_tier = True, "good-quality (≥70, TR≥15%)"
+                elif final >= 60 and _total_ret_r8a >= 20.0:
+                    _r8a_promote, _r8a_tier = True, "acceptable (≥60, TR≥20%)"
+                if _r8a_promote and verdict_sc not in ('BUY', 'STRONG BUY'):
                     verdict_sc = 'BUY'
                     conviction = 'High' if final >= 80 else 'Medium'
                     emoji      = '🟢'
                     sc_data['_rule8a_applied'] = True
                     logger.info(
-                        f"[Rule8A] {target}: Score={final}, Upside={_upside_r8a:.1f}%"
-                        f" → Fundamental=BUY (was {_de_result['verdict']})"
+                        f"[Rule8A] {target}: Score={final}, Upside={_upside_r8a:.1f}%, "
+                        f"DivYield={_div_y_r8a:.2f}%, TotalReturn={_total_ret_r8a:.1f}% "
+                        f"→ Fundamental=BUY [{_r8a_tier}] (was {_de_result['verdict']})"
                     )
             except Exception as _de_err:
                 import logging as _de_log
