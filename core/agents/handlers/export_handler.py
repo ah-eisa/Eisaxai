@@ -152,13 +152,39 @@ class ExportMixin:
         except Exception as e:
              return {"type": "error", "reply": f"Export failed: {e}"}
 
-    def _save_to_brain(self, target, reply_text, real_price, analyst_target, fund, news_sent):
-        """Save analysis verdict and stock knowledge to the Brain DB."""
+    def _save_to_brain(self, target, reply_text, real_price, analyst_target, fund, news_sent,
+                       verdict=None, currency_sym="$"):
+        """Save analysis verdict and stock knowledge to the Brain DB.
+
+        Prefer the explicit ``verdict`` arg (the value computed by the
+        scorecard / decision engine). Fall back to the legacy text-scrape
+        only when the caller doesn't pass one — and even then, exclude
+        well-known false-positive contexts ("SELL-side consensus",
+        "Last verdict: HOLD", "Tactical HOLD").
+        """
         try:
             from learning_engine import get_engine
-            _ru = reply_text.upper()
-            _bv = "SELL" if ("SELL" in _ru or "REDUCE" in _ru) else "HOLD" if "HOLD" in _ru else "BUY"
+            if verdict:
+                _bv = str(verdict).upper().strip()
+                if _bv == "STRONG BUY":
+                    _bv = "BUY"
+                if _bv not in ("BUY", "HOLD", "SELL", "REDUCE", "AVOID"):
+                    _bv = "HOLD"
+            else:
+                # Defensive scrape — strip false-positive phrases first.
+                import re as _re_brain
+                _stripped = _re_brain.sub(
+                    r"(sell-?side|last verdict[^\n]*|tactical (buy|hold|reduce)|do not (buy|sell)|why not (buy|sell))",
+                    "", reply_text, flags=_re_brain.IGNORECASE,
+                )
+                _ru = _stripped.upper()
+                _bv = (
+                    "SELL"   if ("SELL" in _ru or "REDUCE" in _ru) else
+                    "HOLD"   if "HOLD" in _ru else
+                    "BUY"
+                )
             if real_price and real_price > 0:
+                _price_str = f"{currency_sym}{real_price:,.2f}"
                 _bc = get_engine()._get_conn()
                 _bc.execute(
                     "INSERT INTO predictions (ticker, prediction_date, verdict, price_at_prediction, target_price, horizon_days) VALUES (?, date('now'), ?, ?, ?, 30)",
@@ -166,11 +192,11 @@ class ExportMixin:
                 )
                 _bc.execute(
                     "INSERT INTO stock_knowledge (ticker, company_name, sector, summary, last_price, last_verdict, last_sentiment, analysis_count, first_seen, last_updated, tags) VALUES (?, ?, ?, ?, ?, ?, ?, 1, date('now'), datetime('now'), '[]') ON CONFLICT(ticker) DO UPDATE SET last_price=excluded.last_price, last_verdict=excluded.last_verdict, last_updated=excluded.last_updated, analysis_count=analysis_count+1",
-                    (target, fund.get('company_name', target), fund.get('sector', 'Unknown'), f"{_bv} @ ${real_price:.2f}", real_price, _bv, news_sent or 'Neutral')
+                    (target, fund.get('company_name', target), fund.get('sector', 'Unknown'), f"{_bv} @ {_price_str}", real_price, _bv, news_sent or 'Neutral')
                 )
                 _bc.commit()
                 _bc.close()
-                logger.info(f"[Brain] Saved: {target} {_bv} @ ${real_price:.2f}")
+                logger.info(f"[Brain] Saved: {target} {_bv} @ {_price_str}")
         except Exception as _be:
             logger.warning(f"[Brain] Warning: {_be}")
 

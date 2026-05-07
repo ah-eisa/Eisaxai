@@ -4259,7 +4259,11 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 })
 
                 # Save to brain (raw — Layer 2, source of truth)
-                self._save_to_brain(target, reply, real_price, analyst_target, fund, news_sent)
+                self._save_to_brain(
+                    target, reply, real_price, analyst_target, fund, news_sent,
+                    verdict=verdict_sc if 'verdict_sc' in dir() else None,
+                    currency_sym=_currency_sym if '_currency_sym' in dir() else "$",
+                )
 
                 # Rule-based editorial — instant, no LLM, safe for main response
                 try:
