@@ -2,7 +2,19 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional
 import logging
+import os
+import state
+import config
+from datetime import datetime
 from core.intent_classifier import IntentClassifier
+from core.fixed_income import (
+    is_fixed_income_query, extract_isin,
+    get_instrument_data, compute_fi_score, format_fi_for_prompt,
+    detect_sukuk_query_language,
+)
+from core.egypt_bonds import (
+    is_egypt_bond_query, get_egypt_bond_data, format_egypt_bonds_for_prompt,
+)
 logger = logging.getLogger(__name__)
 
 

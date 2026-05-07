@@ -103,6 +103,29 @@
       gap: 4px;
     }
 
+    .token-form {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .token-input {
+      min-width: 220px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      background: var(--surface);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 12px;
+    }
+
+    .token-note {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
     button {
       cursor: pointer;
       font-family: inherit;
@@ -222,6 +245,11 @@
     </div>
     <button id="btn-clear"  onclick="clearLogs()">Clear</button>
     <button id="btn-pause"  onclick="togglePause()">Pause</button>
+    <form id="tokenForm" class="token-form" autocomplete="off" hidden>
+      <input id="tokenInput" class="token-input" type="password" placeholder="Enter admin password" />
+      <button type="submit">Sign In</button>
+    </form>
+    <span class="token-note">4-hour admin session via HttpOnly cookie. No token stored in browser.</span>
     <span   id="count-badge">0 entries</span>
   </div>
 
@@ -239,7 +267,6 @@
   /* ── Constants ── */
   const MAX_ENTRIES    = 500;
   const RETRY_DELAY_MS = 3000;
-  const TOKEN          = (typeof window.__AT !== 'undefined' && window.__AT) ? window.__AT : '';
 
   /* ── State ── */
   let activeFilter  = 'ALL';
@@ -257,6 +284,8 @@
   const statusText  = document.getElementById('status-text');
   const btnPause    = document.getElementById('btn-pause');
   const reconnNotice= document.getElementById('reconnect-notice');
+  const tokenForm   = document.getElementById('tokenForm');
+  const tokenInput  = document.getElementById('tokenInput');
 
   /* We'll scroll the window since #log-list is a direct child of #app (flex column).
      Actually wrap it: give log-list a scrollable parent. */
@@ -359,46 +388,111 @@
     reconnNotice.style.display = (state === 'offline') ? 'block' : 'none';
   }
 
-  /* ── SSE connection ── */
-  function connect() {
-    if (es) { try { es.close(); } catch(e) {} es = null; }
+  function showLoginForm(msg) {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    tokenForm.hidden = false;
+    tokenInput.focus();
+    if (msg) setStatus('offline', msg);
+  }
 
-    const url = '/admin/logs/stream' + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+  function hideLoginForm() {
+    tokenForm.hidden = true;
+  }
+
+  async function adminLogin(password) {
+    const response = await fetch('/admin/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+    if (!response.ok) {
+      throw new Error(response.status === 403 ? 'Invalid admin password' : 'HTTP ' + response.status);
+    }
+  }
+
+  async function adminLogout() {
+    await fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    showLoginForm();
+  }
+
+  function handleEventData(raw) {
+    try {
+      const obj  = JSON.parse(raw);
+      const line = obj.line || raw;
+      if (line) appendEntry(line);
+    } catch (e) {
+      if (raw) appendEntry(raw);
+    }
+  }
+
+  /* ── SSE connection ── */
+  async function connect() {
+    if (es) { try { es.abort(); } catch (e) {} es = null; }
+
+    const controller = new AbortController();
+    es = controller;
     setStatus('', 'connecting…');
 
     try {
-      es = new EventSource(url);
-    } catch (e) {
-      scheduleRetry();
-      return;
-    }
+      const response = await fetch('/admin/logs/stream', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { 'Accept': 'text/event-stream' },
+        signal: controller.signal
+      });
 
-    es.onopen = function () {
+      if (response.status === 401 || response.status === 403) {
+        es = null;
+        showLoginForm('Session expired — sign in again');
+        return;
+      }
+
+      if (!response.ok || !response.body) {
+        throw new Error('HTTP ' + response.status);
+      }
+
+      hideLoginForm();
       setStatus('live', 'live');
       reconnNotice.style.display = 'none';
-    };
 
-    es.onmessage = function (evt) {
-      if (paused) return;
-      try {
-        const obj  = JSON.parse(evt.data);
-        const line = obj.line || evt.data;
-        if (line) appendEntry(line);
-      } catch (e) {
-        if (evt.data) appendEntry(evt.data);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        buffer += decoder.decode(result.value, { stream: true });
+
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary !== -1) {
+          const chunk = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          chunk.split(/\r?\n/).forEach(line => {
+            if (paused || !line.startsWith('data:')) return;
+            handleEventData(line.slice(5).trim());
+          });
+          boundary = buffer.indexOf('\n\n');
+        }
       }
-    };
 
-    es.onerror = function () {
-      es.close();
       es = null;
       setStatus('offline', 'disconnected');
       scheduleRetry();
-    };
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      es = null;
+      setStatus('offline', 'disconnected');
+      scheduleRetry();
+    }
   }
 
   function scheduleRetry() {
-    if (retryTimer) return;
+    if (retryTimer || !tokenForm.hidden) return;
     setStatus('offline', 'reconnecting in 3s…');
     retryTimer = setTimeout(function () {
       retryTimer = null;
@@ -411,6 +505,26 @@
     const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 60);
     autoScroll = nearBottom;
   }, { passive: true });
+
+  tokenForm.addEventListener('submit', function (event) {
+    event.preventDefault();
+    const password = tokenInput.value.trim();
+    if (!password) {
+      showLoginForm('Admin password required');
+      return;
+    }
+    setStatus('', 'signing in…');
+    adminLogin(password)
+      .then(() => {
+        tokenInput.value = '';
+        hideLoginForm();
+        connect();
+      })
+      .catch((error) => {
+        setStatus('offline', error.message || 'sign-in failed');
+        tokenInput.focus();
+      });
+  });
 
   /* ── Kick off ── */
   updateCount();
