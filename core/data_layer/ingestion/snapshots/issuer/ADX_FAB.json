@@ -1,0 +1,19 @@
+{
+  "ticker": "ADX:FAB",
+  "reviewer": "seed",
+  "captured_at": "2026-05-17",
+  "fields": [
+    {
+      "field": "parent_company",
+      "value": "Mubadala / ADQ",
+      "source_type": "issuer",
+      "source_url": "https://www.bankfab.com/en-ae/about-fab/investor-relations/annual-report",
+      "document_id": "fab_annual_report_2023_governance_section",
+      "captured_at": "2026-05-17",
+      "captured_by": "seed",
+      "confidence": 0.9,
+      "methodology": "fab_annual_report_2023_governance_section",
+      "data_quality": "verified"
+    }
+  ]
+}

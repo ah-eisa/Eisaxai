@@ -1,0 +1,138 @@
+{
+  "archetype": "02_uae_utility",
+  "display_name": "Dubai Electricity & Water Authority",
+  "entry": {
+    "country": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "dfm_listing",
+      "source_type": "exchange",
+      "value": "UAE"
+    },
+    "dividend_stability_score": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "domestic_vs_export_split": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "exchange": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "dfm_listing",
+      "source_type": "exchange",
+      "value": "DFM"
+    },
+    "free_float_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "government_ownership_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "inclusion_indices": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "notes": "DEWA — Dubai Electricity & Water Authority, sovereign-controlled utility.",
+    "oil_beta_dependency": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "parent_company": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "dewa_ipo_prospectus_2022",
+      "source_type": "issuer",
+      "value": "Government of Dubai (Investment Corporation of Dubai)"
+    },
+    "sector": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "dfm_sector_assignment",
+      "source_type": "exchange",
+      "value": "Utilities"
+    },
+    "shariah_compliant_flag": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.8,
+      "data_quality": "derived",
+      "fallback_used": false,
+      "methodology": "derived_from:S&P GCC Shariah Index:spdji_gcc_shariah_2024_constituents",
+      "source_type": "derived",
+      "value": true
+    },
+    "source": "curated",
+    "sovereign_sensitivity": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "strategic_asset_flag": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "dewa_ipo_prospectus_2022",
+      "source_type": "issuer",
+      "value": true
+    },
+    "ticker": "DFM:DEWA"
+  },
+  "provenance_summary": {
+    "derived": 1,
+    "estimated": 0,
+    "fallback_used": 7,
+    "missing": 7,
+    "tier_1": 5,
+    "tier_2": 1,
+    "tier_3": 0,
+    "tier_4": 7,
+    "verified": 5
+  },
+  "ticker": "DFM:DEWA"
+}

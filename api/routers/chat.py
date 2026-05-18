@@ -150,7 +150,7 @@ async def pilot_report(
             report_text=html_report,
             analysis_data=analysis_result.get("data") or {},
             system_version=_APP_VERSION,
-            model_primary="DeepSeek V3",
+            model_primary="EisaX Agent",
             generated_at=generated_at,
             data_as_of=generated_at,
             latency_seconds=latency_seconds,
@@ -234,6 +234,33 @@ async def unified_chat(
     if payload.settings and isinstance(payload.settings, dict):
         active_file_id = payload.settings.get("active_file_id")
 
+    # ── Analytics intent detection — fast-path before LLM ─────────────────────
+    if not payload.files and not active_file_id:
+        try:
+            from core.analytics_intent_router import route_message as _route_analytics
+            _analytics_reply = _route_analytics(message, payload.user_id)
+            if _analytics_reply:
+                orchestrator.session_mgr.save_message(
+                    session_id, payload.user_id, "user", message
+                )
+                orchestrator.session_mgr.save_message(
+                    session_id, payload.user_id, "assistant", _analytics_reply
+                )
+                return JSONResponse(
+                    content={
+                        "reply":        _analytics_reply,
+                        "session_id":   session_id,
+                        "agent":        "PortfolioAnalytics",
+                        "model":        None,
+                        "download_url": None,
+                        "format":       "markdown",
+                        "quota":        orchestrator.session_mgr.get_user_daily_usage(payload.user_id),
+                    },
+                    headers=orchestrator.session_mgr.get_quota_header(payload.user_id),
+                )
+        except Exception as _ai_err:
+            logger.warning(f"[analytics_intent_router] non-fatal error: {_ai_err}")
+
     if not payload.files and not active_file_id and _should_resolve_direct_analysis_request(message):
         from core.services.entity_resolution import EntityResolution, resolve_asset_entity
 
@@ -309,6 +336,49 @@ async def unified_chat(
                            + "User question: " + message)
         except Exception:
             pass
+
+    # ── Institutional allocator fast-path ─────────────────────────────────
+    # Route portfolio-build intents (EN/AR) to the validated A-G/H/I
+    # _run_allocator instead of the legacy LLM "EisaX Portfolio Pipeline".
+    # Falls through to the orchestrator on any error or non-match.
+    if not payload.files and not active_file_id:
+        try:
+            from portfolio_builder import detect_and_build as _pb_detect
+            _inst_settings_lang = ""
+            if payload.settings and isinstance(payload.settings, dict):
+                _inst_settings_lang = str(payload.settings.get("language") or "").strip().lower()
+            if _inst_settings_lang.startswith("ar"):
+                _inst_lang = "ar"
+            elif _inst_settings_lang.startswith("en"):
+                _inst_lang = "en"
+            else:
+                _inst_lang = "ar" if any("؀" <= ch <= "ۿ" for ch in message) else "en"
+            _inst_md = _pb_detect(message, language=_inst_lang)
+            if _inst_md:
+                orchestrator.session_mgr.save_message(
+                    session_id, payload.user_id, "user", message
+                )
+                orchestrator.session_mgr.save_message(
+                    session_id, payload.user_id, "assistant", _inst_md
+                )
+                quota = orchestrator.session_mgr.get_user_daily_usage(payload.user_id)
+                return JSONResponse(
+                    content={
+                        "reply": _inst_md,
+                        "session_id": session_id,
+                        "agent": "EisaX Institutional Allocator",
+                        "model": "phase_h+phase_i",
+                        "download_url": None,
+                        "format": "markdown",
+                        "quota": quota,
+                    },
+                    headers=orchestrator.session_mgr.get_quota_header(payload.user_id),
+                )
+        except Exception as _inst_err:
+            logger.warning(
+                "[institutional-allocator] fast-path failed; falling through: %s",
+                _inst_err,
+            )
 
     result = await orchestrator.process_message(
         user_id=payload.user_id,

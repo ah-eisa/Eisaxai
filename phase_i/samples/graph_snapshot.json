@@ -1,0 +1,2252 @@
+{
+  "built_from_hash": "528ee8c284a7a828ed4b75d351118a3b971d2e657d509005cadaca0e9f1be403",
+  "edge_count": 108,
+  "edges": [
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "1d26bcd3e6572425",
+      "from_id": "ADX:ADCB",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "834080d3543cc2f0",
+      "from_id": "ADX:ADIB",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "d824cf0201c00641",
+      "from_id": "ADX:ADIB",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "a03d8f34c90c049b",
+      "from_id": "ADX:ADNOCDIST",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "adnoc_distribution_ipo_prospectus_2017",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "a67bd23a0dacfb7d",
+      "from_id": "ADX:ADNOCDIST",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "079f162122c0ec1e",
+      "from_id": "ADX:ADNOCDIST",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "5be7a126b2304c27",
+      "from_id": "ADX:ADNOCDRILL",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "adnoc_drilling_ipo_prospectus_2021",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "40a0e798929e1453",
+      "from_id": "ADX:ADNOCDRILL",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "2a00fe0a44f897ef",
+      "from_id": "ADX:ADNOCDRILL",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "b515f80fcfe054f5",
+      "from_id": "ADX:ADNOCGAS",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "adnoc_gas_ipo_prospectus_2023",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "34b8e88412973256",
+      "from_id": "ADX:ADNOCGAS",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "7808453c741473b2",
+      "from_id": "ADX:ADNOCGAS",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "bd221bca24ba9a20",
+      "from_id": "ADX:ALDAR",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "523d527d943c8b94",
+      "from_id": "ADX:ALPHADHABI",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "8630b144933e22be",
+      "from_id": "ADX:EAND",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "c098602f65897813",
+      "from_id": "ADX:FAB",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "fab_annual_report_2023_major_shareholders",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "9ba747eeb1c662d6",
+      "from_id": "ADX:FAB",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "b114f2efeed2fbb4",
+      "from_id": "ADX:IHC",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "ihc_annual_report_2023_governance_chapter",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3ceed2747e8f356a",
+      "from_id": "ADX:IHC",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "a5bf7f3b8b8f6ead",
+      "from_id": "ADX:MULTIPLY",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "4916f4c0f32b88ba",
+      "from_id": "ADX:PUREHEALTH",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3ae826e6d8718910",
+      "from_id": "ADX:Q",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "0540c33ad127c01b",
+      "from_id": "ADX:TAQA",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "taqa_annual_report_2023_shareholders",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "ec7b97ccd4bb98be",
+      "from_id": "ADX:TAQA",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:ADX",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.8,
+      "edge_id": "b379f121a51971de",
+      "from_id": "ADX:TAQA",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "6832e55d3506bb05",
+      "from_id": "BHB:ALBH",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:BHB",
+      "to_id": "REG:CBB",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "4657f149eee85713",
+      "from_id": "DFM:CBD",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "8f41fb4ea17b044a",
+      "from_id": "DFM:DAMAC",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "e46c8ab60f92da7a",
+      "from_id": "DFM:DEWA",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "dewa_ipo_prospectus_2022",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "81cc2dd730e6f185",
+      "from_id": "DFM:DEWA",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.8,
+      "edge_id": "be117b9f5153081a",
+      "from_id": "DFM:DEWA",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "7bfa43966729aa14",
+      "from_id": "DFM:DIB",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "b501f5b6ebf0eb2f",
+      "from_id": "DFM:DIB",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "8120001ed332de47",
+      "from_id": "DFM:DUBAIINV",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "78624ebe6b61e3a3",
+      "from_id": "DFM:EMAAR",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "emaar_annual_report_2023_shareholding_section",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "2575c0c7a6f90422",
+      "from_id": "DFM:EMAAR",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.8,
+      "edge_id": "3a1e060f2428de40",
+      "from_id": "DFM:EMAAR",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "4761f7ecb664228e",
+      "from_id": "DFM:EMAARDEV",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "132b74c848f9173e",
+      "from_id": "DFM:EMIRATESNBD",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "emirates_nbd_annual_report_2023",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "7847b6c3d2fd89a1",
+      "from_id": "DFM:EMIRATESNBD",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "22c314493d38d72f",
+      "from_id": "DFM:MASHREQ",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "d8dadb6f312ecbaf",
+      "from_id": "DFM:SALIK",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "salik_ipo_prospectus_2022",
+      "to_id": "SOV:UAE",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "2fda6780cf4e5d14",
+      "from_id": "DFM:SALIK",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "45c0732f145916ca",
+      "from_id": "DFM:UPP",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:DFM",
+      "to_id": "REG:SCA-UAE",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "6d09ed3e39087e4d",
+      "from_id": "EGX:COMI",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:EGX",
+      "to_id": "REG:FRA-EG",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "30862462bfc4750c",
+      "from_id": "EGX:FWRY",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:EGX",
+      "to_id": "REG:FRA-EG",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "1f9b0317c230fb2f",
+      "from_id": "EGX:TMGH",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:EGX",
+      "to_id": "REG:FRA-EG",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "a44d6f93f90ce350",
+      "from_id": "KSE:AGLTY",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:KSE",
+      "to_id": "REG:CMA-KW",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3db773eed1e3c101",
+      "from_id": "KSE:KFH",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:KSE",
+      "to_id": "REG:CMA-KW",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3ddce6b9b305d49f",
+      "from_id": "KSE:KFH",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "30f95ccbd5f659a1",
+      "from_id": "KSE:MEZZAN",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:KSE",
+      "to_id": "REG:CMA-KW",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.75,
+      "edge_id": "5aa6997a41f3f07a",
+      "from_id": "KSE:NBK",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "nbk_annual_report_2023_governance",
+      "to_id": "SOV:KUWAIT",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "d4cdd6ebae910f7b",
+      "from_id": "KSE:NBK",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:KSE",
+      "to_id": "REG:CMA-KW",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "6f9692c8e2b2241f",
+      "from_id": "KSE:ZAIN",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:KSE",
+      "to_id": "REG:CMA-KW",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "e7e4b5e84e02dc01",
+      "from_id": "QSE:IQCD",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "iqcd_annual_report_2022_ownership_chapter",
+      "to_id": "SOV:QATAR",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "2bacf45aa4042f38",
+      "from_id": "QSE:IQCD",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:QSE",
+      "to_id": "REG:QFMA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "a40d308da78a41f7",
+      "from_id": "QSE:IQCD",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "f582501b27c61498",
+      "from_id": "QSE:ORDS",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "ooredoo_annual_report_2023_shareholders",
+      "to_id": "SOV:QATAR",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "c32669b384b9d53b",
+      "from_id": "QSE:ORDS",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:QSE",
+      "to_id": "REG:QFMA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "481bb2ae631abe12",
+      "from_id": "QSE:QFLS",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:QSE",
+      "to_id": "REG:QFMA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "907f81684d044f70",
+      "from_id": "QSE:QIBK",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:QSE",
+      "to_id": "REG:QFMA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "d5a9db29d6b6a018",
+      "from_id": "QSE:QIBK",
+      "methodology": "derived_from_index_membership:S&P GCC Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_gcc_shariah_2024_constituents",
+      "to_id": "IDX:SP-GCC-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "628df068bfdee875",
+      "from_id": "QSE:QNBK",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "qnb_annual_report_2023_major_shareholders",
+      "to_id": "SOV:QATAR",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "a8ae63fd98e56579",
+      "from_id": "QSE:QNBK",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:QSE",
+      "to_id": "REG:QFMA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "4e1745e125fe6a25",
+      "from_id": "TADAWUL:1010",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3d6817e10d7628d1",
+      "from_id": "TADAWUL:1120",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "711c2def8c6a7962",
+      "from_id": "TADAWUL:1120",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "c506a1e1860e8217",
+      "from_id": "TADAWUL:1140",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "d26e37dd2a09d60f",
+      "from_id": "TADAWUL:1140",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "0b0c0ea393565d8b",
+      "from_id": "TADAWUL:1150",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "cb3c542ac6d9eded",
+      "from_id": "TADAWUL:1150",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "12781132bb95f257",
+      "from_id": "TADAWUL:1180",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "snb_annual_report_2023_major_shareholders",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "22badac90be494a7",
+      "from_id": "TADAWUL:1180",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "1cc37a6a1cd47496",
+      "from_id": "TADAWUL:1211",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "maaden_annual_report_2023_shareholding_section",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "923882081a04009b",
+      "from_id": "TADAWUL:1211",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "b877881b04068c41",
+      "from_id": "TADAWUL:1211",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "fca713bfa574d21b",
+      "from_id": "TADAWUL:2010",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "sabic_acquisition_disclosure_2020",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3d9c7c46b5a5b016",
+      "from_id": "TADAWUL:2010",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "82ac5fbebb71afae",
+      "from_id": "TADAWUL:2010",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "836abc875103136b",
+      "from_id": "TADAWUL:2082",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "acwa_power_ipo_prospectus_2021",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "e0fc3a7a76609349",
+      "from_id": "TADAWUL:2082",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "b2fe422c6fd859f7",
+      "from_id": "TADAWUL:2082",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "12ce8d4cb09b2b15",
+      "from_id": "TADAWUL:2222",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "aramco_ipo_prospectus_2019_ownership_section",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "57ff84346438fc85",
+      "from_id": "TADAWUL:2222",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "f6b9b9d068063202",
+      "from_id": "TADAWUL:2222",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "4cffefe2131e035a",
+      "from_id": "TADAWUL:2280",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "4091678acc53ef16",
+      "from_id": "TADAWUL:2280",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "9d7e01a23b119050",
+      "from_id": "TADAWUL:2350",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "19336729738d263d",
+      "from_id": "TADAWUL:2380",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "59ee4cfb3236c5e1",
+      "from_id": "TADAWUL:2381",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "614a1fb454957b19",
+      "from_id": "TADAWUL:3030",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "649a3ec301b7b929",
+      "from_id": "TADAWUL:4001",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "6db3c8e5f680e7a3",
+      "from_id": "TADAWUL:4020",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "93e97527673fc5ab",
+      "from_id": "TADAWUL:4090",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "9ef864d76459f329",
+      "from_id": "TADAWUL:4190",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.8,
+      "edge_id": "1337bad3a7e80b17",
+      "from_id": "TADAWUL:4190",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "515137b0229e6867",
+      "from_id": "TADAWUL:4240",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "960102017e670def",
+      "from_id": "TADAWUL:5110",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "saudi_electricity_disclosure_2022",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "dc74afc85158a5fd",
+      "from_id": "TADAWUL:5110",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "c3a8612baa294711",
+      "from_id": "TADAWUL:5110",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "84168570e201a1ea",
+      "from_id": "TADAWUL:6010",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "edge_id": "7571bbc2fb55fd9e",
+      "from_id": "TADAWUL:7010",
+      "methodology": "curated_sovereign_ownership_table",
+      "provenance_tier": 1,
+      "relation": "owned_by",
+      "review_status": "unreviewed",
+      "source_document_id": "stc_annual_report_2023_major_shareholders",
+      "to_id": "SOV:KSA",
+      "truth_type": "asserted"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "ff61edd1a6096dea",
+      "from_id": "TADAWUL:7010",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "b65fa9c057f171a1",
+      "from_id": "TADAWUL:7010",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "f44d6e33f7e4f81b",
+      "from_id": "TADAWUL:7020",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "edge_id": "5e746bc8e34a34a7",
+      "from_id": "TADAWUL:7020",
+      "methodology": "derived_from_index_membership:S&P Saudi Arabia Shariah Index",
+      "provenance_tier": 2,
+      "relation": "shariah_compliant_per",
+      "review_status": "unreviewed",
+      "source_document_id": "spdji_saudi_shariah_2024_constituents",
+      "to_id": "IDX:SP-KSA-SHARIAH",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "3950be79c5daaf22",
+      "from_id": "TADAWUL:7030",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    },
+    {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.95,
+      "edge_id": "81e9e7f4a7cd256f",
+      "from_id": "TADAWUL:8210",
+      "methodology": "derived_from:exchange_listing_to_regulator_mapping",
+      "provenance_tier": 2,
+      "relation": "regulated_by",
+      "review_status": "unreviewed",
+      "source_document_id": "exchange_listing:Tadawul",
+      "to_id": "REG:CMA-KSA",
+      "truth_type": "derived"
+    }
+  ],
+  "node_count": 86,
+  "nodes": [
+    {
+      "attributes": {
+        "source_document_id": "ftse_em_methodology"
+      },
+      "country": "Global",
+      "id": "IDX:FTSE-EM",
+      "kind": "index",
+      "label": "FTSE Emerging Markets Index"
+    },
+    {
+      "attributes": {
+        "source_document_id": "msci_em_methodology"
+      },
+      "country": "Global",
+      "id": "IDX:MSCI-EM",
+      "kind": "index",
+      "label": "MSCI Emerging Markets Index"
+    },
+    {
+      "attributes": {
+        "source_document_id": "spdji_gcc_composite_methodology"
+      },
+      "country": "Regional",
+      "id": "IDX:SP-GCC",
+      "kind": "index",
+      "label": "S&P GCC Composite Index"
+    },
+    {
+      "attributes": {
+        "source_document_id": "spdji_gcc_shariah_methodology"
+      },
+      "country": "Regional",
+      "id": "IDX:SP-GCC-SHARIAH",
+      "kind": "index",
+      "label": "S&P GCC Shariah Index"
+    },
+    {
+      "attributes": {
+        "source_document_id": "spdji_saudi_shariah_methodology"
+      },
+      "country": "KSA",
+      "id": "IDX:SP-KSA-SHARIAH",
+      "kind": "index",
+      "label": "S&P Saudi Arabia Shariah Index"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "ADX:ADCB",
+      "kind": "issuer",
+      "label": "ADX:ADCB"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "ADX:ADIB",
+      "kind": "issuer",
+      "label": "ADX:ADIB"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Energy"
+      },
+      "country": "UAE",
+      "id": "ADX:ADNOCDIST",
+      "kind": "issuer",
+      "label": "ADX:ADNOCDIST"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Energy"
+      },
+      "country": "UAE",
+      "id": "ADX:ADNOCDRILL",
+      "kind": "issuer",
+      "label": "ADX:ADNOCDRILL"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Energy"
+      },
+      "country": "UAE",
+      "id": "ADX:ADNOCGAS",
+      "kind": "issuer",
+      "label": "ADX:ADNOCGAS"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Real Estate"
+      },
+      "country": "UAE",
+      "id": "ADX:ALDAR",
+      "kind": "issuer",
+      "label": "ADX:ALDAR"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "ADX:ALPHADHABI",
+      "kind": "issuer",
+      "label": "ADX:ALPHADHABI"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Communication Services"
+      },
+      "country": "UAE",
+      "id": "ADX:EAND",
+      "kind": "issuer",
+      "label": "ADX:EAND"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "ADX:FAB",
+      "kind": "issuer",
+      "label": "ADX:FAB"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "ADX:IHC",
+      "kind": "issuer",
+      "label": "ADX:IHC"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "ADX:MULTIPLY",
+      "kind": "issuer",
+      "label": "ADX:MULTIPLY"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Health Care"
+      },
+      "country": "UAE",
+      "id": "ADX:PUREHEALTH",
+      "kind": "issuer",
+      "label": "ADX:PUREHEALTH"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "ADX:Q",
+      "kind": "issuer",
+      "label": "ADX:Q"
+    },
+    {
+      "attributes": {
+        "exchange": "ADX",
+        "sector": "Utilities"
+      },
+      "country": "UAE",
+      "id": "ADX:TAQA",
+      "kind": "issuer",
+      "label": "ADX:TAQA"
+    },
+    {
+      "attributes": {
+        "exchange": "BHB",
+        "sector": "Materials"
+      },
+      "country": "Bahrain",
+      "id": "BHB:ALBH",
+      "kind": "issuer",
+      "label": "BHB:ALBH"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "DFM:CBD",
+      "kind": "issuer",
+      "label": "DFM:CBD"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Real Estate"
+      },
+      "country": "UAE",
+      "id": "DFM:DAMAC",
+      "kind": "issuer",
+      "label": "DFM:DAMAC"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Utilities"
+      },
+      "country": "UAE",
+      "id": "DFM:DEWA",
+      "kind": "issuer",
+      "label": "DFM:DEWA"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "DFM:DIB",
+      "kind": "issuer",
+      "label": "DFM:DIB"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "DFM:DUBAIINV",
+      "kind": "issuer",
+      "label": "DFM:DUBAIINV"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Real Estate"
+      },
+      "country": "UAE",
+      "id": "DFM:EMAAR",
+      "kind": "issuer",
+      "label": "DFM:EMAAR"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Real Estate"
+      },
+      "country": "UAE",
+      "id": "DFM:EMAARDEV",
+      "kind": "issuer",
+      "label": "DFM:EMAARDEV"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "DFM:EMIRATESNBD",
+      "kind": "issuer",
+      "label": "DFM:EMIRATESNBD"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Financials"
+      },
+      "country": "UAE",
+      "id": "DFM:MASHREQ",
+      "kind": "issuer",
+      "label": "DFM:MASHREQ"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Industrials"
+      },
+      "country": "UAE",
+      "id": "DFM:SALIK",
+      "kind": "issuer",
+      "label": "DFM:SALIK"
+    },
+    {
+      "attributes": {
+        "exchange": "DFM",
+        "sector": "Real Estate"
+      },
+      "country": "UAE",
+      "id": "DFM:UPP",
+      "kind": "issuer",
+      "label": "DFM:UPP"
+    },
+    {
+      "attributes": {
+        "exchange": "EGX",
+        "sector": "Financials"
+      },
+      "country": "Egypt",
+      "id": "EGX:COMI",
+      "kind": "issuer",
+      "label": "EGX:COMI"
+    },
+    {
+      "attributes": {
+        "exchange": "EGX",
+        "sector": "Information Technology"
+      },
+      "country": "Egypt",
+      "id": "EGX:FWRY",
+      "kind": "issuer",
+      "label": "EGX:FWRY"
+    },
+    {
+      "attributes": {
+        "exchange": "EGX",
+        "sector": "Real Estate"
+      },
+      "country": "Egypt",
+      "id": "EGX:TMGH",
+      "kind": "issuer",
+      "label": "EGX:TMGH"
+    },
+    {
+      "attributes": {
+        "exchange": "KSE",
+        "sector": "Industrials"
+      },
+      "country": "Kuwait",
+      "id": "KSE:AGLTY",
+      "kind": "issuer",
+      "label": "KSE:AGLTY"
+    },
+    {
+      "attributes": {
+        "exchange": "KSE",
+        "sector": "Financials"
+      },
+      "country": "Kuwait",
+      "id": "KSE:KFH",
+      "kind": "issuer",
+      "label": "KSE:KFH"
+    },
+    {
+      "attributes": {
+        "exchange": "KSE",
+        "sector": "Consumer Staples"
+      },
+      "country": "Kuwait",
+      "id": "KSE:MEZZAN",
+      "kind": "issuer",
+      "label": "KSE:MEZZAN"
+    },
+    {
+      "attributes": {
+        "exchange": "KSE",
+        "sector": "Financials"
+      },
+      "country": "Kuwait",
+      "id": "KSE:NBK",
+      "kind": "issuer",
+      "label": "KSE:NBK"
+    },
+    {
+      "attributes": {
+        "exchange": "KSE",
+        "sector": "Communication Services"
+      },
+      "country": "Kuwait",
+      "id": "KSE:ZAIN",
+      "kind": "issuer",
+      "label": "KSE:ZAIN"
+    },
+    {
+      "attributes": {
+        "exchange": "QSE",
+        "sector": "Materials"
+      },
+      "country": "Qatar",
+      "id": "QSE:IQCD",
+      "kind": "issuer",
+      "label": "QSE:IQCD"
+    },
+    {
+      "attributes": {
+        "exchange": "QSE",
+        "sector": "Communication Services"
+      },
+      "country": "Qatar",
+      "id": "QSE:ORDS",
+      "kind": "issuer",
+      "label": "QSE:ORDS"
+    },
+    {
+      "attributes": {
+        "exchange": "QSE",
+        "sector": "Consumer Staples"
+      },
+      "country": "Qatar",
+      "id": "QSE:QFLS",
+      "kind": "issuer",
+      "label": "QSE:QFLS"
+    },
+    {
+      "attributes": {
+        "exchange": "QSE",
+        "sector": "Financials"
+      },
+      "country": "Qatar",
+      "id": "QSE:QIBK",
+      "kind": "issuer",
+      "label": "QSE:QIBK"
+    },
+    {
+      "attributes": {
+        "exchange": "QSE",
+        "sector": "Financials"
+      },
+      "country": "Qatar",
+      "id": "QSE:QNBK",
+      "kind": "issuer",
+      "label": "QSE:QNBK"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1010",
+      "kind": "issuer",
+      "label": "TADAWUL:1010"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1120",
+      "kind": "issuer",
+      "label": "TADAWUL:1120"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1140",
+      "kind": "issuer",
+      "label": "TADAWUL:1140"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1150",
+      "kind": "issuer",
+      "label": "TADAWUL:1150"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1180",
+      "kind": "issuer",
+      "label": "TADAWUL:1180"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Materials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:1211",
+      "kind": "issuer",
+      "label": "TADAWUL:1211"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Materials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2010",
+      "kind": "issuer",
+      "label": "TADAWUL:2010"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Utilities"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2082",
+      "kind": "issuer",
+      "label": "TADAWUL:2082"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Energy"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2222",
+      "kind": "issuer",
+      "label": "TADAWUL:2222"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Consumer Staples"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2280",
+      "kind": "issuer",
+      "label": "TADAWUL:2280"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Materials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2350",
+      "kind": "issuer",
+      "label": "TADAWUL:2350"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Energy"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2380",
+      "kind": "issuer",
+      "label": "TADAWUL:2380"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Energy"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:2381",
+      "kind": "issuer",
+      "label": "TADAWUL:2381"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Materials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:3030",
+      "kind": "issuer",
+      "label": "TADAWUL:3030"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Consumer Staples"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:4001",
+      "kind": "issuer",
+      "label": "TADAWUL:4001"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Real Estate"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:4020",
+      "kind": "issuer",
+      "label": "TADAWUL:4020"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Real Estate"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:4090",
+      "kind": "issuer",
+      "label": "TADAWUL:4090"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Consumer Discretionary"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:4190",
+      "kind": "issuer",
+      "label": "TADAWUL:4190"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Consumer Discretionary"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:4240",
+      "kind": "issuer",
+      "label": "TADAWUL:4240"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Utilities"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:5110",
+      "kind": "issuer",
+      "label": "TADAWUL:5110"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Consumer Staples"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:6010",
+      "kind": "issuer",
+      "label": "TADAWUL:6010"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Communication Services"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:7010",
+      "kind": "issuer",
+      "label": "TADAWUL:7010"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Communication Services"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:7020",
+      "kind": "issuer",
+      "label": "TADAWUL:7020"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Communication Services"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:7030",
+      "kind": "issuer",
+      "label": "TADAWUL:7030"
+    },
+    {
+      "attributes": {
+        "exchange": "Tadawul",
+        "sector": "Financials"
+      },
+      "country": "KSA",
+      "id": "TADAWUL:8210",
+      "kind": "issuer",
+      "label": "TADAWUL:8210"
+    },
+    {
+      "attributes": {
+        "source_document_id": "bahrain_decree_64_of_2006"
+      },
+      "country": "Bahrain",
+      "id": "REG:CBB",
+      "kind": "regulator",
+      "label": "Central Bank of Bahrain"
+    },
+    {
+      "attributes": {
+        "source_document_id": "egypt_law_194_of_2020"
+      },
+      "country": "Egypt",
+      "id": "REG:CBE",
+      "kind": "regulator",
+      "label": "Central Bank of Egypt"
+    },
+    {
+      "attributes": {
+        "source_document_id": "kuwait_law_32_of_1968"
+      },
+      "country": "Kuwait",
+      "id": "REG:CBK",
+      "kind": "regulator",
+      "label": "Central Bank of Kuwait"
+    },
+    {
+      "attributes": {
+        "source_document_id": "uae_federal_law_14_2018"
+      },
+      "country": "UAE",
+      "id": "REG:CBUAE",
+      "kind": "regulator",
+      "label": "Central Bank of the UAE"
+    },
+    {
+      "attributes": {
+        "source_document_id": "ksa_capital_market_law_2003"
+      },
+      "country": "KSA",
+      "id": "REG:CMA-KSA",
+      "kind": "regulator",
+      "label": "Capital Market Authority (Saudi Arabia)"
+    },
+    {
+      "attributes": {
+        "source_document_id": "kuwait_law_7_of_2010"
+      },
+      "country": "Kuwait",
+      "id": "REG:CMA-KW",
+      "kind": "regulator",
+      "label": "Capital Markets Authority (Kuwait)"
+    },
+    {
+      "attributes": {
+        "source_document_id": "egypt_law_10_of_2009"
+      },
+      "country": "Egypt",
+      "id": "REG:FRA-EG",
+      "kind": "regulator",
+      "label": "Financial Regulatory Authority (Egypt)"
+    },
+    {
+      "attributes": {
+        "source_document_id": "qatar_law_13_of_2012"
+      },
+      "country": "Qatar",
+      "id": "REG:QCB",
+      "kind": "regulator",
+      "label": "Qatar Central Bank"
+    },
+    {
+      "attributes": {
+        "source_document_id": "qatar_law_8_of_2012"
+      },
+      "country": "Qatar",
+      "id": "REG:QFMA",
+      "kind": "regulator",
+      "label": "Qatar Financial Markets Authority"
+    },
+    {
+      "attributes": {
+        "source_document_id": "ksa_sama_law_2020"
+      },
+      "country": "KSA",
+      "id": "REG:SAMA",
+      "kind": "regulator",
+      "label": "Saudi Central Bank"
+    },
+    {
+      "attributes": {
+        "source_document_id": "uae_federal_law_4_of_2000"
+      },
+      "country": "UAE",
+      "id": "REG:SCA-UAE",
+      "kind": "regulator",
+      "label": "Securities and Commodities Authority (UAE)"
+    },
+    {
+      "attributes": {
+        "source_document_id": "bahrain_constitution_2002"
+      },
+      "country": "Bahrain",
+      "id": "SOV:BAHRAIN",
+      "kind": "sovereign",
+      "label": "Kingdom of Bahrain"
+    },
+    {
+      "attributes": {
+        "source_document_id": "egypt_constitution_2014"
+      },
+      "country": "Egypt",
+      "id": "SOV:EGYPT",
+      "kind": "sovereign",
+      "label": "Arab Republic of Egypt"
+    },
+    {
+      "attributes": {
+        "source_document_id": "saudi_basic_law_1992"
+      },
+      "country": "KSA",
+      "id": "SOV:KSA",
+      "kind": "sovereign",
+      "label": "Kingdom of Saudi Arabia"
+    },
+    {
+      "attributes": {
+        "source_document_id": "kuwait_constitution_1962"
+      },
+      "country": "Kuwait",
+      "id": "SOV:KUWAIT",
+      "kind": "sovereign",
+      "label": "State of Kuwait"
+    },
+    {
+      "attributes": {
+        "source_document_id": "qatar_permanent_constitution_2004"
+      },
+      "country": "Qatar",
+      "id": "SOV:QATAR",
+      "kind": "sovereign",
+      "label": "State of Qatar"
+    },
+    {
+      "attributes": {
+        "source_document_id": "uae_constitution_1971"
+      },
+      "country": "UAE",
+      "id": "SOV:UAE",
+      "kind": "sovereign",
+      "label": "United Arab Emirates"
+    }
+  ],
+  "phase_i_version": "0.1.0"
+}

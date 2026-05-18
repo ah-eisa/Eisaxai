@@ -1,0 +1,138 @@
+{
+  "archetype": "01_saudi_bank",
+  "display_name": "Saudi National Bank",
+  "entry": {
+    "country": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_listing",
+      "source_type": "exchange",
+      "value": "KSA"
+    },
+    "dividend_stability_score": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "domestic_vs_export_split": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "exchange": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_listing",
+      "source_type": "exchange",
+      "value": "Tadawul"
+    },
+    "free_float_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "government_ownership_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "inclusion_indices": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "notes": "Saudi National Bank — largest KSA lender.",
+    "oil_beta_dependency": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "parent_company": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "snb_annual_report_2023_major_shareholders",
+      "source_type": "issuer",
+      "value": "Public Investment Fund (PIF)"
+    },
+    "sector": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_sector_assignment",
+      "source_type": "exchange",
+      "value": "Financials"
+    },
+    "shariah_compliant_flag": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "source": "curated",
+    "sovereign_sensitivity": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "strategic_asset_flag": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "snb_annual_report_2023_major_shareholders",
+      "source_type": "issuer",
+      "value": false
+    },
+    "ticker": "TADAWUL:1180"
+  },
+  "provenance_summary": {
+    "derived": 0,
+    "estimated": 0,
+    "fallback_used": 8,
+    "missing": 8,
+    "tier_1": 5,
+    "tier_2": 0,
+    "tier_3": 0,
+    "tier_4": 8,
+    "verified": 5
+  },
+  "ticker": "TADAWUL:1180"
+}

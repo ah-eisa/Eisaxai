@@ -1,0 +1,138 @@
+{
+  "archetype": "03_gcc_industrial",
+  "display_name": "SABIC",
+  "entry": {
+    "country": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_listing",
+      "source_type": "exchange",
+      "value": "KSA"
+    },
+    "dividend_stability_score": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "domestic_vs_export_split": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "exchange": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_listing",
+      "source_type": "exchange",
+      "value": "Tadawul"
+    },
+    "free_float_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "government_ownership_pct": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "inclusion_indices": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "notes": "SABIC — petrochemical national champion.",
+    "oil_beta_dependency": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "parent_company": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "sabic_acquisition_disclosure_2020",
+      "source_type": "issuer",
+      "value": "PIF + Saudi Aramco"
+    },
+    "sector": {
+      "as_of_date": "2026-05-17",
+      "confidence": 1.0,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "tadawul_sector_assignment",
+      "source_type": "exchange",
+      "value": "Materials"
+    },
+    "shariah_compliant_flag": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.85,
+      "data_quality": "derived",
+      "fallback_used": false,
+      "methodology": "derived_from:S&P Saudi Arabia Shariah Index:spdji_saudi_shariah_2024_constituents",
+      "source_type": "derived",
+      "value": true
+    },
+    "source": "curated",
+    "sovereign_sensitivity": {
+      "as_of_date": null,
+      "confidence": 0.0,
+      "data_quality": "missing",
+      "fallback_used": true,
+      "methodology": "no_authoritative_source",
+      "source_type": "missing",
+      "value": null
+    },
+    "strategic_asset_flag": {
+      "as_of_date": "2026-05-17",
+      "confidence": 0.9,
+      "data_quality": "verified",
+      "fallback_used": false,
+      "methodology": "sabic_acquisition_disclosure_2020",
+      "source_type": "issuer",
+      "value": true
+    },
+    "ticker": "TADAWUL:2010"
+  },
+  "provenance_summary": {
+    "derived": 1,
+    "estimated": 0,
+    "fallback_used": 7,
+    "missing": 7,
+    "tier_1": 5,
+    "tier_2": 1,
+    "tier_3": 0,
+    "tier_4": 7,
+    "verified": 5
+  },
+  "ticker": "TADAWUL:2010"
+}

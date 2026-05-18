@@ -1,0 +1,19 @@
+{
+  "ticker": "TADAWUL:2222",
+  "reviewer": "seed",
+  "captured_at": "2026-05-17",
+  "fields": [
+    {
+      "field": "parent_company",
+      "value": "Government of Saudi Arabia / PIF",
+      "source_type": "issuer",
+      "source_url": "https://www.aramco.com/-/media/aramcoglobal/files/investors/aramco-ipo-prospectus-english.pdf",
+      "document_id": "aramco_ipo_prospectus_2019_ownership_section",
+      "captured_at": "2026-05-17",
+      "captured_by": "seed",
+      "confidence": 0.95,
+      "methodology": "aramco_ipo_prospectus_2019_ownership_section",
+      "data_quality": "verified"
+    }
+  ]
+}
