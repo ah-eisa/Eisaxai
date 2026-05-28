@@ -140,9 +140,18 @@ try:
     from engine import start_scheduler as _start_news_scheduler
     _news_init_db()
     app.include_router(_news_router, prefix="/v1")     # → /v1/news, /v1/news/latest …
-    _start_news_scheduler()
+    # Multi-worker dedup: only the first-spawned worker owns the scheduler.
+    # `EISAX_SCHEDULER_OWNER` is set by gunicorn's post_fork hook via an
+    # O_EXCL lock file; absent (default → "1") means single-worker setup.
     import logging as _lg
-    _lg.getLogger(__name__).info("[NewsEngine] Router included at /v1/news — scheduler started")
+    _scheduler_owner = os.getenv("EISAX_SCHEDULER_OWNER", "1") == "1"
+    if _scheduler_owner:
+        _start_news_scheduler()
+        _lg.getLogger(__name__).info("[NewsEngine] Router included at /v1/news — scheduler started")
+    else:
+        _lg.getLogger(__name__).info(
+            "[NewsEngine] Router included at /v1/news — scheduler skipped (worker is not owner)"
+        )
 except Exception as _ne:
     import logging as _lg
     _lg.getLogger(__name__).warning("[NewsEngine] Failed to include router: %s", _ne)
@@ -244,6 +253,14 @@ from api.routers.portfolio_upload import (
     _evict_old_files, _file_store_set, _file_store_get, _file_store_get_for_user,
 )
 app.include_router(portfolio_upload_router)
+
+# ── Portfolio analytics endpoints (macro sim, MC/VaR, shariah, optimize, etc.) ──
+try:
+    from api.routers.portfolio_analytics import router as portfolio_analytics_router
+    app.include_router(portfolio_analytics_router)
+except Exception as _pa_err:
+    import logging as _pa_log
+    _pa_log.getLogger("eisax.startup").warning(f"portfolio_analytics router not loaded: {_pa_err}")
 
 class MessagePayload(BaseModel):
     message: str = Field(..., max_length=16000)

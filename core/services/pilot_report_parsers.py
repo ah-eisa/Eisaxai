@@ -31,7 +31,7 @@ ENUMS = {
     "severity": {"low", "medium", "high"},
     "tracking_status": {"active", "paused", "closed"},
     "review_cycle": {"daily", "weekly", "monthly"},
-    "pilot_status": {"live_pilot", "demo", "archived"},
+    "pilot_status": {"institutional_pipeline", "live_pilot", "demo", "archived"},
     "asset_type": {"equity", "crypto", "commodity", "etf", "index"},
     "technical_trend": {"improving", "stable", "deteriorating"},
     "macd_signal": {"bullish_crossover", "bearish_crossover", "neutral"},
@@ -315,6 +315,35 @@ def _parse_level_label(report_text: str, label: str) -> str | None:
     return match.group(1).title()
 
 
+def _parse_percent_loose(report_text: str, label_pattern: str) -> int | None:
+    """
+    Like _parse_percent_after_label but accepts label/title text already
+    containing separators (·, |, –, em-dash) before the percent. Used to
+    handle calibration-block and markdown-table cells where the percent is
+    not directly after a colon.
+    """
+    match = re.search(
+        rf"{label_pattern}[^\d%\n]{{0,40}}?(\d{{1,3}})\s*%",
+        report_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return _clamp_int(match.group(1), 0, 100)
+
+
+def _parse_level_label_loose(report_text: str, label_pattern: str) -> str | None:
+    """Same idea for Low/Medium/High labels separated by · or em-dashes."""
+    match = re.search(
+        rf"{label_pattern}[^\n]{{0,60}}?\b(Low|Medium|High)\b",
+        report_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).title()
+
+
 def _report_label_from_score(score: int) -> str:
     if score <= 59:
         return "Low"
@@ -380,13 +409,32 @@ def _build_report_meta(
     conviction_score: int,
     low_data_mode: bool,
 ) -> dict[str, Any]:
-    confidence_score = _parse_percent_after_label(report_text, "Verdict Confidence")
+    # Confidence score — try multiple body formats:
+    #   "Verdict Confidence: 60%"   (legacy)
+    #   "Confidence Calibration · Score: 60%"
+    #   "| Confidence Score | 60% |"  (markdown table)
+    confidence_score = (
+        _parse_percent_after_label(report_text, "Verdict Confidence")
+        or _parse_percent_loose(report_text, r"Confidence\s+Calibration[^|\n]{0,40}?Score")
+        or _parse_percent_loose(report_text, r"Confidence\s+Score")
+    )
     if confidence_score is None:
         confidence_score = conviction_score
-    parsed_conviction_score = _parse_percent_after_label(report_text, "Conviction")
+    parsed_conviction_score = (
+        _parse_percent_after_label(report_text, "Conviction")
+        or _parse_percent_loose(report_text, r"Conviction\s+Score")
+    )
     canonical_conviction_score = parsed_conviction_score if parsed_conviction_score is not None else conviction_score
-    confidence_label = _parse_level_label(report_text, "Confidence") or _report_label_from_score(confidence_score)
-    conviction_label = _parse_level_label(report_text, "Conviction") or _report_label_from_score(canonical_conviction_score)
+    confidence_label = (
+        _parse_level_label(report_text, "Confidence")
+        or _parse_level_label_loose(report_text, r"Confidence\s+Calibration")
+        or _report_label_from_score(confidence_score)
+    )
+    conviction_label = (
+        _parse_level_label(report_text, "Conviction")
+        or _parse_level_label_loose(report_text, r"Conviction[^|\n]{0,30}?Fundamental")
+        or _report_label_from_score(canonical_conviction_score)
+    )
     if low_data_mode:
         confidence_label = "Low"
         conviction_label = "Low"

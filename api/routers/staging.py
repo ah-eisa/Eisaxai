@@ -563,9 +563,816 @@ def _cleanup_report_text_artifacts(text: str) -> str:
         (r"\bmomentum is bullish momentum\b", "bullish momentum exists"),
         (r"\bmomentum is bearish momentum\b", "bearish momentum is present"),
         (r"\bmomentum is neutral momentum\b", "momentum remains neutral"),
+        # Phrase repair — the LLM/structural-variation occasionally rewrites
+        # the templated "avoid chasing" → "Sell chasing", which a reader
+        # parses as a hidden verdict in a No-Action sentence. Runs here as
+        # a final safety net so it catches reports served from either the
+        # in-memory _REPORT_CACHE or the SQLite analysis_cache, regardless
+        # of when they were generated.
+        (r"\b[Ss]ell\s+chasing\b", "avoid chasing"),
+        (r"\b[Ss]ell\s+(adding|entering|extending)\b", r"avoid \1"),
+        # Reasoning / meta-instruction leaks — the LLM occasionally echoes
+        # parenthetical guidance like "(pre-computed, exact copy)" or
+        # "(exact copy from PRE-COMPUTED VALUES)" which it absorbed from
+        # the system prompt. Strip these so the published report carries
+        # no editorial scaffolding.
+        # Any parenthetical that contains "pre-computed" / "precomputed"
+        # is editorial scaffolding leaked from the system prompt — strip it
+        # regardless of what follows ("exact copy", "scenarios", "values",
+        # "do not recalculate", etc.).
+        (r"\s*\([^)]*\bpre[- ]?computed\b[^)]*\)", ""),
+        (r"\s*\([^)]*\bexact\s+(?:copy|values)\b[^)]*\)", ""),
+        (r"\s*\(verbatim(?:\s+from\s+[^)]+)?\)", ""),
+        (r"\s*\(do\s+not\s+recalculate\)", ""),
+        (r"\s*\(copy\s+from\s+PRE-COMPUTED[^)]*\)", ""),
+        # LLM-style first-person reasoning preambles that occasionally slip
+        # through ("Wait — pre-computed values …", "Let me look at …",
+        # "I need to …", "Actually, …", "Hmm, …", "Looking at the data, …").
+        # Drop the leading clause up to the first sentence terminator.
+        (
+            r"(?m)^\s*(?:Wait[\s,\.—–\-]+|Hmm[\s,\.]+|Actually[\s,]+|"
+            r"Let\s+me\s+(?:think|look|check|see|verify)[^\n.]*[\.—\-]\s*|"
+            r"I(?:'ll| will)\s+(?:start by|need to|look at|check)[^\n.]*[\.—\-]\s*|"
+            r"Looking\s+at\s+(?:the|this)[^\n.]*[\.—\-]\s*)",
+            "",
+        ),
+        # Sometimes the LLM annotates table titles with "(used in the report)"
+        # or "(below in the report)" — editorial scaffolding, strip it.
+        (r"\s*\((?:as\s+)?(?:shown|used|displayed|provided)(?:\s+(?:above|below|here))?\s*(?:in\s+the\s+report)?\)", ""),
+
+        # ── Fair Value math claim repair ──────────────────────────────────
+        # The LLM sometimes prints "Forward EPS 0.20 د.إ × 17x sector P/E"
+        # whose arithmetic does not equal the stated FV (0.20 × 17 = 3.40,
+        # not the actual FV figure). Strip the derivation phrase so the
+        # value stands on its own as a proprietary EisaX estimate without
+        # false arithmetic. Engine output retains the figure; only the
+        # misleading derivation tail is removed.
+        # Patterns use `[^)\n]` (allowing '.') with bounded length so the
+        # price decimal (0.20) doesn't break the class.
+        (
+            r",\s*derived\s+from\s+(?:a\s+)?[Ff]orward\s+EPS\s+(?:of\s+)?[^,\n]{1,90}?\d+\s*x\b[^,\n]{0,40}",
+            "",
+        ),
+        (
+            r"\s*\(\s*[Ff]orward\s+EPS[^)\n]{1,80}?\bx\s*sector[^)\n]{0,40}\)",
+            " (proprietary EisaX methodology)",
+        ),
+        (
+            r"derived\s+from\s+(?:a\s+)?[Ff]orward\s+EPS\s+(?:of\s+)?[^,\n]{1,80}?\d+\s*x[^,\n]{0,40}?(?:sector[- ]?(?:average\s+)?)?P/E",
+            "derived from EisaX proprietary methodology (forward earnings × sector multiple, peer-benchmarked)",
+        ),
+        # Catch the explicit equation form:
+        # "EisaX Fair Value Estimate is calculated as Forward EPS (X) × Y x sector P/E = Z"
+        # The arithmetic rarely matches (X × Y ≠ Z because Z uses a different
+        # peer-adjusted multiple). Strip the equation tail so only the
+        # methodology label and the value remain.
+        (
+            r"(EisaX\s+Fair\s+Value\s+Estimate\s+is\s+)"
+            r"calculated\s+as\s+[Ff]orward\s+EPS[^=\n]{0,140}=\s*",
+            r"\1based on the EisaX proprietary methodology (peer-benchmarked forward earnings × sector multiple) — estimated at ",
+        ),
+        # Drop "= Z" tail when methodology is already labelled
+        (
+            r"((?:Forward|TTM)\s+EPS\s*\(?[^)\n]{0,60}\)?\s*[×x]\s*\d+\s*x?\s+(?:sector|peer)[- ]?(?:average\s+)?P/E)\s*=\s*\*{0,2}[د.إ﷼\$]?\s*[\d\.,]+\*{0,2}",
+            r"\1",
+        ),
+
+        # ── Score label disambiguation ─────────────────────────────────────
+        # An unlabeled "Score: 50/100 — Score reflects business quality" line
+        # is the Fundamental Quality Score (different metric from EisaX Score).
+        # Relabel so the reader doesn't conflate it with the top-card 71/100.
+        # Handle leading `**` wrap (e.g. `**Score: 50/100 — Score reflects...**`).
+        (
+            r"(?m)^(\s*)\*{0,2}\s*Score:\s*\*{0,2}(\d{1,3})/100\*{0,2}\s*[—\-]\s*(?:Score\s+reflects|Reflects)\s+business\s+quality[^.\n]*\.?\*{0,2}",
+            r"\1**Fundamental Quality Score: \2/100** — reflects business quality only (independent of the top-card EisaX Score, which is a blended composite).",
+        ),
+
+        # ── Analyst coverage wording ──────────────────────────────────────
+        # Accept several variants the LLM has used: "exists", "found",
+        # "was found", "available", "reported", "is reported", "is provided".
+        # Normalise to one phrase.
+        (
+            r"\b[Nn]o\s+(?:formal\s+)?analyst\s+coverage\s+"
+            r"(?:exists?|"
+            r"(?:is\s+|was\s+|currently\s+)?(?:found|available|reported|provided|tracked|disclosed)"
+            r")(?:\s+for\s+\S+)?",
+            "No analyst coverage available in current dataset",
+        ),
+
+        # ── Position sizing — strip orphan "refer to" pointer ────────────
+        # The report has a concrete "≤5% of portfolio" sizing earlier; this
+        # later "refer to EisaX Score → Core Allocation" line is dangling
+        # and adds no value. Remove the whole sentence/bullet.
+        (
+            r"[\s\-\*]*\*?\s*Full\s+position\s+sizing:\s*refer\s+to\s+EisaX\s+Score[^.\n]*\.\s*\*?",
+            "",
+        ),
+        (
+            r"\s*[Pp]osition\s+sizing[^.]{0,30}refer\s+to\s+EisaX\s+Score[^.\n]*\.",
+            "",
+        ),
     ]
     for pattern, replacement in replacements:
         text = _re.sub(pattern, replacement, text, flags=_re.IGNORECASE)
+
+    # ── FV / Scenario disambiguation footnote ─────────────────────────────
+    # When both the proprietary EisaX Fair Value Estimate and a multi-row
+    # Valuation Range Table (Bear/Base/Bull) appear, append a one-line
+    # footnote so the reader doesn't conflate "EisaX FV" with the Bull
+    # scenario implied price (they use different methodologies).
+    has_fv = bool(_re.search(r"EisaX\s+(?:Fair\s+Value|FV)", text, _re.IGNORECASE))
+    # Accept either the "Implied Price" column header, the literal
+    # "Valuation Range Table" / "Valuation Range:" heading, or the
+    # presence of an emoji-tagged Bear/Base/Bull row.
+    has_scenario = bool(_re.search(
+        r"(?:Bear|Bull)[^\n]*\|[^\n]*[Ii]mplied\s+Price"
+        r"|Valuation\s+Range(?:\s+Table)?\s*:?\s*\*?\*?"
+        r"|\|\s*🚀\s*Bull[^\n]*\|"
+        r"|\|\s*🐻\s*Bear[^\n]*\|",
+        text,
+        _re.IGNORECASE,
+    ))
+    footnote = (
+        "\n\n> _Note on Fair Value vs Scenarios: the EisaX Fair Value Estimate "
+        "is a single proprietary target derived from peer-benchmarked forward "
+        "earnings × sector multiple (central case). The Bear / Base / Bull "
+        "scenario implied prices apply stress-test P/E multiples to the same "
+        "earnings stream and act as an uncertainty band around the FV — Base "
+        "anchors to current price, Bull tracks the FV ceiling under expansion, "
+        "and Bear sets the downside floor. FV typically sits between Base and "
+        "Bull. The two views are complementary, not redundant._\n\n"
+    )
+    footnote_marker = "Note on Fair Value vs Scenarios"
+    if has_fv and has_scenario and footnote_marker not in text:
+        # Append after the Valuation Range Table if we can locate it.
+        # Use underscore italics (_..._) so we never collide with adjacent
+        # bold markers (**) the LLM emits in nearby notes.
+        m_tbl = _re.search(
+            r"(\|\s*🚀?\s*Bull[^|\n]*\|[^\n]*\|[^\n]*\|[^\n]*\|\s*\n)",
+            text,
+        )
+        if m_tbl:
+            text = text[: m_tbl.end()] + footnote + text[m_tbl.end():]
+
+    # ── S/R Ladder: insert SMA200 as nearest support if missing ──────────
+    # The LLM sometimes lists only 52W Low as support, ignoring SMA200 which
+    # is typically a much closer dynamic support. Try to read SMA200 from
+    # the body text; if absent, pull from the TradingView pipeline cache so
+    # the ladder is always complete.
+    _sr_table_marker = _re.search(
+        r"(\|\s*Level\s*\|\s*Price\s*\|\s*Type\s*\|\s*Basis\s*\|[^\n]*\n"
+        r"\|[\s\-:|]+\n"  # markdown separator row
+        r"(?:\|[^\n]+\n){2,12}?)"
+        r"(\|\s*S1\s*\|[^|\n]+\|\s*Support\s*\|[^|\n]+\|)",
+        text,
+    )
+    if _sr_table_marker and "SMA200" not in _sr_table_marker.group(0):
+        _sma200 = None
+        # 1. Try body text first
+        for _pat in (r"SMA[\s_(]*200[)\s]*[^\d\.]{0,10}([\d]+\.\d{2,4})",
+                     r"SMA\(200\)[^\d\.]{0,10}([\d]+\.\d{2,4})"):
+            _m = _re.search(_pat, text)
+            if _m:
+                try:
+                    _sma200 = float(_m.group(1))
+                    break
+                except ValueError:
+                    pass
+        # 2. Fallback: TV pipeline cache by detecting the ticker from the
+        #    first H1 heading "EisaX Intelligence Report: <TICKER>".
+        if _sma200 is None:
+            try:
+                _tick_m = _re.search(
+                    r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)", text
+                )
+                if _tick_m:
+                    _tk_norm = _tick_m.group(1).upper()
+                    # market mapping
+                    _mk_map = {".AE":"uae",".DU":"uae",".SR":"ksa",".CA":"egypt",
+                               ".KW":"kuwait",".QA":"qatar",".BH":"bahrain",
+                               ".MA":"morocco",".TN":"tunisia","=F":"commodities"}
+                    _tv_mkt = next((v for k, v in _mk_map.items() if _tk_norm.endswith(k)), "america")
+                    from core.data_layer import market_cache_adapter as _mca_sr
+                    _df = _mca_sr.get_latest_snapshot(_tv_mkt)
+                    if _df is not None and not _df.empty:
+                        _bare = _tk_norm.split(".")[0]
+                        _col = _df["ticker"].astype(str).str.upper()
+                        _matches = _df[
+                            _col.str.endswith(":" + _bare)
+                            | (_col == _tk_norm)
+                            | (_col == _bare)
+                        ]
+                        if not _matches.empty:
+                            _v = _matches.iloc[0].get("SMA200")
+                            if _v is not None:
+                                try:
+                                    _sma200 = float(_v)
+                                except (TypeError, ValueError):
+                                    pass
+            except Exception:
+                pass
+
+        if _sma200 and _sma200 > 0:
+            # Detect currency symbol used in the table from first price cell
+            _sym_m = _re.search(r"\|\s*(?:Spot|R\d|S\d)\s*\|\s*(\D{0,4})\d", _sr_table_marker.group(0))
+            _sym = _sym_m.group(1).strip() if _sym_m else ""
+            new_row = f"| S2 | {_sym}{_sma200:.2f} | Support | SMA200 |\n"
+            # Insert the new S2 row right before the existing S1 row
+            text = text.replace(
+                _sr_table_marker.group(2),
+                new_row + _sr_table_marker.group(2),
+                1,
+            )
+
+    # ── SMA200 / SMA50 numeric reconciliation ────────────────────────────
+    # The LLM occasionally hallucinates SMA50/SMA200 values that disagree
+    # with the S/R ladder and with TV cache. Pull the authoritative values
+    # from TV cache and rewrite any "(<currency><number>)" attached to an
+    # SMA50/SMA200 mention so the body, ladder, and any stop-loss reference
+    # all align. Also rebuild the canonical "Price at X is Y% above SMA200
+    # and Z% below SMA50" comparison sentence with computed percentages.
+    try:
+        _tick_sma = _re.search(
+            r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)", text
+        )
+        if _tick_sma:
+            _tk = _tick_sma.group(1).upper()
+            _mk_map = {".AE":"uae",".DU":"uae",".SR":"ksa",".CA":"egypt",
+                       ".KW":"kuwait",".QA":"qatar",".BH":"bahrain",
+                       "=F":"commodities"}
+            _tv_mkt = next((v for k, v in _mk_map.items() if _tk.endswith(k)), "america")
+            from core.data_layer import market_cache_adapter as _mca_sma
+            _df = _mca_sma.get_latest_snapshot(_tv_mkt)
+            _row = None
+            if _df is not None and not _df.empty:
+                _bare = _tk.split(".")[0]
+                _col = _df["ticker"].astype(str).str.upper()
+                _ms = _df[_col.str.endswith(":" + _bare) | (_col == _tk) | (_col == _bare)]
+                if not _ms.empty:
+                    _row = _ms.iloc[0]
+            if _row is not None:
+                _tv_sma200 = _row.get("SMA200")
+                _tv_sma50  = _row.get("SMA50")
+                _tv_price  = _row.get("close")
+                try:
+                    _tv_sma200 = float(_tv_sma200) if _tv_sma200 is not None else None
+                except (TypeError, ValueError):
+                    _tv_sma200 = None
+                try:
+                    _tv_sma50  = float(_tv_sma50)  if _tv_sma50  is not None else None
+                except (TypeError, ValueError):
+                    _tv_sma50 = None
+                try:
+                    _tv_price  = float(_tv_price)  if _tv_price  is not None else None
+                except (TypeError, ValueError):
+                    _tv_price = None
+
+                # Detect currency prefix for replacement substitution
+                _cur_pref_m = _re.search(
+                    r"SMA(?:200|50)\s*\(\s*(د\.إ|﷼|ج\.م|ر\.ق|\$)",
+                    text,
+                )
+                _cur_pref = _cur_pref_m.group(1) if _cur_pref_m else ""
+
+                # 1. Normalize SMA200 "(price)" mentions
+                if _tv_sma200 and _tv_sma200 > 0:
+                    text = _re.sub(
+                        r"SMA\s*200\s*\(\s*(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?\s*[\d\.,]+\s*\)",
+                        f"SMA200 ({_cur_pref}{_tv_sma200:.2f})",
+                        text,
+                    )
+                # 2. Normalize SMA50 "(price)" mentions
+                if _tv_sma50 and _tv_sma50 > 0:
+                    text = _re.sub(
+                        r"SMA\s*50\s*\(\s*(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?\s*[\d\.,]+\s*\)",
+                        f"SMA50 ({_cur_pref}{_tv_sma50:.2f})",
+                        text,
+                    )
+                # 3. Also normalize the S/R table SMA200 row value if it disagrees
+                if _tv_sma200 and _tv_sma200 > 0:
+                    text = _re.sub(
+                        r"(\|\s*S\d\s*\|\s*)(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?\s*[\d\.,]+(\s*\|\s*Support\s*\|\s*SMA200\s*\|)",
+                        rf"\1{_cur_pref}{_tv_sma200:.2f}\2",
+                        text,
+                    )
+
+                # 4. Rebuild the comparison sentence with correct percentages
+                if _tv_sma200 and _tv_sma200 > 0 and _tv_sma50 and _tv_sma50 > 0 and _tv_price:
+                    _pct200 = (_tv_price - _tv_sma200) / _tv_sma200 * 100
+                    _pct50  = (_tv_price - _tv_sma50)  / _tv_sma50  * 100
+                    _pos200 = "above" if _pct200 >= 0 else "below"
+                    _pos50  = "above" if _pct50  >= 0 else "below"
+                    _new_sent = (
+                        f"Price at {_cur_pref}{_tv_price:.2f} is {abs(_pct200):.1f}% "
+                        f"{_pos200} SMA200 ({_cur_pref}{_tv_sma200:.2f}) and "
+                        f"{abs(_pct50):.1f}% {_pos50} SMA50 ({_cur_pref}{_tv_sma50:.2f})"
+                    )
+                    text = _re.sub(
+                        r"Price\s+at\s+(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?[\d\.,]+\s+is\s+\d+\.\d+%\s+"
+                        r"(?:above|below)\s+SMA\s*200\s*\([^)]+\)\s+and\s+\d+\.\d+%\s+"
+                        r"(?:above|below)\s+SMA\s*50\s*\([^)]+\)",
+                        _new_sent,
+                        text,
+                    )
+
+                # 4b. Trend-line variant: "Price is above SMA200 (X) by Y%" —
+                # rewrite Y% using the TV cache so the body, ladder, and
+                # methodology references all agree on a single number.
+                if _tv_sma200 and _tv_sma200 > 0 and _tv_price:
+                    _pct = (_tv_price - _tv_sma200) / _tv_sma200 * 100
+                    _pos = "above" if _pct >= 0 else "below"
+                    text = _re.sub(
+                        r"Price\s+is\s+(?:above|below)\s+SMA\s*200\s*\("
+                        r"(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?[\d\.,]+\s*\)\s+by\s+\d+\.\d+%",
+                        f"Price is {_pos} SMA200 ({_cur_pref}{_tv_sma200:.2f}) by {abs(_pct):.1f}%",
+                        text,
+                    )
+                if _tv_sma50 and _tv_sma50 > 0 and _tv_price:
+                    _pct = (_tv_price - _tv_sma50) / _tv_sma50 * 100
+                    _pos = "above" if _pct >= 0 else "below"
+                    text = _re.sub(
+                        r"Price\s+is\s+(?:above|below)\s+SMA\s*50\s*\("
+                        r"(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?[\d\.,]+\s*\)\s+by\s+\d+\.\d+%",
+                        f"Price is {_pos} SMA50 ({_cur_pref}{_tv_sma50:.2f}) by {abs(_pct):.1f}%",
+                        text,
+                    )
+
+                # 5. Stop-loss SMA200 reference — if any line mentions a stop
+                #    "below SMA200" with a numeric level, normalize the level
+                #    to the TV SMA200 value.
+                if _tv_sma200 and _tv_sma200 > 0:
+                    text = _re.sub(
+                        r"(stop[- ]?loss[^.\n]{0,80}?(?:below|under|at)\s+(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?)[\d\.,]+"
+                        r"([^.\n]{0,80}?\bSMA[\s_(]*200\b[^.\n]*)",
+                        rf"\g<1>{_tv_sma200:.2f}\g<2>",
+                        text,
+                        flags=_re.IGNORECASE,
+                    )
+    except Exception:
+        pass
+
+    # ── News filter: keep only ticker/sector-relevant items ──────────────
+    # The news engine sometimes returns sector/region pulls that aren't
+    # related to the analysed ticker (e.g. Lulu Retail in an ADNOCGAS
+    # report). Drop list items whose anchor text contains none of the
+    # asset-specific keywords. We only run this filter for the Latest News
+    # bullet list — leaving other sections untouched.
+    # Tightened: drop the generic UAE/Emirates/DFM/ADX tokens because they
+    # let through items like "UAE Lottery winner", "UK envoy to UAE", "FDI
+    # destinations" which have no bearing on ADNOC Gas. Require an
+    # energy-domain keyword (oil/gas/LNG/etc.) or an exact ADNOC-Gas /
+    # ADNOCGAS / pipeline / Hormuz reference. Generic "ADNOC" alone (e.g.
+    # "ADNOC Distribution road trip") is no longer enough.
+    _news_keywords_re = _re.compile(
+        r"\b(?:ADNOC\s*Gas|ADNOCGAS|"
+        r"LNG|crude|Brent|OPEC|hydrocarbon|petrochemical|refinery|pipeline|"
+        r"Hormuz|"
+        r"oil\s+(?:price|market|disruption|sanctions?|spike|drop|fall|swing|outlook|export|production)|"
+        r"gas\s+(?:price|market|production|export|supply|contract|demand)|"
+        r"energy\s+(?:price|market|disruption|sanctions?|sector|policy))\b",
+        _re.IGNORECASE,
+    )
+    # Find the Latest News block boundaries
+    _news_m = _re.search(
+        r"(?ms)^📰\s*\*\*Latest News\*\*[^\n]*\n(?P<body>.+?)(?=^---|\n## |\Z)",
+        text,
+    )
+    if _news_m:
+        body = _news_m.group("body")
+        # Only filter the lines inside the body that are bullet-list news
+        # items (start with "- [" markdown link). Section headers and notes
+        # remain untouched.
+        new_lines = []
+        for line in body.split("\n"):
+            stripped = line.strip()
+            is_news_item = (
+                _re.match(r"^[-*]\s*(?:⚪\s*)?\[", stripped) is not None
+            )
+            if is_news_item:
+                # Keep only if the anchor text or surrounding line contains
+                # a relevant keyword. For ADNOCGAS this is asset-specific.
+                if _news_keywords_re.search(stripped):
+                    new_lines.append(line)
+                # else: drop
+            else:
+                new_lines.append(line)
+        new_body = "\n".join(new_lines)
+        # If filtering removed all news items in a sub-section, replace the
+        # section with a one-line note. Detect by no remaining bullets.
+        if not _re.search(r"^[-*]\s*(?:⚪\s*)?\[", new_body, _re.MULTILINE):
+            new_body = (
+                "\n_No directly relevant news items in the current feed window._\n"
+            )
+        text = text[: _news_m.start("body")] + new_body + text[_news_m.end("body"):]
+
+    # ── Sector classification override ─────────────────────────────────
+    # TradingView's `sector` field is wrong for several Gulf real-estate
+    # developers (EMAAR, EMAARDEV, ALDAR, DAMAC, UPP, DEYAAR — tagged
+    # "Finance" instead of "Real Estate"). When the report's subject
+    # ticker is in the override map, we rewrite the sector mentions, the
+    # regional peer table, and the risk taxonomy.
+    try:
+        from core.sector_overrides import (
+            get_corrected_sector,
+            REAL_ESTATE_PEER_UNIVERSE,
+            REAL_ESTATE_RISK_TAXONOMY_EN,
+            REAL_ESTATE_RISK_TAXONOMY_AR,
+        )
+        _tick_m = _re.search(
+            r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)", text
+        )
+        _subject = _tick_m.group(1).upper() if _tick_m else None
+        _override = get_corrected_sector(_subject) if _subject else None
+    except Exception:
+        _override = None
+
+    if _override:
+        _corr_sector, _corr_industry = _override
+        # 1. Replace "Sector:" mentions in scorecard headers
+        text = _re.sub(
+            r"(\*\*Sector:\*\*\s*)Finance\b",
+            rf"\1{_corr_sector}",
+            text,
+        )
+        text = _re.sub(
+            r"(Sector:\s*)Finance\b",
+            rf"\1{_corr_sector}",
+            text,
+        )
+        # 2. Sector Standing line
+        text = _re.sub(
+            r"(its\s+)Finance(\s+sector)",
+            rf"\1{_corr_sector}\2",
+            text,
+        )
+        text = _re.sub(
+            r"(Sector\s+Avg\s+\()Finance(\))",
+            rf"\1{_corr_sector}\2",
+            text,
+        )
+        # 3. Regional Peer Comparison heading + Cross-Market sector tag
+        text = _re.sub(
+            r"(Regional Peer Comparison[^\n]*?\*?)Finance(\s+Sector)",
+            rf"\1{_corr_sector}\2",
+            text,
+        )
+        text = _re.sub(
+            r"(\*\*)Finance(\*\*\s+sector\s+RSI)",
+            rf"\1{_corr_sector}\2",
+            text,
+        )
+        text = _re.sub(
+            r"(Sector\s+Rotation:\*?\*?\s*[⚖️🔥📉]?\s*\*?\*?)Finance",
+            rf"\1{_corr_sector}",
+            text,
+        )
+
+        # 4. Replace the (bank-laden) Regional Peer Comparison table
+        #    with a curated real-estate peer table queried from TV cache.
+        if _corr_sector.lower().startswith("real estate"):
+            try:
+                from core.data_layer import market_cache_adapter as _mca_re
+                _peer_rows = []
+                _market_flag = {"uae":"🇦🇪 UAE", "ksa":"🇸🇦 KSA", "qatar":"🇶🇦 Qatar"}
+                _exchange_for_market = {"uae":"DFM", "ksa":"TADAWUL", "qatar":"QSE"}
+                for _mkt, _bare in REAL_ESTATE_PEER_UNIVERSE:
+                    _df = _mca_re.get_latest_snapshot(_mkt)
+                    if _df is None or _df.empty:
+                        continue
+                    _col = _df["ticker"].astype(str).str.upper()
+                    _m = _df[
+                        _col.str.endswith(":" + _bare) | (_col == _bare)
+                    ]
+                    if _m.empty:
+                        continue
+                    _r = _m.iloc[0]
+                    _close = float(_r.get("close") or 0)
+                    if _close <= 0:
+                        continue
+                    _change = float(_r.get("change") or 0)
+                    _pe_raw = _r.get("price_earnings_ttm")
+                    try:
+                        _pe = float(_pe_raw)
+                        _pe_str = f"{_pe:.1f}x" if _pe == _pe else "—"  # NaN check
+                    except (TypeError, ValueError):
+                        _pe_str = "—"
+                    _rsi_raw = _r.get("RSI")
+                    try:
+                        _rsi_str = f"{float(_rsi_raw):.1f}"
+                    except (TypeError, ValueError):
+                        _rsi_str = "—"
+                    _dy_raw = _r.get("dividend_yield_recent")
+                    try:
+                        _dy = float(_dy_raw)
+                        _dy_str = f"{_dy:.2f}%" if _dy and _dy > 0 else "—"
+                    except (TypeError, ValueError):
+                        _dy_str = "—"
+                    _mc_raw = _r.get("market_cap_basic")
+                    try:
+                        _mc = float(_mc_raw)
+                        _mc_str = f"{_mc/1e9:.1f}B"
+                    except (TypeError, ValueError):
+                        _mc_str = "—"
+                    _arrow = "▲" if _change > 0 else "▼" if _change < 0 else "—"
+                    _ticker_disp = str(_r["ticker"])
+                    _name = _bare
+                    _peer_rows.append(
+                        (float(_mc_raw or 0), _ticker_disp, _name, _market_flag.get(_mkt, _mkt.upper()),
+                         _close, _change, _arrow, _pe_str, _rsi_str, _dy_str, _mc_str)
+                    )
+                # Sort by market cap desc
+                _peer_rows.sort(key=lambda r: r[0], reverse=True)
+                if _peer_rows:
+                    _hdr = (
+                        f"### 🌍 Regional Peer Comparison — *{_corr_sector} Sector Across Gulf Markets*\n\n"
+                        "| # | Stock | Market | Price | Change | P/E | RSI | Div Yield | Mkt Cap |\n"
+                        "|---|-------|--------|-------|--------|-----|-----|-----------|---------|\n"
+                    )
+                    _lines = [_hdr]
+                    for i, (_mc, _td, _nm, _mk, _c, _ch, _ar, _pe, _rsi, _dy, _mcs) in enumerate(_peer_rows[:12], 1):
+                        _lines.append(
+                            f"| {i} | **{_nm}** `{_td}` | {_mk} | {_c:.2f} | "
+                            f"{_ch:+.2f}% {_ar} | {_pe} | {_rsi} | {_dy} | {_mcs} |\n"
+                        )
+                    _new_peer_block = "".join(_lines)
+                    # Replace the existing peer block (heading + table rows
+                    # through the blank line after the last table row).
+                    text = _re.sub(
+                        r"### 🌍 Regional Peer Comparison[^\n]*\n"
+                        r"(?:\s*\n)*"          # allow blank separator lines
+                        r"(?:\|[^\n]*\n)+",     # the markdown table rows
+                        _new_peer_block,
+                        text,
+                        count=1,
+                    )
+            except Exception:
+                pass  # leave original peer table if curation fails
+
+        # ── Bank-peer narrative scrub (Section 6 Peer Comparison) ────
+        # Real-estate sector overrides need to also remove the LLM's
+        # peer-narrative paragraph that compares EMAAR to banks like
+        # EMIRATESNBD / FAB. Replace it with a neutral RE-focused note.
+        if _corr_sector.lower().startswith("real estate"):
+            _bank_names = (
+                r"EMIRATESNBD|FAB|ADCB|QNBK|ADIB|EmiratesNBD|"
+                r"Saudi National Bank|Al Rajhi|First Abu Dhabi"
+            )
+            # Remove entire paragraph starting with "vs <bank>:" or
+            # "**vs <bank> (DFM:<bank>):**" — runs to the next double
+            # newline or section heading. Handles bold opener BEFORE the
+            # "vs" token and inline exchange-prefixed tickers.
+            text = _re.sub(
+                rf"(?ms)^\*{{0,2}}vs\s+\*{{0,2}}(?:{_bank_names})\b"
+                rf"[^\n]*(?:\n(?!\n|#{{2,3}}\s|---)[^\n]+)*",
+                ("_(EMAAR is a real-estate developer; bank peers are excluded "
+                 "as they sit in a different sector universe. See the Regional "
+                 "Peer Comparison table for real-estate peers.)_"),
+                text,
+            )
+            # Sweep up any remaining sentence that still mentions a bank
+            # peer by name within Section 6 — these are stray comparison
+            # clauses the first scrub may have left in adjacent paragraphs.
+            _sec6_m = _re.search(
+                r"(?ms)(#{2,3}\s+\d+\.?\s*(?:⚔️\s*)?Peer\s+Comparison[^\n]*\n)(.*?)(?=\n#{2,3}\s)",
+                text,
+            )
+            if _sec6_m:
+                _sec6_body = _sec6_m.group(2)
+                # Drop any sentence mentioning a bank ticker by name
+                _clean_body = _re.sub(
+                    rf"[^.\n]*\b(?:{_bank_names})\b[^.\n]*\.",
+                    "",
+                    _sec6_body,
+                )
+                # Collapse 3+ newlines back to 2
+                _clean_body = _re.sub(r"\n{3,}", "\n\n", _clean_body)
+                text = text[: _sec6_m.start(2)] + _clean_body + text[_sec6_m.end(2):]
+
+        # 5. Risk taxonomy replacement — if the report's risk section
+        #    contains oil/commodity boilerplate (which makes no sense for
+        #    a real-estate developer), splice in the real-estate taxonomy.
+        _commodity_risk_re = _re.compile(
+            r"\b(?:oil[- ]price\s+sensitivity|cyclical\s+commodity\s+exposure|"
+            r"OPEC|Brent|crude\s+oil|hydrocarbon)\b",
+            _re.IGNORECASE,
+        )
+        # For real-estate tickers, strip any remaining oil/Brent/commodity
+        # sentences in the narrative (they leak from boilerplate triggers).
+        if _corr_sector.lower().startswith("real estate"):
+            text = _re.sub(
+                r"(?m)^[\-\*]?\s*\*?\*?(?:Brent\s+crude\s+spikes?|"
+                r"Oil\s+price\s+sensitivity|Cyclical\s+commodity\s+exposure|"
+                r"OPEC[- ]?\+?\s+(?:supply|production))[^\n]+\n?",
+                "",
+                text,
+                flags=_re.IGNORECASE,
+            )
+        # Inject the RE risk taxonomy whenever the subject is a real-estate
+        # ticker — independent of whether commodity boilerplate survived,
+        # since the body may have been scrubbed earlier in this pass.
+        if _corr_sector.lower().startswith("real estate"):
+            # Detect language: prefer explicit Arabic section headings
+            # (e.g. "## التحليل الأساسي"), not stray Arabic terms that may
+            # leak into a primarily-English report.
+            _is_ar = bool(_re.search(
+                r"#{1,3}\s*[؀-ۿ]{3,}.*\n",  # H1-H3 heading in Arabic
+                text,
+            ))
+            _taxonomy = REAL_ESTATE_RISK_TAXONOMY_AR if _is_ar else REAL_ESTATE_RISK_TAXONOMY_EN
+            # Inject before the Key Risks heading body — keep heading,
+            # replace the body. Match H2 (## 4. Key Risks) or H3 (### Key Risks).
+            _risk_m = _re.search(
+                r"(#{2,3}\s+\d+\.?\s*(?:⚠️\s*)?(?:Key\s+Risks?|Risks?|المخاطر[^\n]*)[^\n]*\n)"
+                r"(.*?)"
+                r"(?=\n#{2,3}\s|\Z)",
+                text, _re.S,
+            )
+            if _risk_m:
+                _hdr_line = _risk_m.group(1)
+                text = text[:_risk_m.start(2)] + "\n" + _taxonomy + "\n" + text[_risk_m.end(2):]
+
+        # ── Real-Estate final polish (last pass before currency fix) ──────
+        # Covers leftovers that earlier scrubs may miss because they live
+        # outside the Key Risks section: scorecard one-liners, executive
+        # memo, peer-comparison prose, valuation methodology footers.
+        if _corr_sector.lower().startswith("real estate"):
+            # (A) Strip any remaining commodity / oil-cycle phrases anywhere
+            #     in the report (memo, scorecard, summary, top-risk row).
+            # Catch-all: for an RE ticker, ANY sentence mentioning Brent,
+            # OPEC, crude-oil, or hydrocarbon is off-thesis and should be
+            # scrubbed. The more-specific phrases below pick up bullet-only
+            # variants ("Cyclical commodity exposure" with no surrounding
+            # sentence, etc.).
+            _re_commodity_phrases = [
+                r"cyclical\s+commodity\s+exposure",
+                r"commodity\s+price\s+cycle",
+                r"oil[- ]price\s+sensitivity",
+                r"oil\s+price\s+(?:decline|drop|fall|swing|move|spike)",
+                r"hydrocarbon\s+(?:price\s+)?exposure",
+                r"crude[- ]oil\s+(?:linked|exposure|sensitivity)",
+                r"OPEC[+\- ]?\s*(?:supply|production|cuts?|decisions?)",
+                r"\bOPEC\b",
+                r"\bBrent\b",                    # any standalone Brent ref
+                r"\bcrude\s+oil\b",
+                r"\bhydrocarbon\b",
+                r"energy[- ]price\s+(?:volatility|sensitivity)",
+                r"correlation\s+to\s+oil\s+price",
+                r"lower\s+crude\s+pressures",
+            ]
+            for _p in _re_commodity_phrases:
+                # Sentence-level scrub
+                text = _re.sub(
+                    rf"[^.\n]*\b{_p}\b[^.\n]*\.\s*",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+                # Bullet-level scrub (line starts with -/* and contains phrase)
+                text = _re.sub(
+                    rf"(?m)^[\-\*]\s*\*?\*?[^\n]*?\b{_p}\b[^\n]*\n",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+                # Table-row scrub (pipes around a row mentioning the phrase)
+                text = _re.sub(
+                    rf"(?m)^\|[^\n]*\b{_p}\b[^\n]*\|\s*\n",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+
+            # (B) Sector-average wording — RE peers, not Finance sector.
+            text = _re.sub(
+                r"\bFinance\s+sector\s+average\b",
+                "Real-Estate peer average",
+                text,
+                flags=_re.IGNORECASE,
+            )
+            text = _re.sub(
+                r"\b(?:the\s+)?sector[- ]average\s+P/E\b",
+                "real-estate peer-average P/E",
+                text,
+                flags=_re.IGNORECASE,
+            )
+            text = _re.sub(
+                r"\bsector\s+P/E\s+average\b",
+                "real-estate peer P/E average",
+                text,
+                flags=_re.IGNORECASE,
+            )
+            text = _re.sub(
+                r"\b(?:vs\.?|versus)\s+(?:the\s+)?Finance\s+sector\b",
+                "vs. Real-Estate peers",
+                text,
+                flags=_re.IGNORECASE,
+            )
+
+            # (C) Valuation methodology unification.
+            # If the narrative never anchors Forward EPS to a real source
+            # (consensus, guidance, FY-tag, or 4-digit year), rewrite the
+            # methodology label to TTM EPS × real-estate peer multiple so
+            # the report doesn't imply forward-looking data we don't have.
+            _has_real_fwd_eps = bool(_re.search(
+                r"Forward\s+EPS[^.\n]{0,200}\b(?:consensus|guidance|FY\d{2,4}|20\d{2}|analyst[s]?\s+estimate)\b",
+                text,
+                _re.IGNORECASE,
+            ))
+            if not _has_real_fwd_eps:
+                # Rewrite the FV-vs-Scenario disambiguation footnote that was
+                # appended earlier in this function (uses "Forward EPS × sector-average P/E").
+                text = text.replace(
+                    "uses Forward EPS × sector-average P/E",
+                    "uses TTM EPS × real-estate peer-average P/E",
+                )
+                # Drop any other "Forward EPS × Nx sector P/E" methodology line
+                text = _re.sub(
+                    r"\bForward\s+EPS\s*[×x]\s*\d+\s*x?\s+sector[- ]?(?:average\s+)?P/E\b",
+                    "TTM EPS × real-estate peer-average P/E",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+                # Strip methodology-only Forward-EPS clauses ("based on Forward EPS …")
+                text = _re.sub(
+                    r"\b(?:based\s+on|using|applying)\s+Forward\s+EPS[^.\n]{0,120}\.",
+                    "based on TTM EPS × real-estate peer-average P/E.",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+
+            # (D) SMA200 guard — if no S/R row was injected with SMA200
+            #     basis (meaning TV cache had no value), strip any prose
+            #     that asserts "price is below/above SMA200" because the
+            #     level itself is unavailable to verify.
+            _has_sma200_in_table = bool(_re.search(
+                r"\|\s*S\d\s*\|[^|]*\|\s*Support\s*\|\s*SMA200\s*\|",
+                text,
+                _re.IGNORECASE,
+            ))
+            if not _has_sma200_in_table:
+                text = _re.sub(
+                    r"[^.\n]*\b(?:trading\s+|currently\s+|sits\s+|is\s+)?"
+                    r"(?:below|above|near|crossing|under|over)\s+(?:its\s+|the\s+)?SMA[\s_(]*200[)\s]*[^.\n]*\.\s*",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+                text = _re.sub(
+                    r"[^.\n]*\b(?:trading\s+|currently\s+|sits\s+|is\s+)?"
+                    r"(?:below|above|near|crossing|under|over)\s+(?:its\s+|the\s+)?200[- ]?day\s+(?:moving\s+average|MA|SMA)[^.\n]*\.\s*",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+                # Also drop standalone bullets that only carry an SMA200 claim
+                text = _re.sub(
+                    r"(?m)^[\-\*]\s*\*?\*?[^\n]*?\bSMA[\s_(]*200[)\s]*[^\n]*\n",
+                    "",
+                    text,
+                    flags=_re.IGNORECASE,
+                )
+
+            # (E) Tidy any blank-line cascades the scrubs leave behind
+            text = _re.sub(r"\n{3,}", "\n\n", text)
+
+    # ── Currency fix in fact-check ────────────────────────────────────
+    # For local-market tickers (.AE/.DU/.SR/.CA/.KW/.QA), force the
+    # fact-check Live Price row to render in the local currency. The
+    # LLM sometimes emits "$11.78" when the surrounding report already
+    # uses "د.إ" / "ر.س" / etc.
+    try:
+        _tick_m2 = _re.search(
+            r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)", text
+        )
+        _t = (_tick_m2.group(1).upper() if _tick_m2 else "")
+        _cur_sym = None
+        if _t.endswith((".AE", ".DU")):           _cur_sym = "د.إ"
+        elif _t.endswith(".SR"):                   _cur_sym = "﷼"
+        elif _t.endswith(".CA"):                   _cur_sym = "ج.م"
+        elif _t.endswith(".KW"):                   _cur_sym = "ف"
+        elif _t.endswith(".QA"):                   _cur_sym = "ر.ق"
+        # Also catch bare symbols where the report already uses the
+        # local symbol elsewhere
+        if _cur_sym is None:
+            for _sym_probe in ("د.إ", "﷼", "ج.م", "ف", "ر.ق"):
+                if _sym_probe in text:
+                    _cur_sym = _sym_probe
+                    break
+        if _cur_sym and _cur_sym != "$":
+            # Replace "$X.YY" in the Live Price row of the fact-check table
+            text = _re.sub(
+                r"(\|\s*Live\s+Price\s*\|\s*)\$([\d,]+\.\d+)",
+                rf"\1\2 {_cur_sym}",
+                text,
+            )
+            text = _re.sub(
+                r"(Live Price[:\s\|]+\*{0,2}\s*)\$([\d,]+\.\d+)(?!\s*(?:د\.إ|﷼|ج\.م|ر\.ق))",
+                rf"\1\2 {_cur_sym}",
+                text,
+            )
+    except Exception:
+        pass
+
     return text
 
 
@@ -689,6 +1496,8 @@ def _staging_shape_result(
     report_id: Optional[str] = None,
     restrict_for_trial: bool = False,
     access_context: Optional[dict] = None,
+    analysis_data: Optional[dict] = None,   # NEW: live_payload data for SSOT reconciler
+    subject_ticker: Optional[str] = None,    # NEW: ticker for FactSheet construction
 ) -> dict:
     is_guest = _is_guest_access(access_context, restrict_for_trial=restrict_for_trial)
     report_text = _cleanup_report_text_artifacts(report_text)
@@ -698,6 +1507,63 @@ def _staging_shape_result(
         report_text = _apply_report_meta_to_text(report_text, report_json)
         if html_report:
             html_report = _apply_report_meta_to_text(html_report, report_json)
+        # _apply_report_meta_to_text re-injects fields from report_json
+        # (Risk Profile row using primary_driver, etc) which can re-introduce
+        # phrases the first cleanup pass already scrubbed. Re-run cleanup so
+        # the meta-injection passes through the same filters. Idempotent.
+        report_text = _cleanup_report_text_artifacts(report_text)
+        if html_report:
+            html_report = _cleanup_report_text_artifacts(html_report)
+
+    # ── SSOT Reconciler — Phase C integration ───────────────────────────
+    # FactSheet + Reconciler runs AFTER all legacy cleanup. It owns the
+    # final consistency check (price, SMA200, verdict, score, news,
+    # currency, sector-aware scrubs). Legacy regex patches above remain
+    # as a safety net until we've validated the reconciler on enough
+    # tickers — they're idempotent so no harm.
+    _ssot_fs = None  # hoisted so payload builder can read SSOT verdict below
+    try:
+        _ssot_ticker = subject_ticker
+        if not _ssot_ticker and report_text:
+            _h1 = _re.search(
+                r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)",
+                report_text,
+            )
+            if _h1:
+                _ssot_ticker = _h1.group(1).upper()
+        if _ssot_ticker and report_kind in ("stock", "asset", ""):
+            from core.services.fact_sheet import build_fact_sheet
+            from core.services.report_reconciler import reconcile_report
+            _live_payload = {
+                "data": analysis_data or {},
+                "report_json": report_json or {},
+            }
+            _ssot_fs = build_fact_sheet(_ssot_ticker, live_payload=_live_payload)
+            if _ssot_fs.blocking_errors:
+                logger.error(
+                    "[SSOT] %s blocked by FactSheet errors: %s",
+                    _ssot_ticker, _ssot_fs.blocking_errors,
+                )
+                # Don't block production yet — log only until enough samples validated
+            report_text, _audit = reconcile_report(report_text, _ssot_fs)
+            if html_report:
+                html_report, _html_audit = reconcile_report(html_report, _ssot_fs)
+            logger.info(
+                "[SSOT] %s reconciler %s",
+                _ssot_ticker, _audit.summary(),
+            )
+            for c in _audit.corrections[:10]:
+                logger.info(
+                    "[SSOT-correction] %s %s: %s → %s (%s)",
+                    _ssot_ticker, c.field_name, c.old, c.new, c.rule,
+                )
+            for w in _audit.warnings[:5]:
+                logger.warning("[SSOT-warn] %s %s", _ssot_ticker, w)
+    except Exception as _ssot_err:
+        logger.warning(
+            "[SSOT] reconciler failed (non-fatal) for %s: %s",
+            subject_ticker or "?", _ssot_err,
+        )
     if is_guest:
         report_text = _sanitize_guest_report_text(report_text, report_json)
         if html_report:
@@ -717,7 +1583,12 @@ def _staging_shape_result(
         "report_kind": report_kind,
         "result_type": result_type or report_kind,
         "summary": summary,
-        "verdict": _staging_extract_verdict(report_text, report_kind=report_kind, result_type=result_type),
+        # SSOT verdict wins when FactSheet is available; legacy extractor is fallback only
+        "verdict": (
+            _ssot_fs.verdict
+            if _ssot_fs and _ssot_fs.verdict
+            else _staging_extract_verdict(report_text, report_kind=report_kind, result_type=result_type)
+        ),
         "risk_level": risk_level,
         "confidence": confidence,
         "insights": _staging_extract_insights(report_text, report_kind=report_kind, summary=summary, result_type=result_type),
@@ -1297,7 +2168,7 @@ async def staging_public_analyze(
                 "[intent-gate][staging] portfolio construction routed to builder: %s",
                 normalized_query,
             )
-            report_text = await run_in_threadpool(_detect_and_build, normalized_query)
+            report_text = await run_in_threadpool(_detect_and_build, normalized_query, preferred_language)
             if not report_text:
                 raise HTTPException(status_code=502, detail="Portfolio builder returned no content.")
             return _shape_public_result(
@@ -1417,6 +2288,41 @@ async def staging_public_analyze(
         if not report_text:
             raise HTTPException(status_code=502, detail="Analysis returned no content.")
 
+        # ── Phase G — Institutional single-asset parity wrapper ─────────────
+        # Augments the LLM report with Section A (metadata + confidence + implementation)
+        # and Section G (audit appendix + model constraints). Non-invasive — preserves
+        # original report body, only prepends/appends + polishes retail emoji headers.
+        # Toggle via INSTITUTIONAL_STOCK_WRAPPER=0 to disable.
+        try:
+            if os.getenv("INSTITUTIONAL_STOCK_WRAPPER", "1") not in ("0", "false", "False"):
+                from core.services.institutional_stock_wrapper import wrap_stock_report
+                _live_data = live_payload.get("data") or {}
+                _fund_data = (_live_data.get("fundamentals") if isinstance(_live_data, dict) else {}) or {}
+                _tech_data = (_live_data.get("technical")    if isinstance(_live_data, dict) else {}) or {}
+                _realized_vol = (_tech_data.get("realized_vol_pct")
+                                 or _tech_data.get("volatility_pct")
+                                 or _fund_data.get("volatility_pct"))
+                _beta_val     = _fund_data.get("beta") or _fund_data.get("beta_world")
+                _adv          = _tech_data.get("avg_daily_volume")
+                _has_fund     = bool(_fund_data and (
+                    _fund_data.get("pe") is not None
+                    or _fund_data.get("eps") is not None
+                    or _fund_data.get("revenue") is not None
+                ))
+                report_text = wrap_stock_report(
+                    report_text,
+                    symbol=resolution.symbol,
+                    market=resolution.market or "",
+                    asset_type=resolution.asset_type or "equity",
+                    language=preferred_language,
+                    realized_vol_pct=_realized_vol if isinstance(_realized_vol, (int, float)) else None,
+                    beta=_beta_val if isinstance(_beta_val, (int, float)) else None,
+                    fundamentals_available=_has_fund,
+                    avg_daily_volume=_adv if isinstance(_adv, (int, float)) else None,
+                )
+        except Exception as _ex:
+            logger.warning("[institutional-wrapper] failed for %s: %s", resolution.symbol, _ex)
+
         generated_at = datetime.now().astimezone().isoformat()
         report_json = None
         try:
@@ -1428,7 +2334,7 @@ async def staging_public_analyze(
                 report_text=report_text,
                 analysis_data=live_payload.get("data") or {},
                 system_version=_APP_VERSION,
-                model_primary="DeepSeek V3",
+                model_primary="EisaX Agent",
                 generated_at=generated_at,
                 data_as_of=generated_at,
                 latency_seconds=max(0, int(round(_time.perf_counter() - started_at))),
@@ -1475,6 +2381,8 @@ async def staging_public_analyze(
             report_json=report_json,
             resolution=resolution_payload,
             report_id=_report_id,
+            analysis_data=live_payload.get("data") or {},
+            subject_ticker=resolution.symbol,
         )
     except HTTPException:
         raise
