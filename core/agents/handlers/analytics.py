@@ -110,7 +110,9 @@ class AnalyticsMixin:
             _r = _DEDUP_MAP.get(_tk.upper(), _tk.upper())
             if _r not in _seen_res:
                 _seen_res.add(_r)
-                _deduped.append(_tk)
+                # Preserve the canonical resolved form so downstream lookups
+                # (TV cache by market, yfinance) get e.g. "CL=F" not "CL".
+                _deduped.append(_r if _r != _tk.upper() else _tk)
         tickers = _deduped
         # Remove spurious local-market tickers injected by the resolver when the user
         # didn't explicitly mention them.  e.g. "analyze COPPER" → resolver adds
@@ -193,7 +195,7 @@ class AnalyticsMixin:
                     _r2 = _req.post(
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
-                        json={"model": "deepseek-chat",
+                        json={"model": "deepseek-v4-flash",
                               "messages": [{"role": "user", "content": f"Compare {' vs '.join(_names)} in a markdown table with: Verdict, Score, Upside, Risk, Best For. Be concise."}],
                               "max_tokens": 400, "temperature": 0},
                         timeout=30
@@ -264,6 +266,24 @@ class AnalyticsMixin:
             try: return str(round(float(v), 2))
             except: return str(v) if v else "N/A"
 
+        # ── DATA GUARD: pre-flight completeness check + auto-enrich ──────────
+        # Ensures uae_fundamentals DB is filled before any analysis runs.
+        # If fields are missing, runs waterfall through yfinance/tradingview/scrape.
+        # Saves results to DB so the parallel _f_fund call below hits a hot cache.
+        try:
+            from core.data_guard import ensure_complete as _ensure_data
+            _dg_report = _ensure_data(target, level="institutional", allow_scrape=True)
+            logger.info(
+                f"[DataGuard] {target}: complete={_dg_report.is_complete} "
+                f"pct={_dg_report.completeness_pct:.0f}% "
+                f"sources={_dg_report.sources_used} "
+                f"missing={len(_dg_report.missing_fields)} "
+                f"scraped={_dg_report.scrape_performed} "
+                f"({_dg_report.duration_ms}ms)"
+            )
+        except Exception as _dg_err:
+            logger.warning(f"[DataGuard] {target}: non-fatal error: {_dg_err}")
+
         # Submit all network calls simultaneously (news engine runs in parallel too)
         from core.news_engine_client import get_ticker_news as _get_engine_news
         with _TpEx(max_workers=8) as _exe:
@@ -283,12 +303,16 @@ class AnalyticsMixin:
             t10y = fed = unemp = inflation = gdp = "N/A"
             news_sent = "N/A"; news_score = 0; sentiment = {}
 
-            # ── Market Cache lookup (UAE/KSA/Egypt/Qatar tickers) ────────────
-            # Try before yfinance — cache has live TradingView data every 15min
+            # ── TradingView Cache Lookup — authoritative for ALL tickers ─────
+            # TV pipeline cache refreshes every 15 min and covers:
+            #   GCC/MENA: uae/ksa/egypt/kuwait/qatar/bahrain/morocco/tunisia
+            #   US      : america (top 500)
+            #   Commodities: GC=F, CL=F, BZ=F, SI=F, NG=F, HG=F, PL=F
+            #   Crypto  : 200 pairs
+            # YF/Scrape are fallbacks for fields TV doesn't have or tickers TV misses.
             _cache_row = None
             try:
                 _target_up = target.upper()
-                # Determine which market cache to search
                 _cache_markets = []
                 if _target_up.endswith(".AE") or _target_up.endswith(".DU"):
                     _cache_markets = ["uae"]
@@ -306,41 +330,33 @@ class AnalyticsMixin:
                     _cache_markets = ["morocco"]
                 elif _target_up.endswith(".TN"):
                     _cache_markets = ["tunisia"]
+                elif _target_up.endswith("=F"):
+                    _cache_markets = ["commodities"]
                 else:
-                    # Try all regional caches for bare tickers like "ADNOCGAS"
-                    _cache_markets = ["uae", "ksa", "egypt", "kuwait", "qatar"]
+                    # Bare symbol — try regional first, then US, then crypto
+                    _cache_markets = ["uae", "ksa", "egypt", "kuwait", "qatar",
+                                      "america", "crypto"]
 
-                import os as _os, json as _json
-                _cache_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "market_cache")
-                _idx_path = _os.path.join(_cache_dir, "index.json")
-                if _os.path.exists(_idx_path):
-                    import pandas as _pd
-                    with open(_idx_path) as _f:
-                        _idx = _json.load(_f)
-                    for _mkt in _cache_markets:
-                        if _mkt not in _idx:
-                            continue
-                        _entries = _idx[_mkt]
-                        if isinstance(_entries, list):
-                            _entries = sorted(_entries, key=lambda x: x.get("timestamp",""), reverse=True)
-                            _latest = _entries[0] if _entries else None
-                        else:
-                            _latest = _entries
-                        if not _latest:
-                            continue
-                        _fpath = _os.path.join(_cache_dir, _latest["filename"])
-                        _df = _pd.read_parquet(_fpath)
-                        # Match by yfinance suffix format (ADNOCGAS.AE → ADX:ADNOCGAS)
-                        # or by bare symbol
-                        _bare = _target_up.split(".")[0]
-                        _match = _df[
-                            _df["ticker"].str.upper().str.endswith(":" + _bare) |
-                            (_df["ticker"].str.upper() == _target_up)
-                        ]
-                        if not _match.empty:
-                            _cache_row = _match.iloc[0].to_dict()
-                            logger.info("[MarketCache] Found %s in %s cache: price=%.2f", target, _mkt, float(_cache_row.get("close",0) or 0))
-                            break
+                from core.data_layer import market_cache_adapter as _mca
+                for _mkt in _cache_markets:
+                    _df = _mca.get_latest_snapshot(_mkt)
+                    if _df is None or _df.empty or "ticker" not in _df.columns:
+                        continue
+                    _bare = _target_up.split(".")[0]
+                    _col = _df["ticker"].str.upper()
+                    _match = _df[
+                        _col.str.endswith(":" + _bare)
+                        | (_col == _target_up)
+                        | (_col == _bare)
+                    ]
+                    if not _match.empty:
+                        _cache_row = _match.iloc[0].to_dict()
+                        _cache_row["_tv_market"] = _mkt
+                        logger.info(
+                            "[DataLayer] Found %s in %s snapshot: price=%.4f",
+                            target, _mkt, float(_cache_row.get("close", 0) or 0),
+                        )
+                        break
             except Exception as _ce:
                 logger.debug("[MarketCache] Lookup failed for %s: %s", target, _ce)
 
@@ -365,15 +381,43 @@ class AnalyticsMixin:
                 sentiment = {}
                 macro = {}
 
-            # ── Inject Market Cache data if yfinance returned no price ────────
-            if _cache_row and not real_price:
+            # ── Unified routing: TradingView cache is authoritative for ALL ──
+            # For any ticker where TV cache returned a row, TV wins over YF
+            # and scrape sources. Yahoo/StockAnalysis/Investing.com are
+            # labeled fallbacks for fields TV doesn't expose or tickers
+            # TV cache doesn't carry.
+            _snapshot_ts = None
+            _price_source = "fallback"
+            _tv_authoritative = False     # Sticky flag: TV was the source
+            _tv_authoritative_price = None  # Survives later real_price overwrites
+            if _cache_row:
                 try:
-                    real_price = float(_cache_row.get("close") or 0) or None
-                    change_pct = float(_cache_row.get("change") or 0)
-                    logger.info("[MarketCache] Injected price=%.2f change=%.2f%% for %s",
-                                real_price or 0, change_pct, target)
+                    _tv_price = float(_cache_row.get("close") or 0) or None
+                    _tv_change = float(_cache_row.get("change") or 0)
+                    if _tv_price:
+                        if real_price and abs(real_price - _tv_price) / _tv_price > 0.001:
+                            logger.info(
+                                "[TVRouting] %s: fallback price=%.4f -> TV authoritative=%.4f",
+                                target, real_price, _tv_price,
+                            )
+                        real_price = _tv_price
+                        change_pct = _tv_change
+                        _price_source = "tradingview_cache"
+                        _tv_authoritative = True
+                        _tv_authoritative_price = _tv_price
+                        logger.info(
+                            "[MarketCache] %s price=%.4f change=%.2f%% (source=tradingview_cache)",
+                            target, real_price, change_pct,
+                        )
                 except Exception as _cij:
                     logger.debug("[MarketCache] Price inject failed: %s", _cij)
+                # Capture snapshot timestamp for cross-section reconciliation
+                try:
+                    from core.data_layer import market_cache_adapter as _mca_ts
+                    _mkt_for_ts = _cache_row.get("_tv_market") or (_cache_markets[0] if _cache_markets else "uae")
+                    _snapshot_ts = _mca_ts.snapshot_timestamp(_mkt_for_ts)
+                except Exception:
+                    _snapshot_ts = None
 
             # ── collect: Fundamentals (resilient waterfall) ──────────────────
             fund = {}
@@ -395,14 +439,16 @@ class AnalyticsMixin:
                     _db = _sq.connect(str(_cfg_core_db))
                     _row = _db.execute(
                         "SELECT pe_ratio,beta,market_cap,eps,div_yield,revenue,net_margin,forward_pe,sector,company_name,"
-                        "week_52_high,week_52_low,roe,gross_margin,revenue_growth,earnings_growth,net_income "
+                        "week_52_high,week_52_low,roe,gross_margin,revenue_growth,earnings_growth,net_income,"
+                        "operating_margin,roa,ebitda,free_cash_flow,debt_equity,current_ratio,price_book "
                         "FROM uae_fundamentals WHERE ticker=? LIMIT 1", (target.upper(),)
                     ).fetchone()
                     _db.close()
                     if _row and any(v is not None for v in _row[:8]):
                         _cols = ["pe_ratio","beta","market_cap","eps","div_yield","revenue","net_margin","forward_pe",
                                  "sector","company_name","week52_high","week52_low","roe","gross_margin",
-                                 "revenue_growth","earnings_growth","net_income"]
+                                 "revenue_growth","earnings_growth","net_income",
+                                 "operating_margin","roa","ebitda","fcf","debt_equity","current_ratio","price_book"]
                         _db_fund = {k: v for k, v in zip(_cols, _row) if v is not None}
                         fund = {**_db_fund, **fund}   # DB fills gaps, live data takes priority
                         _fund_source = "db_cache+yfinance"
@@ -434,26 +480,29 @@ class AnalyticsMixin:
                             return not (_math_fc.isnan(f) or _math_fc.isinf(f)) and f != 0
                         except (TypeError, ValueError):
                             return False
+                    # Unified policy: TV authoritative -> always collect, no gating.
+                    # YF/scrape values keep their place for fields TV doesn't have.
+                    _gate = lambda key: True  # noqa: E731
                     _pe_raw = _cache_row.get("price_earnings_ttm")
-                    if _valid_cache_num(_pe_raw) and not fund.get("pe_ratio"):
+                    if _valid_cache_num(_pe_raw) and _gate("pe_ratio"):
                         _cache_fund["pe_ratio"] = float(_pe_raw)
                     _eps_raw = _cache_row.get("earnings_per_share_diluted_ttm")
-                    if _valid_cache_num(_eps_raw) and not fund.get("eps"):
+                    if _valid_cache_num(_eps_raw) and _gate("eps"):
                         _cache_fund["eps"] = float(_eps_raw)
-                    if _cache_row.get("market_cap_basic") and not fund.get("market_cap"):
+                    if _cache_row.get("market_cap_basic") and _gate("market_cap"):
                         _cache_fund["market_cap"] = float(_cache_row["market_cap_basic"])
-                    if _cache_row.get("sector") and not fund.get("sector"):
+                    if _cache_row.get("sector") and _gate("sector"):
                         _cache_fund["sector"] = str(_cache_row["sector"])
-                    if _cache_row.get("dividend_yield_recent") is not None and not fund.get("div_yield"):
+                    if _cache_row.get("dividend_yield_recent") is not None and _gate("div_yield"):
                         _cache_fund["div_yield"] = float(_cache_row["dividend_yield_recent"] or 0)
-                    # Inject 52W range from TradingView cache if not already populated
+                    # Inject 52W range from TradingView cache
                     _cache_52h = float(_cache_row.get("high_52_week") or _cache_row.get("week52_high") or 0)
                     _cache_52l = float(_cache_row.get("low_52_week") or _cache_row.get("week52_low") or 0)
-                    if _cache_52h and not fund.get("week52_high"):
+                    if _cache_52h and _gate("week52_high"):
                         _cache_fund["week52_high"] = _cache_52h
-                    if _cache_52l and not fund.get("week52_low"):
+                    if _cache_52l and _gate("week52_low"):
                         _cache_fund["week52_low"] = _cache_52l
-                    # Inject TradingView technicals directly
+                    # Inject TradingView technicals directly (TV is always authoritative for technicals)
                     _cache_fund["rsi"]        = round(float(_cache_row.get("RSI") or 0), 2)
                     _cache_fund["macd"]       = round(float(_cache_row.get("MACD.macd") or 0), 4)
                     _cache_fund["macd_signal"]= round(float(_cache_row.get("MACD.signal") or 0), 4)
@@ -462,10 +511,14 @@ class AnalyticsMixin:
                     _cache_fund["atr"]        = round(float(_cache_row.get("ATR") or 0), 4)
                     _cache_fund["stoch_k"]    = round(float(_cache_row.get("Stoch.K") or 0), 2)
                     _cache_fund["volume"]     = int(_cache_row.get("volume") or 0)
-                    _cache_fund["data_source"] = "TradingView Live Cache"
-                    fund = {**_cache_fund, **fund}   # cache fills gaps, live data takes priority
-                    if _fund_source == "none":
-                        _fund_source = "tradingview_cache"
+                    # Tag source + snapshot ts so downstream sections can reconcile
+                    _cache_fund["data_source"] = "TradingView Live Cache (authoritative)"
+                    _cache_fund["snapshot_ts"] = _snapshot_ts
+                    # TV authoritative across markets: cache overrides fund.
+                    # Yahoo-only fields (forward_pe, analyst data, growth, etc.)
+                    # remain in fund and pass through unchanged.
+                    fund = {**fund, **_cache_fund}
+                    _fund_source = "tradingview_cache"
                     logger.info("[MarketCache] Injected %d fundamental fields for %s (P/E=%.1f, RSI=%.1f)",
                                 len(_cache_fund), target,
                                 (float(_cache_row.get("price_earnings_ttm") or 0) if _valid_cache_num(_cache_row.get("price_earnings_ttm")) else 0.0),
@@ -515,6 +568,23 @@ class AnalyticsMixin:
             forward_pe = None
             dividend_yield = None; news_links = []; earnings_date = None
             dc_data = {}
+            # Universal TV-first: pre-seed dividend_yield from TV cache.
+            # DeepCrawl/yfinance only fill when TV value is missing.
+            try:
+                if _cache_row is not None:
+                    _tv_dy = _cache_row.get("dividend_yield_recent")
+                    if _tv_dy is not None:
+                        _tv_dy_f = float(_tv_dy)
+                        if 0 < _tv_dy_f < 50:
+                            # TV stores as percent (e.g. 3.81). Downstream code
+                            # treats dividend_yield as decimal (3.81% = 0.0381).
+                            dividend_yield = _tv_dy_f / 100.0
+                            logger.info(
+                                "[TVRouting] %s: dividend_yield seeded from TV cache: %.4f",
+                                target, dividend_yield,
+                            )
+            except Exception as _dy_seed_e:
+                logger.debug("[TVRouting] dividend_yield seed failed: %s", _dy_seed_e)
             # ── EisaX News Engine — collected in parallel, resolved first ────────
             _engine_news_data = {}
             try:
@@ -535,14 +605,21 @@ class AnalyticsMixin:
                 earnings_date = dc_data.get("earnings_date", "")
                 # DeepCrawl "dividend" = annual dollar amount ($1.04), NOT yield %
                 # Convert to yield: $1.04 / $254.23 = 0.0041 (0.41%)
-                _dc_div_dollar = float(dc_data.get("dividend", 0) or 0)
-                _dc_price = float(dc_data.get("price", 0) or 0) or (real_price or 0)
-                if _dc_div_dollar > 0 and _dc_price > 0:
-                    dividend_yield = _dc_div_dollar / _dc_price  # dollar → decimal yield
-                    if dividend_yield > 0.20:  # > 20% yield = data error
+                # Skip DeepCrawl div_yield override if TV cache already seeded
+                # an authoritative value for this ticker.
+                _tv_seeded = (
+                    dividend_yield is not None
+                    and _cache_row is not None
+                )
+                if not _tv_seeded:
+                    _dc_div_dollar = float(dc_data.get("dividend", 0) or 0)
+                    _dc_price = float(dc_data.get("price", 0) or 0) or (real_price or 0)
+                    if _dc_div_dollar > 0 and _dc_price > 0:
+                        dividend_yield = _dc_div_dollar / _dc_price  # dollar → decimal yield
+                        if dividend_yield > 0.20:  # > 20% yield = data error
+                            dividend_yield = None
+                    else:
                         dividend_yield = None
-                else:
-                    dividend_yield = None
                 logger.info(f"[Analytics] DeepCrawl OK: price={dc_data.get('price')}, target={analyst_target}")
             except Exception as e:
                 logger.error(f"[Analytics] DeepCrawl failed: {e}")
@@ -2309,18 +2386,30 @@ REQUIREMENT: Show at least 2 BULLISH rows (🚀💡📈) and at least 2 BEARISH 
                     change_pct=change_pct
                 )
                 import re as _re_hint
-                # Extract verdict from scorecard markdown: "MSFT | **HOLD 🟡** | Conviction: **Low**"
-                _vh_m = _re_hint.search(r'\|\s*\*\*([A-Z]+)\s*([^\*]*)\*\*\s*\|\s*Conviction:\s*\*\*([^\*]+)\*\*', _pre_scorecard_md)
+                # Extract verdict from scorecard markdown — supports both legacy and canonical formats:
+                #   Legacy:    "MSFT | **HOLD 🟡** | Conviction: **Low**"
+                #   Canonical: "MSFT | Verdict: **Hold 🟡** | Timing: **Neutral** | Evidence: **Limited**"
+                # New schema first — uses "Verdict: ... | ... Evidence: ..."
+                _vh_m = _re_hint.search(
+                    r'Verdict:\s*\*\*([A-Za-z]+)\s*([^\*]*)\*\*[^|]*\|[^|]*Evidence:\s*\*\*([^\*]+)\*\*',
+                    _pre_scorecard_md,
+                )
+                if not _vh_m:
+                    # Legacy fallback (Fundamental: ... | Conviction: ...)
+                    _vh_m = _re_hint.search(
+                        r'\|\s*\*\*([A-Z]+)\s*([^\*]*)\*\*\s*\|\s*(?:Conviction|Evidence):\s*\*\*([^\*]+)\*\*',
+                        _pre_scorecard_md,
+                    )
                 if _vh_m:
                     _sc_v, _sc_e, _sc_c = _vh_m.group(1).strip(), _vh_m.group(2).strip(), _vh_m.group(3).strip()
-                    scorecard_verdict_hint = f'{_sc_v} {_sc_e} (Conviction: {_sc_c})'
+                    scorecard_verdict_hint = f'{_sc_v} {_sc_e} (Evidence: {_sc_c})'
                 else:
                     # Primary regex failed — try broader extraction before giving up
-                    _vh_m2 = _re_hint.search(r'\b(BUY|HOLD|SELL|REDUCE|ACCUMULATE|UNDERWEIGHT|AVOID)\b', _pre_scorecard_md)
-                    _vc_m2 = _re_hint.search(r'Conviction[\s:*|]+?(High|Medium|Low)', _pre_scorecard_md, _re_hint.IGNORECASE)
+                    _vh_m2 = _re_hint.search(r'\b(Buy|Hold|Reduce|Sell|BUY|HOLD|SELL|REDUCE|ACCUMULATE|UNDERWEIGHT|AVOID)\b', _pre_scorecard_md)
+                    _vc_m2 = _re_hint.search(r'(?:Conviction|Evidence)[\s:*|]+?(High|Medium|Low|Strong|Moderate|Limited)', _pre_scorecard_md, _re_hint.IGNORECASE)
                     if _vh_m2:
-                        _sc_c2 = _vc_m2.group(1).strip() if _vc_m2 else 'Medium'
-                        scorecard_verdict_hint = f'{_vh_m2.group(1)} (Conviction: {_sc_c2})'
+                        _sc_c2 = _vc_m2.group(1).strip() if _vc_m2 else 'Moderate'
+                        scorecard_verdict_hint = f'{_vh_m2.group(1)} (Evidence: {_sc_c2})'
                         logger.warning(f"[ScorecardHint] Primary regex failed for {target}, broad fallback: {scorecard_verdict_hint}")
                     else:
                         scorecard_verdict_hint = None
@@ -2505,20 +2594,54 @@ RESEARCH CONTEXT ({_dt.now().strftime("%B %Y")}):
                         "   ⚡ PEER SELECTION: Choose the MOST RELEVANT competitor — for cloud/software companies this may be AMZN (AWS) or META, not necessarily GOOGL. For UAE/Saudi companies compare to the closest regional peer."
                     )
 
-                # ── Data mode block: compact report when fundamentals are limited ────────
+                # ── Phase 3: Evidence Router — gate sections by data quality ──
+                # Determines which sections may render. Disabled sections must be
+                # HIDDEN, not rendered as placeholder text.
+                _allow_list = None
+                try:
+                    from core.evidence_router import route_evidence as _route_ev
+                    _allow_list = _route_ev(
+                        fund=fund or {},
+                        scorecard=getattr(self, '_last_scorecard_decision', {}) or {},
+                        summary=summary or {},
+                        peers=(_us_peers if '_us_peers' in dir() else None),
+                        analyst_data={
+                            "analyst_count": (analyst_consensus or {}).get("count")
+                                if isinstance(analyst_consensus, dict) else None,
+                            "dc_consensus": (dc_data or {}).get("consensus")
+                                if isinstance(dc_data, dict) else None,
+                            "next_earnings": next_earnings if 'next_earnings' in dir() else None,
+                        },
+                        ticker=target,
+                    )
+                except Exception as _ev_err:
+                    logger.warning(f"[EvidenceRouter] {target}: routing failed: {_ev_err}")
+
+                # ── Data mode block: dynamic depth scaling by data coverage ──
+                # Now driven by evidence_router rather than free-form prompt rules.
                 _data_mode_block = ""
-                if '_data_coverage_level' in dir() and _data_coverage_level in ("technical_only", "low"):
+                if _allow_list is not None:
+                    _disabled = _allow_list.disabled()
+                    _enabled  = _allow_list.enabled()
+                    if _disabled:
+                        _data_mode_block = (
+                            "\n🔴 EVIDENCE-GATED SECTIONS (do NOT render the following):\n"
+                            + "\n".join(f"  ⛔ {s}" for s in _disabled)
+                            + "\n✅ Eligible sections (render only these):\n"
+                            + "\n".join(f"  • {s}" for s in _enabled)
+                            + "\nRule: If a section is in the FORBIDDEN list, OMIT it entirely. "
+                              "No placeholder like 'Disabled in low-data mode.' — just don't write it.\n"
+                            + ("\nThis is TACTICAL BRIEF mode — total body MUST stay under 400 words.\n"
+                               if not _allow_list.full_fundamental else "")
+                        )
+                elif '_data_coverage_level' in dir() and _data_coverage_level in ("technical_only", "low"):
+                    # Legacy fallback if evidence_router failed
                     _data_mode_block = (
-                        "\n🔴 DATA COVERAGE ALERT: FUNDAMENTAL DATA LIMITED\n"
-                        "⛔ COMPACT REPORT MODE — MANDATORY:\n"
-                        "- Executive Summary MUST open with: \"⚠️ Fundamental data coverage is limited — this analysis relies primarily on price behavior.\"\n"
-                        "- Section 2 (Fundamental Analysis): Write 2-3 sentences MAX. State which metrics ARE available. Then: \"Fundamental visibility is limited; analysis relies primarily on price behavior.\"\n"
-                        "- Section 5: Write \"Analyst consensus and valuation scenarios are disabled in low-data mode.\" Do not create valuation tables.\n"
-                        "- Section 6 (Peer Comparison): Write \"Peer comparison is disabled in low-data mode because fundamental coverage is limited.\" Do not create peer tables.\n"
-                        "- Section 9: Write one concise scenario-sensitivity sentence only. Do not create scenario tables.\n"
-                        "- This overrides any later instruction asking for valuation ranges, peer comparison, or scenario tables.\n"
-                        "- Avoid strong BUY/SELL wording; describe technical moves as positive or negative momentum that requires confirmation.\n"
-                        "- Total memo body: maximum 600 words. Be concise.\n"
+                        "\n🔴 TACTICAL BRIEF MODE — LOW DATA COVERAGE\n"
+                        "- Executive Summary: 2 sentences MAX. Open with: \"Fundamental data coverage is limited.\"\n"
+                        "- Section 2 (Fundamental Analysis): 2 sentences MAX.\n"
+                        "- Sections 5, 6, 9: OMIT entirely.\n"
+                        "- Total body: HARD CAP 400 words.\n"
                     )
 
                 # ── Conviction anchor: cascade Low conviction to all sections ──────────
@@ -2536,12 +2659,13 @@ RESEARCH CONTEXT ({_dt.now().strftime("%B %Y")}):
                     pass
                 if _scorecard_conviction_level_safe == "Low" or _eisax_score_int < 60:
                     _conviction_anchor_block = (
-                        f"\n⚠️ LOW CONVICTION SIGNAL: EisaX Score={_eisax_score_int}/100, Conviction={_scorecard_conviction_level_safe}\n"
-                        "This MUST cascade through the entire memo:\n"
-                        "- Every section: use hedged language (\"suggests\", \"may indicate\", \"limited evidence for\") rather than confident assertions.\n"
-                        "- Avoid specific price targets — use ranges with explicit uncertainty (e.g., \"estimated range 20–25, low confidence\").\n"
-                        "- Section 8b Conviction: MUST be Low for both Fundamental and Timing dimensions.\n"
-                        "- Do NOT write a high-confidence Executive Summary when conviction is Low.\n"
+                        f"\n⚠️ LIMITED FUNDAMENTAL VISIBILITY: EisaX Score={_eisax_score_int}/100, Evidence Strength={_scorecard_conviction_level_safe}\n"
+                        "This MUST cascade through the entire memo using institutional calibrated language:\n"
+                        "- Use declarative but calibrated phrasing: \"evidence suggests\", \"data supports\", \"signal indicates\" — never \"we believe\" or \"clearly\".\n"
+                        "- Price targets must use scenario ranges with explicit data caveats (e.g., \"base case 20–25, limited fundamental visibility\").\n"
+                        "- Thesis classification: \"Technical-Led Thesis\" when fundamentals are limited; \"Awaiting Confirmation\" when momentum is unconfirmed.\n"
+                        "- Section 8b: report dimension status as \"Limited Fundamental Visibility\" or \"Awaiting Confirmation\" — not \"Low Confidence\".\n"
+                        "- Executive Summary must reflect institutional calibration — no false certainty, no hedging filler.\n"
                     )
 
                 # ── Verdict tone lock: prevent tone contradictions ──────────────────────
@@ -2837,6 +2961,45 @@ Do NOT include a standalone Positioning section.{_brain_ctx}
                 # Add Local Market Data
                 prompt += _local_data_injection
 
+                # ── Phase D: SSOT pre-grounding (flag-gated, OFF by default) ──
+                # Inject the FactSheet 'GROUND TRUTH' block so the LLM grounds
+                # on authoritative price/SMA/currency/sector/verdict BEFORE
+                # generating, reducing post-hoc reconciler corrections. Enable
+                # with EISAX_PREGROUNDING=1. Fully non-fatal: any error skips
+                # the block and report generation proceeds unchanged.
+                import os as _os_pg
+                if _os_pg.getenv("EISAX_PREGROUNDING", "0") == "1":
+                    try:
+                        import re as _re_pg
+                        from core.services.fact_sheet import (
+                            build_fact_sheet as _build_fs_pg,
+                            render_pregrounding_block as _render_pg,
+                        )
+                        _pg_ds = None
+                        _vh_pg = locals().get("scorecard_verdict_hint")
+                        if _vh_pg:
+                            _vm_pg = _re_pg.search(
+                                r"\b(Buy|Hold|Reduce|Sell|Accumulate|Underweight|Overweight)\b",
+                                str(_vh_pg), _re_pg.IGNORECASE,
+                            )
+                            if _vm_pg:
+                                _pg_ds = {"verdict": _vm_pg.group(1)}
+                        _pg_fs = _build_fs_pg(target, decision_state=_pg_ds)
+                        if not _pg_fs.blocking_errors:
+                            _pg_block = _render_pg(_pg_fs)
+                            if _pg_block:
+                                prompt += "\n\n" + _pg_block
+                                logger.info(
+                                    "[PreGround] %s: FactSheet block injected (%d chars, verdict=%s, subtype=%s)",
+                                    target, len(_pg_block), _pg_fs.verdict,
+                                    _pg_fs.sector_subtype.value if _pg_fs.sector_subtype else "?",
+                                )
+                        else:
+                            logger.info("[PreGround] %s: skipped — FactSheet blockers: %s",
+                                        target, _pg_fs.blocking_errors)
+                    except Exception as _pg_e:
+                        logger.warning("[PreGround] %s: skipped — %s", target, _pg_e)
+
                 # ── Mode-based prompt adjustment ──────────────────────────────
                 if _analysis_mode == "quick":
                     _max_tokens = 1500
@@ -2862,28 +3025,63 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     _mode_instruction = ""
 
                 if _low_data_compact_mode:
-                    _max_tokens = min(_max_tokens, 1600)
+                    # V4-flash is a reasoning model — it consumes ~500-1500 tokens
+                    # on internal reasoning BEFORE producing output. The previous
+                    # 1600 cap left 0 tokens for content (finish=length, reply_len=0).
+                    # Bump to 4000 so reasoning + condensed report both fit.
+                    _max_tokens = min(_max_tokens, 4000)
 
                 if _mode_instruction:
                     prompt = _mode_instruction + "\n\n" + prompt
 
+                # DIAG: log prompt size before call
+                logger.info(f"[DeepSeek] {target}: calling v4-flash prompt={len(prompt)} chars max_tokens={_max_tokens}")
+                _ds_t0 = _tc.time()
                 r = requests.post(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}",
                              "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat",
+                    json={"model": "deepseek-v4-flash",
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": _max_tokens,
                           "temperature": 0},
                     timeout=150
                 )
-                logger.debug(f"[DeepSeek] status: {r.status_code}, response keys: {list(r.json().keys())}")
-                resp_json = r.json()
+                _ds_elapsed = _tc.time() - _ds_t0
+                logger.info(f"[DeepSeek] {target}: status={r.status_code} elapsed={_ds_elapsed:.1f}s")
+                try:
+                    resp_json = r.json()
+                except Exception as _je:
+                    logger.error(f"[DeepSeek] {target}: JSON parse failed: {_je} | body[:200]={r.text[:200]!r}")
+                    resp_json = {}
                 if "choices" in resp_json:
-                    deepseek_reply = resp_json["choices"][0]["message"]["content"].strip()
-                    logger.debug(f"[DeepSeek] got reply length: {len(deepseek_reply)}")
+                    _content = resp_json["choices"][0].get("message", {}).get("content") or ""
+                    _finish = resp_json["choices"][0].get("finish_reason")
+                    _usage = resp_json.get("usage", {})
+                    deepseek_reply = _content.strip()
+                    logger.info(
+                        f"[DeepSeek] {target}: reply_len={len(deepseek_reply)} finish={_finish} "
+                        f"reasoning_tok={_usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
+                        f"completion_tok={_usage.get('completion_tokens')}"
+                    )
+                    # ── Phase 6: structured LLM cost/usage observability ──────
+                    # Single grep-able line for cost aggregation. No secrets,
+                    # no prompt content. pregrounding flag included so token
+                    # impact of Phase D can be measured directly from logs.
+                    import os as _os_u
+                    logger.info(
+                        "[LLMUsage] model=%s ticker=%s prompt_tok=%s completion_tok=%s total_tok=%s "
+                        "cache_hit_tok=%s cache_miss_tok=%s prompt_chars=%d latency_s=%.1f http=%s "
+                        "finish=%s retries=%d pregrounding=%s",
+                        "deepseek-v4-flash", target,
+                        _usage.get("prompt_tokens"), _usage.get("completion_tokens"),
+                        _usage.get("total_tokens"),
+                        _usage.get("prompt_cache_hit_tokens"), _usage.get("prompt_cache_miss_tokens"),
+                        len(prompt), _ds_elapsed, r.status_code, _finish, 0,
+                        _os_u.getenv("EISAX_PREGROUNDING", "0"),
+                    )
                 else:
-                    logger.debug(f"[DeepSeek] unexpected response: {resp_json}")
+                    logger.warning(f"[DeepSeek] {target}: no 'choices' in response: keys={list(resp_json.keys())} body[:300]={str(resp_json)[:300]}")
                 # Force correct date in response (DeepSeek often ignores prompt date)
                 from datetime import datetime as _dt
                 correct_date = _dt.now().strftime("%B %d, %Y")
@@ -3408,11 +3606,11 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         # ── Deterministic score-based sizing table ─────────────────────────────
         _SIZING_TABLE = [
             (85, 100, "7–10%", "12%",  "High Conviction"),
-            (70,  84, "5–8%",  "10%",  "Medium-High"),
-            (55,  69, "3–5%",  "7%",   "Medium"),
-            (0,   54, "1–3%",  "5%",   "Low Conviction"),
+            (70,  84, "5–8%",  "10%",  "Moderate Evidence Strength"),
+            (55,  69, "3–5%",  "7%",   "Partial Fundamental Coverage"),
+            (0,   54, "1–3%",  "5%",   "Limited Fundamental Visibility"),
         ]
-        _alloc_core, _alloc_max, _sizing_label = "1–3%", "5%", "Low Conviction"
+        _alloc_core, _alloc_max, _sizing_label = "1–3%", "5%", "Limited Fundamental Visibility"
         for _lo, _hi, _core, _max, _lbl in _SIZING_TABLE:
             if _lo <= _score_ps <= _hi:
                 _alloc_core, _alloc_max, _sizing_label = _core, _max, _lbl
@@ -3459,7 +3657,7 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
         _conv_pct = int(min(max(round(_conv_raw), 30), 85))
 
         _conviction_note = (
-            f"*Conviction: {_conv_pct}% — "
+            f"*Calibration: {_conv_pct}% — "
             f"Score({_conv_base}) + Upside({_conv_upside}) + "
             f"Coverage({_conv_coverage:+.0f}) + Trend({_conv_trend:+.0f}) + ADX({_conv_adx:+.1f}) "
             f"→ Raw({_conv_raw:.1f}) → Clamped(30–85%)*"
@@ -3843,185 +4041,118 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 decision_data: dict = None,
                 is_arabic: bool = False,
             ) -> str:
-                """Compact snapshot — verdict · Final Action · deterministic insight · one risk."""
+                """
+                Institutional Layer 1 snapshot — 6-8 lines, single source of truth.
+
+                Format:
+                    ## ⚡ Quick View — TICKER
+                    Verdict: Hold · Score: 66/100
+                    Action: Wait
+                    Risk: Moderate · Evidence: Limited · Timing: Extended
+                    ▲ Trigger: ...
+                    ▼ Invalidation: ...
+                    ⚠️ Top Risk: ...
+                """
                 import re as _re_qv
                 _ar = is_arabic
 
-                _lbl_fundamental = "الأساسيات:" if _ar else "Fundamental:"
-                _lbl_timing      = "التوقيت:"   if _ar else "Timing:"
-                _lbl_conviction  = "الثقة:"     if _ar else "Conviction:"
-                _lbl_score       = "درجة EisaX:" if _ar else "EisaX Score:"
-
-                # ── Line 1: Verdict — built from structured decision_data ─────────
-                # decision_data is passed by the caller from self._last_scorecard_decision;
-                # NO closure dependency on _build_scorecard_md locals.
+                # ── Canonical decision data — single source of truth ──────────────
                 dd = decision_data or {}
-                # Arabic value translations so the Quick View doesn't show
-                # "ACCUMULATE / WAIT / Medium" inside Arabic labels.
-                _AR_VERDICT_MAP = {
-                    "STRONG BUY": "شراء قوي",
-                    "BUY":        "شراء",
-                    "ACCUMULATE": "تجميع تدريجي",
-                    "HOLD":       "احتفاظ",
-                    "REDUCE":     "تخفيف",
-                    "SELL":       "بيع",
-                    "AVOID":      "تجنّب",
-                }
-                _AR_TIMING_MAP = {
-                    "BUY NOW":               "شراء فوري",
-                    "WAIT":                  "انتظار التأكيد",
-                    "WAIT FOR CONFIRMATION": "انتظار التأكيد",
-                    "ACCUMULATE ON DIPS":    "تجميع تدريجي عند التراجع",
-                    "REDUCE ON RALLY":       "تخفيف عند الارتفاع",
-                    "EXIT":                  "الخروج",
-                }
-                _AR_CONV_MAP = {
-                    "HIGH":   "عالية",
-                    "MEDIUM": "متوسطة",
-                    "LOW":    "منخفضة",
-                }
-                if dd:
-                    _v = str(dd.get('verdict', 'HOLD')).upper()
-                    _t = str(dd.get('timing',  'WAIT')).upper()
-                    _c = str(dd.get('conviction', 'Medium')).upper()
-                    if _ar:
-                        _v_disp = _AR_VERDICT_MAP.get(_v, _v)
-                        _t_disp = _AR_TIMING_MAP.get(_t, _t)
-                        _c_disp = _AR_CONV_MAP.get(_c, _c)
-                    else:
-                        _v_disp, _t_disp, _c_disp = dd.get('verdict','HOLD'), dd.get('timing','WAIT'), dd.get('conviction','Medium')
-                    _verdict_display = (
-                        f"**{ticker}"
-                        f" | {_lbl_fundamental} {_v_disp} {dd.get('emoji','')}"
-                        f" | {_lbl_timing} {_t_disp}"
-                        f" | {_lbl_conviction} {_c_disp}"
-                        f" | {_lbl_score} {dd.get('score',0)}/100**"
-                    )
-                else:
-                    # No structured data — minimal informative fallback (never "Analysis Complete")
-                    _vl = ""
-                    if scorecard_md:
-                        _vm = _re_qv.search(
-                            r'\*\*' + _re_qv.escape(ticker) + r'\*\*[^*]*EisaX Score.*?\d+/100',
-                            scorecard_md
-                        )
-                        if _vm:
-                            _vl = _re_qv.sub(r'[*`]', '', _vm.group(0)).strip()
-                    if not _vl:
-                        # Last resort: show ticker + score unavailable (no "Analysis Complete")
-                        _vl = f"{ticker} | Score: Unavailable — displaying core metrics only"
-                    _verdict_display = f"**{_vl}**"
+                # Use canonical taxonomy values if present (Buy/Hold/Reduce/Sell, etc.)
+                _v_canon = dd.get('tax_verdict')   or dd.get('verdict', 'Hold')
+                _t_canon = dd.get('tax_timing')    or 'Neutral'
+                _e_canon = dd.get('tax_evidence')  or 'Moderate'
+                _x_canon = dd.get('tax_execution') or 'Hold Steady'
+                _r_canon = dd.get('tax_risk')      or 'Moderate'
+                _score   = dd.get('score', 0)
+                _emoji   = dd.get('emoji', '🟡')
 
-                # ── Line 2: Deterministic quick insight from interpretation labels ──
-                _qv_verdict = dd.get('verdict', 'HOLD') if dd else 'HOLD'
+                # Arabic translations for axis values
+                _AR_VAL = {
+                    "Buy": "شراء", "Hold": "احتفاظ", "Reduce": "تخفيف", "Sell": "بيع",
+                    "Attractive": "نقطة جذابة", "Neutral": "محايد", "Extended": "ممتد",
+                    "Limited": "محدودة", "Moderate": "متوسطة", "Strong": "قوية",
+                    "Scale In": "دخول تدريجي", "Wait": "انتظار", "Reduce Exposure": "تخفيف المركز", "Hold Steady": "ثبات",
+                    "High": "مرتفعة", "Low": "منخفضة",
+                }
+                def _ar_val(v): return _AR_VAL.get(v, v) if _ar else v
+
+                _v_disp = _ar_val(_v_canon)
+                _t_disp = _ar_val(_t_canon)
+                _e_disp = _ar_val(_e_canon)
+                _x_disp = _ar_val(_x_canon)
+                _r_disp = _ar_val(_r_canon)
+
+                # Headline labels
+                _lbl_verdict   = "القرار"     if _ar else "Verdict"
+                _lbl_action    = "الإجراء"    if _ar else "Action"
+                _lbl_risk      = "المخاطرة"   if _ar else "Risk"
+                _lbl_evidence  = "الأدلة"     if _ar else "Evidence"
+                _lbl_timing    = "التوقيت"    if _ar else "Timing"
+                _lbl_trigger   = "محفّز"      if _ar else "Trigger"
+                _lbl_invalid   = "إبطال"     if _ar else "Invalidation"
+                _lbl_top_risk  = "أبرز مخاطرة" if _ar else "Top Risk"
+                _lbl_score     = "الدرجة"     if _ar else "Score"
+
+                _verdict_display = (
+                    f"**{_lbl_verdict}: {_v_disp} {_emoji} · {_lbl_score}: {_score}/100**"
+                )
+                _action_line = f"**{_lbl_action}:** {_x_disp}"
+                _axes_line   = f"**{_lbl_risk}:** {_r_disp} · **{_lbl_evidence}:** {_e_disp} · **{_lbl_timing}:** {_t_disp}"
+
+                # final_action_line param ignored — Action is now derived from canonical execution (axes_line above)
+
+                # ── Triggers: extract upgrade + invalidation from Action Framework ──
+                _trigger = ""
+                _invalidation = ""
                 try:
-                    from core.services.phrase_builder import build_quick_insight
-                    _qv_decision = {
-                        'verdict':      _qv_verdict,
-                        'verdict_type': 'Tactical',
-                        'constraints':  getattr(_de_result, 'get', lambda k, d=None: d)('constraints', [])
-                                        if '_de_result' in dir() else [],
-                    }
-                    _insight = build_quick_insight({"ticker": ticker}, _interpretation_labels or {}, _qv_decision)
-                    if _ar:
-                        from core.services.phrase_builder import _ar_localise as _ar_loc_qv
-                        _insight = _ar_loc_qv(_insight)
-                except Exception as _qv_err:
-                    logger.debug("[QuickView] deterministic insight failed: %s", _qv_err)
-                    _insight = ""
-                    _clean = _re_qv.sub(
-                        r'MEMORANDUM.*?(?:^---\s*$|\n---\s*\n)',
-                        '', full_report[:3000], flags=_re_qv.DOTALL | _re_qv.MULTILINE
+                    _af = _re_qv.search(
+                        r'(?:^|\n)#+\s*(?:11[.\s]*)?Action Framework[^\n]*\n(.*?)(?=\n#+\s|\Z)',
+                        full_report, _re_qv.DOTALL | _re_qv.IGNORECASE,
                     )
-                    _s1 = _re_qv.search(
-                        r'(?:^|\n)#+\s*1[.\s]*Executive Summary\s*\n(.*?)(?=\n#+\s*2[.\s])',
-                        _clean, _re_qv.DOTALL | _re_qv.IGNORECASE
-                    )
-                    if _s1:
-                        _s1_text = _re_qv.sub(r'[#*`>]', '', _s1.group(1)).strip()
-                        _sents = _re_qv.split(r'(?<=[.!?])\s+', _s1_text)
-                        _insight = _sents[0] if _sents else ""
-                    if not _insight:
-                        _plain = _re_qv.sub(r'[#*`>]', '', _clean)
-                        _sents = _re_qv.split(r'(?<=[.!?])\s+', _plain.strip())
-                        # Never produce "analysis complete" — show data-tied note instead
-                        _insight = _sents[0] if _sents else f"Core metrics displayed for {ticker}."
+                    if _af:
+                        _af_text = _af.group(1)
+                        _ut = _re_qv.search(r'Upgrade Trigger[:\s]+([^\n]+)', _af_text, _re_qv.IGNORECASE)
+                        _iv = _re_qv.search(r'Invalidation[:\s]+([^\n]+)', _af_text, _re_qv.IGNORECASE)
+                        if _ut: _trigger      = _re_qv.sub(r'^[*\-•\s]+', '', _ut.group(1)).strip().rstrip('.').strip()
+                        if _iv: _invalidation = _re_qv.sub(r'^[*\-•\s]+', '', _iv.group(1)).strip().rstrip('.').strip()
+                    if _trigger: _trigger = (_trigger[:160] + '…') if len(_trigger) > 160 else _trigger
+                    if _invalidation: _invalidation = (_invalidation[:160] + '…') if len(_invalidation) > 160 else _invalidation
+                except Exception:
+                    pass
 
-                # ── Line 3: Top risk label from Section 4 ────────────────────────
-                _risk_patterns = [
-                    r'(?:Key Risks?|إشارات المخاطر|مخاطر رئيسية)[^\n]*\n+([^\n]{20,200})',
-                ]
+                # ── Top Risk: one short label from Risk Framework section ───────────
                 _top_risk = ""
-                for _rp in _risk_patterns:
-                    _rm = _re_qv.search(_rp, full_report, _re_qv.IGNORECASE)
-                    if _rm:
-                        _top_risk = _rm.group(1).strip()
-                        break
-                if not _top_risk:
+                try:
                     _s4 = _re_qv.search(
-                        r'(?:^|\n)#+\s*4[.\s]*(?:Key Risks?|إشارات المخاطر|مخاطر رئيسية)(.*?)(?=\n#+\s*5[.\s])',
-                        full_report, _re_qv.DOTALL | _re_qv.IGNORECASE
+                        r'(?:^|\n)#+\s*(?:4[.\s]*)?(?:Risk Framework|Key Risks?|إشارات المخاطر|مخاطر رئيسية)(.*?)(?=\n#+\s|\Z)',
+                        full_report, _re_qv.DOTALL | _re_qv.IGNORECASE,
                     )
                     if _s4:
                         for _l in _s4.group(1).split('\n'):
                             _ls = _l.strip()
-                            if _re_qv.match(r'^[\*\-•]|^\d+\.', _ls) and len(_ls) > 15:
-                                _lbl = _re_qv.search(r'\*\*([^*]+)\*\*\s*\(Severity[^)]+\)', _ls)
-                                if _lbl:
-                                    _top_risk = _lbl.group(0)
-                                elif len(_ls) < 120:
-                                    _top_risk = _re_qv.sub(r'[*`]', '', _ls)[:100]
+                            _lbl = _re_qv.search(r'\*\*([^*]+)\*\*\s*\(Severity[^)]+\)', _ls)
+                            if _lbl:
+                                _top_risk = _lbl.group(0).strip()
                                 break
-
-                # Strip accidental leading numbering from insight and risk
-                _insight = _re_qv.sub(r'^\d+\.\s*', '', _insight).strip()
-                _top_risk = _re_qv.sub(r'^\d+\.\s*', '', _top_risk).strip()
-
-                # Flatten embedded newlines so insight stays on one line
-                # (prevents "...weak.\n⚠️ Top Risk" collision)
-                _insight = ' '.join(_insight.splitlines()).strip()
-                _top_risk = ' '.join(_top_risk.splitlines()).strip()
-
-                # ── Final Action label — passed in from outer scope ────────────
-                # Computed in the calling scope where verdict_sc / _entry_timing
-                # are definitively available; passed as `final_action_line` param.
-                _final_action_line = final_action_line
-
-                # ── Contradiction guard: relabel insight if it conflicts verdict ──
-                try:
-                    _buy_re = _re_qv.compile(
-                        r'\b(strong buy|buy now|accumulate|add to position|tactical buy|long position)\b',
-                        _re_qv.IGNORECASE,
-                    )
-                    _red_re = _re_qv.compile(
-                        r'\b(reduce|sell|trim|underweight|exit|short)\b',
-                        _re_qv.IGNORECASE,
-                    )
-                    _conflict = False
-                    if _qv_verdict in ('HOLD', 'WAIT') and (_buy_re.search(_insight) or _red_re.search(_insight)):
-                        _conflict = True
-                    if _qv_verdict == 'BUY' and _red_re.search(_insight):
-                        _conflict = True
-                    if _qv_verdict in ('REDUCE', 'SELL', 'AVOID') and _buy_re.search(_insight):
-                        _conflict = True
-                    if _conflict:
-                        _ts_label = 'إشارة تقنية (داعمة)' if _ar else 'Technical Signal (Supporting)'
-                        _insight = f"[{_ts_label}] {_insight}"
+                            if _re_qv.match(r'^[\*\-•]', _ls) and 20 < len(_ls) < 140:
+                                _top_risk = _re_qv.sub(r'^[\*\-•\s]+', '', _ls).strip()[:120]
+                                break
                 except Exception:
                     pass
 
-                _lines = [_verdict_display]
-                if _final_action_line:
-                    _lines.append(_final_action_line)
-                if _insight:
-                    _lines.append(f"💡 {_insight}")
+                _lines = [_verdict_display, _action_line, _axes_line]
+                if _trigger:
+                    _lines.append(f"▲ **{_lbl_trigger}:** {_trigger}")
+                if _invalidation:
+                    _lines.append(f"▼ **{_lbl_invalid}:** {_invalidation}")
                 if _top_risk:
-                    _lines.append(f"⚠️ {'أبرز مخاطر' if _ar else 'Top Risk'}: {_top_risk}")
+                    _lines.append(f"⚠️ **{_lbl_top_risk}:** {_top_risk}")
 
-                _qv_trailer = "\n\n---\n📄 *التقرير الكامل أدناه*\n" if _ar else "\n\n---\n📄 *Full report below*\n"
+                _qv_trailer = "\n\n---\n\n📄 *التقرير الكامل أدناه*\n\n" if _ar else "\n\n---\n\n📄 *Full report below*\n\n"
                 return (
                     f"## ⚡ {'نظرة سريعة' if _ar else 'Quick View'} — {ticker}\n\n"
-                    + "\n\n".join(_lines)
+                    + "  \n".join(_lines)   # "  \n" = markdown hard line break (2 spaces + LF)
                     + _qv_trailer
                 )
 
@@ -4374,11 +4505,70 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     currency_sym=_currency_sym if '_currency_sym' in dir() else "$",
                 )
 
+                # ── Phase 4: Build authoritative DecisionState (single source) ──
+                _decision_state = None
+                try:
+                    from core.decision_state import build_decision_state
+                    _decision_state = build_decision_state(
+                        scorecard=getattr(self, '_last_scorecard_decision', {}) or {},
+                        summary=summary or {},
+                        allow_list=(_allow_list.to_dict() if _allow_list is not None else None),
+                        ticker=target,
+                    )
+                except Exception as _ds_err:
+                    logger.warning(f"[DecisionState] {target}: build failed: {_ds_err}")
+
+                # ── Phase 5: Protect immune blocks (disclaimer, audit, URLs) ─────
+                # MUST happen BEFORE any regex transforms — otherwise the
+                # disclaimer's "buy or sell any security" gets mangled.
+                _protected_spans = []
+                try:
+                    from core.protected_blocks import protect as _protect_blocks
+                    reply, _protected_spans = _protect_blocks(reply)
+                except Exception as _pb_err:
+                    logger.debug("[ProtectedBlocks] protect skipped: %s", _pb_err)
+
+                # ── Phase 5 (consolidated): Field-availability OBSERVER ───────────
+                # Detects "X unavailable" claims that contradict the DB. Does NOT
+                # mutate text — auto-repair would be silent semantic mutation.
+                # Findings flow into the reconciliation audit at end of pipeline.
+                _field_inconsistencies = []
+                try:
+                    from core.field_validator import validate_fields as _validate_fields
+                    _fv = _validate_fields(reply, fund or {})
+                    _field_inconsistencies = list(_fv.fixes)
+                    if _fv.detected > 0:
+                        logger.info(
+                            "[FieldValidator] %s: detected=%d (observer-only, no mutation)",
+                            target, _fv.detected,
+                        )
+                except Exception as _fv_err:
+                    logger.debug("[FieldValidator] skipped: %s", _fv_err)
+
+                # ── Phase 4: Evidence-Tone Governor ──────────────────────────────
+                # Downgrades strong macro/thematic language when evidence is Limited.
+                # Strips theatrical phrasing always.
+                try:
+                    from core.evidence_tone_governor import govern_tone
+                    _evidence_level = (_decision_state.evidence
+                                       if _decision_state else "Moderate")
+                    _full_fund = (_allow_list.full_fundamental
+                                  if _allow_list is not None else True)
+                    _gov_res = govern_tone(reply, evidence=_evidence_level, full_fundamental=_full_fund)
+                    if _gov_res.edits_made > 0:
+                        reply = _gov_res.text
+                        logger.info(
+                            "[ToneGovernor] %s: edits=%d categories=%s",
+                            target, _gov_res.edits_made, _gov_res.edit_summary,
+                        )
+                except Exception as _tg_err:
+                    logger.debug("[ToneGovernor] skipped: %s", _tg_err)
+
                 # Rule-based editorial — instant, no LLM, safe for main response
                 try:
                     from core.editorial import rule_based_clean as _editorial_rule
                     _raw_len = len(reply)
-                    reply = _editorial_rule(reply)
+                    reply = _editorial_rule(reply, ticker=target)
                     logger.info(
                         "[editorial] editorial_mode=rule_based_only raw_len=%d "
                         "rule_clean_len=%d delta=%d llm_skipped=true endpoint=_handle_analytics",
@@ -4386,6 +4576,125 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     )
                 except Exception as _ed_err:
                     logger.debug("[editorial.rule] skipped: %s", _ed_err)
+
+                # ── Phase 3+4: Contradiction Scanner (V2 with state extraction) ──
+                # Layer 1 hard rules + Layer 2 semantic tension + stateful authority checks.
+                try:
+                    from core.contradiction_scanner import scan as _scan_contradictions
+                    _scan_res = _scan_contradictions(
+                        report_text=reply,
+                        decision_data=getattr(self, '_last_scorecard_decision', {}) or {},
+                        evidence_data=(_allow_list.to_dict() if _allow_list is not None else None),
+                        summary=summary or {},
+                    )
+                    if _scan_res.contradictions:
+                        reply = _scan_res.fixed_text
+                        logger.info(
+                            "[ContradictionScanner] %s: detected=%d fixed=%d unfixed=%d",
+                            target, len(_scan_res.contradictions),
+                            len(_scan_res.contradictions) - len(_scan_res.unfixed),
+                            len(_scan_res.unfixed),
+                        )
+                        for _c in _scan_res.unfixed:
+                            logger.warning(
+                                "[ContradictionScanner] %s: UNFIXED %s — %s",
+                                target, _c.rule_id, _c.summary,
+                            )
+                except Exception as _cs_err:
+                    logger.debug("[ContradictionScanner] skipped: %s", _cs_err)
+
+                # ── Phase 3: Structural Variation ────────────────────────────────
+                # Clause-order / rationale-hierarchy variation by ticker hash.
+                # Different from synonym rotation — same canonical meaning, different syntax.
+                try:
+                    from core.structural_variation import apply_structural_variation
+                    reply = apply_structural_variation(
+                        reply, target,
+                        decision_data=getattr(self, '_last_scorecard_decision', {}) or {},
+                    )
+                except Exception as _sv_err:
+                    logger.debug("[StructVar] skipped: %s", _sv_err)
+
+                # ── Phase 4: Phrase repairs ──────────────────────────────────────
+                # The LLM/struct-variation occasionally rewrites the templated
+                # "avoid chasing" into "Sell chasing", which a reader parses as
+                # a hidden verdict in a No-Action sentence. Restore canonical
+                # action-neutral wording so the decision frame stays clean.
+                try:
+                    import re as _re_phrase
+                    reply = _re_phrase.sub(
+                        r"\b[Ss]ell\s+chasing\b", "avoid chasing", reply,
+                    )
+                    reply = _re_phrase.sub(
+                        r"\b[Ss]ell\s+(adding|entering|extending)\b",
+                        r"avoid \1", reply,
+                    )
+                except Exception as _ph_err:
+                    logger.debug("[PhraseRepair] skipped: %s", _ph_err)
+
+                # ── Phase 5: Restore protected blocks (disclaimer, audit, URLs) ──
+                # Must run AFTER all transforms so protected text comes back intact.
+                if _protected_spans:
+                    try:
+                        from core.protected_blocks import restore as _restore_blocks
+                        reply = _restore_blocks(reply, _protected_spans)
+                        logger.info(
+                            "[ProtectedBlocks] %s: restored=%d blocks",
+                            target, len(_protected_spans),
+                        )
+                    except Exception as _pbr_err:
+                        logger.warning("[ProtectedBlocks] restore failed: %s", _pbr_err)
+
+                # ── Phase 5 Consolidation: Reconciliation Audit (observer trail) ──
+                # Single aggregated log of all detected inconsistencies. Surfaces
+                # discrepancies without silent mutation — ops/dev review.
+                try:
+                    _audit_lines = []
+                    if _field_inconsistencies:
+                        for _f in _field_inconsistencies:
+                            _audit_lines.append(
+                                f"FIELD_DRIFT field={_f.field} "
+                                f"claimed_unavailable actual={_f.actual_value!r}"
+                            )
+                    if '_scan_res' in dir() and _scan_res and _scan_res.unfixed:
+                        for _c in _scan_res.unfixed:
+                            _audit_lines.append(
+                                f"SCAN_FLAG rule={_c.rule_id} layer={_c.layer} "
+                                f"severity={_c.severity}"
+                            )
+                    if _audit_lines:
+                        logger.warning(
+                            "[ReconciliationAudit] %s: %d observer flag(s) — %s",
+                            target, len(_audit_lines), " | ".join(_audit_lines),
+                        )
+                    else:
+                        logger.info(
+                            "[ReconciliationAudit] %s: clean (0 observer flags)",
+                            target,
+                        )
+                except Exception as _ra_err:
+                    logger.debug("[ReconciliationAudit] skipped: %s", _ra_err)
+
+                # ── TV source-of-truth reconciliation ──────────────────
+                # Make sure the report_json builder reads the TV-authoritative
+                # price, not the yfinance/SA value that leaked in via the
+                # historical price series. Uses sticky flag set early in the
+                # function — survives later `_price_source` reassignments.
+                try:
+                    if _tv_authoritative and _tv_authoritative_price:
+                        _orig_summary_price = summary.get("price") if isinstance(summary, dict) else None
+                        summary["price"] = _tv_authoritative_price
+                        summary["data_source"] = "TradingView Live Cache (authoritative)"
+                        if _snapshot_ts:
+                            summary["snapshot_ts"] = _snapshot_ts
+                        logger.info(
+                            "[TVRouting] summary.price injected: %s -> %.4f (TV authoritative) for %s",
+                            _orig_summary_price, _tv_authoritative_price, target,
+                        )
+                except NameError:
+                    pass
+                except Exception as _tv_inj_e:
+                    logger.warning("[TVRouting] summary inject failed: %s", _tv_inj_e)
 
                 _REPORT_CACHE[_cache_key] = (_tc.time(), {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund, "trust_layer": _trust_layer_data}})
                 return {"type": "chat.reply", "reply": reply, "data": {"agent": "finance", "analytics": summary, "fundamentals": fund, "trust_layer": _trust_layer_data}}
@@ -4420,14 +4729,21 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             _fb_fa = '⚪ HOLD — Monitor'
 
         # Quick View block — always present, even in fallback
+        # Map raw conviction tier to institutional terminology
+        _conv_map = {
+            "Low":    "Limited Fundamental Visibility",
+            "Medium": "Moderate Evidence Strength",
+            "High":   "High Conviction",
+        }
+        _fb_conv_label = _conv_map.get(_fb_conv, _fb_conv)
         _fb_qv = (
             f"## ⚡ Quick View — {target}\n\n"
             f"**{target} | Fundamental: {verdict} {_fb_emoji}"
             f" | Timing: {_fb_timing_en}"
-            f" | Conviction: {_fb_conv}"
+            f" | Evidence Strength: {_fb_conv_label}"
             f" | EisaX Score: {_fb_score}/100**\n\n"
             f"**Final Action:** {_fb_fa}\n\n"
-            f"💡 Full analysis unavailable — displaying core metrics only.\n\n"
+            f"💡 Institutional pipeline degraded — displaying core metrics only.\n\n"
             f"---\n📄 *Full report below*\n\n"
         )
 
@@ -4474,6 +4790,18 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
             "type": "analysis", "content": reply, "source": "self_generated",
             "exportable": True, "timestamp": datetime.now()
         })
+
+        # ── TV source-of-truth reconciliation (fallback return) ──────────
+        try:
+            if _tv_authoritative and _tv_authoritative_price:
+                summary["price"] = _tv_authoritative_price
+                summary["data_source"] = "TradingView Live Cache (authoritative)"
+                if _snapshot_ts:
+                    summary["snapshot_ts"] = _snapshot_ts
+        except NameError:
+            pass
+        except Exception as _tv_inj_e2:
+            logger.warning("[TVRouting] fallback summary inject failed: %s", _tv_inj_e2)
 
         return {
             "type": "chat.reply",

@@ -313,6 +313,27 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
     # ── 10. Sector-specific scrubs ──────────────────────────────────────
     text = _sector_scrub(text, fs, audit)
 
+    # ── 11. Missing-value placeholder normalization ─────────────────────
+    # When a metric (e.g. SMA50) is unavailable, the builder renders a
+    # "<currency>0.00 (N/A)" placeholder, which is misleading. Normalise to
+    # plain "N/A". The (?<![\d.]) guard + [^\d\s|] currency cluster ensure we
+    # never touch a real number like "30.00 (N/A)" — only a standalone 0.00.
+    new_na, n_na = re.subn(
+        r"(?<![\d.])[^\d\s|]{0,4}0\.00\s*\(N/?A\)",
+        "N/A",
+        text,
+    )
+    if n_na:
+        text = new_na
+        audit.corrections.append(
+            Correction(
+                "formatting",
+                f"{n_na} '0.00 (N/A)' placeholder(s)",
+                "N/A",
+                "missing_value_na_fix",
+            )
+        )
+
     logger.info(
         "[Reconciler] %s subtype=%s %s",
         fs.ticker, fs.sector_subtype.value, audit.summary(),
@@ -660,6 +681,33 @@ def _sector_scrub(text: str, fs: FactSheet, audit: ReconciliationAudit) -> str:
                 )
             )
             text = new_text
+
+        # Also fix the plain "**Sector:** <wrong>" report header.
+        # analytics_builder emits "**Sector:** {fund.sector}", which upstream
+        # data mislabels as "Finance" for RE developers (EMAAR, ALDAR). The
+        # FactSheet has the authoritative sector — rewrite the header value
+        # only (leave the rest of the header line, e.g. Industry, untouched).
+        def _fix_sector_header(m: "re.Match") -> str:
+            current = m.group(2).strip()
+            if re.search(r"real\s*estate", current, re.IGNORECASE):
+                return m.group(0)  # already correct — no change
+            return f"{m.group(1)}{sector_display}{m.group(3)}"
+
+        new_text2, n2 = re.subn(
+            r"(\*\*Sector:\*\*\s*)([^\n|]+?)(\s*(?:\||\n|$))",
+            _fix_sector_header,
+            text,
+        )
+        if n2 and new_text2 != text:
+            audit.corrections.append(
+                Correction(
+                    "sector_label",
+                    "Sector header (wrong upstream classification)",
+                    sector_display,
+                    "re_sector_header_fix",
+                )
+            )
+            text = new_text2
 
     return text
 

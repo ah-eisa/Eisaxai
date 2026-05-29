@@ -729,9 +729,153 @@ def _validate(fs: FactSheet) -> None:
         fs.warning_flags.append(f"snapshot_stale:{fs.snapshot_age_seconds}s")
 
 
+# ── Phase D — Pre-grounding ─────────────────────────────────────────────────
+# Forward-facing theme guardrails per sector subtype. Mirrors the implicit
+# rules the reconciler's sector_scrub enforces post-hoc, but expressed so the
+# LLM can respect them BEFORE generating. Subtypes not listed default to empty
+# allowed/banned lists (no guardrail line emitted).
+_THEME_GUARDRAILS = {
+    SectorSubtype.ENERGY_PRODUCER:      {"allowed": ["crude", "Brent", "OPEC", "refining", "hydrocarbon margins"],
+                                          "banned":  ["bank/credit themes", "real-estate", "consumer-discretionary"]},
+    SectorSubtype.ENERGY_INTEGRATED:    {"allowed": ["crude", "Brent", "OPEC", "downstream margins", "refining"],
+                                          "banned":  ["bank/credit themes", "real-estate"]},
+    SectorSubtype.GAS_LNG:              {"allowed": ["LNG spot", "gas demand", "pipeline capacity", "Hormuz transit"],
+                                          "banned":  ["bank/credit themes", "real-estate", "consumer-discretionary"]},
+    SectorSubtype.PETROCHEMICAL:        {"allowed": ["feedstock cost", "petchem spreads", "ethylene/propylene"],
+                                          "banned":  ["bank/credit themes", "real-estate"]},
+    SectorSubtype.REAL_ESTATE_DEVELOPER:{"allowed": ["off-plan sales", "land acquisition", "construction backlog",
+                                                      "mortgage rates", "rental yields"],
+                                          "banned":  ["oil price", "crude/Brent", "OPEC", "refinery margins"]},
+    SectorSubtype.REAL_ESTATE_OPERATIONS:{"allowed": ["occupancy", "rental yields", "lease renewals", "mortgage rates"],
+                                          "banned":  ["oil price", "crude/Brent", "OPEC"]},
+    SectorSubtype.BANK:                 {"allowed": ["NIM", "loan growth", "deposits", "central bank rate",
+                                                      "capital adequacy / Basel ratios", "cost of risk"],
+                                          "banned":  ["oil price (except as country macro context)",
+                                                      "crude/Brent direct exposure", "OPEC quotas"]},
+    SectorSubtype.INSURANCE:            {"allowed": ["premiums", "claims", "underwriting", "combined ratio"],
+                                          "banned":  ["crude/Brent direct exposure"]},
+    SectorSubtype.CRYPTO:               {"allowed": ["volatility", "halving cycle", "stablecoin flows", "on-chain activity"],
+                                          "banned":  ["P/E", "EPS", "dividends", "central bank policy specific to fiat issuers"]},
+    SectorSubtype.COMMODITY:            {"allowed": ["spot", "futures curve", "carry", "storage"],
+                                          "banned":  ["P/E", "EPS", "dividends"]},
+}
+
+
+def _fmt_money(symbol: str | None, value) -> str:
+    """Render a price with the FactSheet currency symbol, or N/A."""
+    if value is None:
+        return "N/A"
+    try:
+        return f"{symbol or ''}{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def render_pregrounding_block(fs: "FactSheet") -> str:
+    """
+    Render the SSOT FactSheet as a 'GROUND TRUTH' system-prompt block for the
+    LLM, so the body grounds on authoritative values before generation.
+
+    Pure function — no side-effects, no I/O. Idempotent. Safe to call before
+    every LLM request. Returns "" if the FactSheet has blocking errors (caller
+    should not pre-ground a report that the FactSheet itself rejects).
+
+    Special cases (per Phase D design §3.3):
+      - price is None        → omit the LIVE TECHNICAL FACTS section.
+      - sma200 is None       → emit "SMA200: not available — use SMA50 instead".
+      - verdict is None      → omit the VERDICT section.
+    """
+    if fs.blocking_errors:
+        return ""
+
+    sym = fs.currency_symbol
+    code = fs.currency_code or ""
+    subtype = fs.sector_subtype.value if fs.sector_subtype else "unknown"
+    sector = fs.sector or "Unknown"
+
+    bar = "═" * 75
+    lines = [
+        bar,
+        "GROUND TRUTH FOR THIS REPORT (Single Source of Truth — DO NOT CONTRADICT)",
+        bar,
+        "",
+        f"Ticker          : {fs.ticker}",
+        f"Bare symbol     : {fs.bare_symbol}",
+        f"Market          : {fs.market}        Sector subtype: {subtype} ({sector})",
+    ]
+    if sym:
+        if sym == "$":
+            lines.append(f"Currency        : {sym} ({code})  — write all prices in USD")
+        else:
+            lines.append(f"Currency        : {sym} ({code})  — write all prices in this symbol; never use $ (except USD/Brent oil refs)")
+    if fs.snapshot_age_seconds is not None and fs.snapshot_age_seconds >= 0:
+        mins = int(fs.snapshot_age_seconds // 60)
+        ts = f"  (timestamp {fs.snapshot_ts})" if fs.snapshot_ts else ""
+        lines.append(f"Snapshot age    : {mins} minutes{ts}")
+
+    # LIVE TECHNICAL FACTS — only if price is known
+    if fs.price is not None:
+        lines += ["", "LIVE TECHNICAL FACTS  (TV cache — do not invent alternative numbers)"]
+        lines.append(f"- Price          : {_fmt_money(sym, fs.price)}")
+        if fs.sma50 is not None:
+            vs50 = f"   (price vs SMA50 = {fs.price_vs_sma50_pct:+.1f}%)" if fs.price_vs_sma50_pct is not None else ""
+            lines.append(f"- SMA50          : {_fmt_money(sym, fs.sma50)}{vs50}")
+        if fs.sma200 is not None:
+            vs200 = f"   (price vs SMA200 = {fs.price_vs_sma200_pct:+.1f}%)" if fs.price_vs_sma200_pct is not None else ""
+            lines.append(f"- SMA200         : {_fmt_money(sym, fs.sma200)}{vs200}")
+        else:
+            lines.append("- SMA200         : not available — use SMA50 instead; do NOT invent a 200-day average")
+        if fs.rsi is not None:
+            lines.append(f"- RSI            : {fs.rsi:.0f}")
+
+    # VERDICT — only if known
+    if fs.verdict:
+        lines += ["", "VERDICT  (DecisionState authoritative — match this in the report header)"]
+        lines.append(f"- Verdict        : {fs.verdict}")
+        if fs.action:
+            lines.append(f"- Action         : {fs.action}")
+        if fs.overall_risk_label:
+            lines.append(f"- Risk           : {fs.overall_risk_label}")
+        if fs.confidence:
+            lines.append(f"- Confidence     : {fs.confidence}")
+        if fs.eisax_score is not None:
+            fq = f"  (Fundamental quality {fs.fundamental_quality_score}/100)" if fs.fundamental_quality_score is not None else ""
+            lines.append(f"- Score          : {fs.eisax_score}/100{fq}")
+
+    # SECTOR GUARDRAILS — only if defined for this subtype
+    guard = _THEME_GUARDRAILS.get(fs.sector_subtype)
+    if guard and (guard.get("allowed") or guard.get("banned")):
+        lines += ["", f"SECTOR GUARDRAILS  ({subtype})"]
+        if guard.get("allowed"):
+            lines.append(f"- ALLOWED themes : {', '.join(guard['allowed'])}")
+        if guard.get("banned"):
+            lines.append(f"- BANNED themes  : {', '.join(guard['banned'])}")
+
+    # WRITE RULES
+    lines += ["", "WRITE RULES"]
+    n = 1
+    if fs.verdict:
+        lines.append(f"{n}. The \"Verdict\" line in the report header MUST equal: **{fs.verdict}**."); n += 1
+    if sym:
+        if sym == "$":
+            lines.append(f"{n}. Every price you mention MUST be in USD ($)."); n += 1
+        else:
+            lines.append(f"{n}. Every price you mention MUST be in {sym}. Never write $ except for USD/Brent oil refs."); n += 1
+    if fs.sma200 is not None:
+        lines.append(f"{n}. SMA200 must equal {_fmt_money(sym, fs.sma200)} — do not round or substitute another feed."); n += 1
+    else:
+        lines.append(f"{n}. Do NOT invent SMA200 if it is unavailable — say it is not available and use SMA50."); n += 1
+    if guard and guard.get("banned"):
+        lines.append(f"{n}. Stay in the {subtype} thesis. Do not include {guard['banned'][0]} language."); n += 1
+
+    lines += ["", bar, "END OF GROUND TRUTH BLOCK", bar]
+    return "\n".join(lines)
+
+
 __all__ = [
     "FactSheet",
     "SectorSubtype",
     "Conflict",
     "build_fact_sheet",
+    "render_pregrounding_block",
 ]
