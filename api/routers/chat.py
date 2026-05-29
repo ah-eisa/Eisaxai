@@ -159,6 +159,52 @@ async def pilot_report(
         logger.exception("[pilot-report] json build failed for %s (%s)", symbol, market)
         raise HTTPException(status_code=500, detail="Pilot report JSON validation failed") from exc
 
+    # ── SSOT Reconciler — Phase 3 production wiring ──────────────────────────
+    # Mirrors the staging-validated path in api/routers/staging.py
+    # (_staging_shape_result, SSOT block). FactSheet owns the final
+    # consistency check (price, SMA200, verdict, score, news, currency,
+    # sector-aware scrubs). Runs AFTER build_pilot_report_json so the
+    # FactSheet can read report_json.report_meta — exactly as staging does,
+    # keeping the body, report_json, and FactSheet verdict all on the same
+    # DecisionState source. Fully non-fatal: any failure logs and returns the
+    # un-reconciled report (safe fallback, never blocks production output).
+    try:
+        import re as _re_ssot
+        from core.services.fact_sheet import build_fact_sheet
+        from core.services.report_reconciler import reconcile_report
+        _ssot_ticker = symbol
+        _h1 = _re_ssot.search(
+            r"#\s*EisaX\s+Intelligence\s+Report:\s*([A-Z0-9.=\-]+)",
+            html_report,
+        )
+        if _h1:
+            _ssot_ticker = _h1.group(1).upper()
+        if _ssot_ticker:
+            _live_payload = {
+                "data": analysis_result.get("data") or {},
+                "report_json": report_json or {},
+            }
+            _ssot_fs = build_fact_sheet(_ssot_ticker, live_payload=_live_payload)
+            if _ssot_fs.blocking_errors:
+                logger.error(
+                    "[SSOT] %s blocked by FactSheet errors: %s",
+                    _ssot_ticker, _ssot_fs.blocking_errors,
+                )
+            html_report, _audit = reconcile_report(html_report, _ssot_fs)
+            logger.info("[SSOT] %s reconciler %s", _ssot_ticker, _audit.summary())
+            for _c in _audit.corrections[:10]:
+                logger.info(
+                    "[SSOT-correction] %s %s: %s → %s (%s)",
+                    _ssot_ticker, _c.field_name, _c.old, _c.new, _c.rule,
+                )
+            for _w in _audit.warnings[:5]:
+                logger.warning("[SSOT-warn] %s %s", _ssot_ticker, _w)
+    except Exception as _ssot_err:
+        logger.warning(
+            "[SSOT] reconciler failed (non-fatal) for %s: %s",
+            symbol, _ssot_err,
+        )
+
     return JSONResponse(content={"html_report": html_report, "report_json": report_json})
 
 # ── Chat ───────────────────────────────────────────────────────────────────────
