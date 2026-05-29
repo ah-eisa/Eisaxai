@@ -783,7 +783,8 @@ def render_pregrounding_block(fs: "FactSheet") -> str:
     Special cases (per Phase D design §3.3):
       - price is None        → omit the LIVE TECHNICAL FACTS section.
       - sma200 is None       → emit "SMA200: not available — use SMA50 instead".
-      - verdict is None      → omit the VERDICT section.
+      - verdict is None      → omit the DECISION CONTEXT section.
+    v2 note: the verdict value itself is no longer printed (reconciler-enforced).
     """
     if fs.blocking_errors:
         return ""
@@ -828,10 +829,13 @@ def render_pregrounding_block(fs: "FactSheet") -> str:
         if fs.rsi is not None:
             lines.append(f"- RSI            : {fs.rsi:.0f}")
 
-    # VERDICT — only if known
+    # DECISION CONTEXT — informational only. The verdict line is deliberately
+    # OMITTED (v2): the final verdict is computed POST-generation, so grounding
+    # a pre-prompt verdict guess can mis-lead the body (observed BTC-USD: pre-
+    # prompt hint=Hold vs final=Buy). The reconciler enforces the authoritative
+    # verdict afterwards. We still surface risk/score/timing as soft context.
     if fs.verdict:
-        lines += ["", "VERDICT  (DecisionState authoritative — match this in the report header)"]
-        lines.append(f"- Verdict        : {fs.verdict}")
+        lines += ["", "DECISION CONTEXT  (DecisionState — informational; do NOT assert a final Buy/Hold/Sell verdict from this block)"]
         if fs.action:
             lines.append(f"- Action         : {fs.action}")
         if fs.overall_risk_label:
@@ -851,11 +855,9 @@ def render_pregrounding_block(fs: "FactSheet") -> str:
         if guard.get("banned"):
             lines.append(f"- BANNED themes  : {', '.join(guard['banned'])}")
 
-    # WRITE RULES
+    # WRITE RULES (v2: no verdict rule — verdict is reconciler-enforced, not pre-grounded)
     lines += ["", "WRITE RULES"]
     n = 1
-    if fs.verdict:
-        lines.append(f"{n}. The \"Verdict\" line in the report header MUST equal: **{fs.verdict}**."); n += 1
     if sym:
         if sym == "$":
             lines.append(f"{n}. Every price you mention MUST be in USD ($)."); n += 1
