@@ -2968,7 +2968,15 @@ Do NOT include a standalone Positioning section.{_brain_ctx}
                 # with EISAX_PREGROUNDING=1. Fully non-fatal: any error skips
                 # the block and report generation proceeds unchanged.
                 import os as _os_pg
-                if _os_pg.getenv("EISAX_PREGROUNDING", "0") == "1":
+                # Canary gate: when EISAX_PREGROUNDING_TICKERS is set (comma list),
+                # pre-grounding applies ONLY to those tickers; empty = all tickers.
+                _pg_on = _os_pg.getenv("EISAX_PREGROUNDING", "0") == "1"
+                _pg_allow = _os_pg.getenv("EISAX_PREGROUNDING_TICKERS", "").strip()
+                if _pg_on and _pg_allow:
+                    _pg_on = target.upper() in {
+                        _t.strip().upper() for _t in _pg_allow.split(",") if _t.strip()
+                    }
+                if _pg_on:
                     try:
                         import re as _re_pg
                         from core.services.fact_sheet import (
