@@ -4152,7 +4152,13 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 _verdict_display = (
                     f"**{_lbl_verdict}: {_v_disp} {_emoji} · {_lbl_score}: {_score}/100**"
                 )
-                _action_line = f"**{_lbl_action}:** {_x_disp}"
+                # When verdict is Buy but execution axis is Wait or Hold Steady,
+                # label the action as "Action (Timing)" so it reads as an entry-
+                # timing guidance rather than a verdict contradiction.
+                _action_label = _lbl_action
+                if _v_canon == "Buy" and _x_canon in ("Wait", "Hold Steady"):
+                    _action_label = ("الإجراء (التوقيت)" if _ar else "Action (Timing)")
+                _action_line = f"**{_action_label}:** {_x_disp}"
                 _axes_line   = f"**{_lbl_risk}:** {_r_disp} · **{_lbl_evidence}:** {_e_disp} · **{_lbl_timing}:** {_t_disp}"
 
                 # final_action_line param ignored — Action is now derived from canonical execution (axes_line above)

@@ -253,8 +253,16 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
     # ── 6. Verdict consistency ──────────────────────────────────────────
     if fs.verdict:
         body_verdicts = set()
+        # Pattern A: "Verdict: Buy", "verdict: **Hold**", "Verdict 🟢 Buy" etc.
         for m in re.finditer(
             r"\bVerdict[:\s]+(?:🟢|🔴|⚪|🟡)?\s*\*{0,2}(Buy|Hold|Reduce|Sell)\b",
+            text,
+            re.IGNORECASE,
+        ):
+            body_verdicts.add(m.group(1).title())
+        # Pattern B: narrative "our verdict is a Reduce" / "verdict is Reduce"
+        for m in re.finditer(
+            r"\bverdict\s+is\s+(?:a\s+)?\*{0,2}(Buy|Hold|Reduce|Sell)\b",
             text,
             re.IGNORECASE,
         ):
@@ -262,11 +270,22 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
         if body_verdicts and body_verdicts != {fs.verdict}:
             # Auto-correct: swap any non-SSOT verdict label to SSOT
             for wrong in body_verdicts - {fs.verdict}:
+                # Swap Pattern A: "Verdict: <wrong>"
                 text = _swap_n(
                     text,
                     rf"(\bVerdict[:\s]+(?:🟢|🔴|⚪|🟡)?\s*\*{{0,2}}){re.escape(wrong)}\b",
                     f"\\g<1>{fs.verdict}",
                     audit, "verdict", f"verdict_swap_{wrong}_to_{fs.verdict}",
+                )
+                # Swap Pattern B: "verdict is a <wrong>" / "verdict is <wrong>"
+                # Replace only the verdict word — do NOT add bold markers so
+                # we don't break surrounding bold spans (e.g. "**Our verdict
+                # is a Reduce**" → "**Our verdict is a Buy**").
+                text = _swap_n(
+                    text,
+                    rf"(\bverdict\s+is\s+(?:a\s+)?){re.escape(wrong)}\b",
+                    f"\\g<1>{fs.verdict}",
+                    audit, "verdict", f"verdict_narrative_swap_{wrong}_to_{fs.verdict}",
                 )
             audit.warnings.append(
                 f"verdict_mismatch_corrected: body had {body_verdicts}, "
@@ -331,6 +350,33 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
                 f"{n_na} '0.00 (N/A)' placeholder(s)",
                 "N/A",
                 "missing_value_na_fix",
+            )
+        )
+
+    # ── 12. Orphan markdown bold marker cleanup ─────────────────────────
+    # v4-flash occasionally emits a stray closing ** without a matching
+    # opener on the same line (e.g. "Reduce** —" at the end of a long
+    # interpolated sentence). Lines with an odd count of ** markers are
+    # the signal; fix by removing the last (unpaired) ** on such lines.
+    fixed_lines = []
+    n_orphan = 0
+    for _line in text.split("\n"):
+        _stars = re.findall(r"\*{2}", _line)
+        if len(_stars) % 2 != 0:
+            # Remove the last ** on this line (it has no opening partner)
+            _last = _line.rfind("**")
+            if _last >= 0:
+                _line = _line[:_last] + _line[_last + 2:]
+                n_orphan += 1
+        fixed_lines.append(_line)
+    if n_orphan:
+        text = "\n".join(fixed_lines)
+        audit.corrections.append(
+            Correction(
+                "formatting",
+                f"{n_orphan} line(s) with orphaned **",
+                "removed stray closing **",
+                "orphan_bold_fix",
             )
         )
 
@@ -659,6 +705,70 @@ def _sector_scrub(text: str, fs: FactSheet, audit: ReconciliationAudit) -> str:
             )
         # Collapse blank-line cascades the scrub leaves behind
         text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Real-estate developer tickers: remove cross-sector bank-peer leakage.
+    # The LLM sometimes compares RE developers to UAE banks (FAB, Emirates NBD,
+    # etc.) because they share the same exchange. Narrative sentences and peer
+    # table rows referencing bank-specific metrics are off-thesis for RE and
+    # confuse readers. News link lines are preserved (external headlines are
+    # not peer analysis — they are editorial context).
+    if fs.sector_subtype == SectorSubtype.REAL_ESTATE_DEVELOPER:
+        # Detect the specific bank/finance-peer terms we want to scrub from
+        # RE reports. Deliberately narrow so we don't over-strip:
+        #  • Named UAE bank tickers/names used as peers: FAB, First Abu Dhabi
+        #    Bank, DIB, Emirates NBD, ENBD.
+        #  • Banking-specific metrics: banking margin, NIM, banking peer, etc.
+        _BANK_PEER_TERMS = [
+            r"\bFAB\b",                              # First Abu Dhabi Bank ticker
+            r"First\s+Abu\s+Dhabi\s+Bank",
+            r"\bDIB\b",                              # Dubai Islamic Bank ticker
+            r"Emirates\s+NBD",
+            r"\bENBD\b",
+            r"banking\s+(?:margin|average|peer)",
+            r"finance[\-\s]sector\s+peer",
+            r"finance[\-\s]sector\s+average",
+        ]
+        # News-link pattern: lines starting with a bullet + emoji + link
+        _NEWS_LINK_RE = re.compile(
+            r"^\s*[-*]\s*[⚪🔴🟢🟡⚠️🔵🟠]\s*\[", flags=re.UNICODE
+        )
+        _TABLE_ROW_RE = re.compile(r"^\s*\|")
+        _TABLE_DIV_RE = re.compile(r"^\s*\|[\s\-:|]+\|\s*$")
+
+        _bank_removed = 0
+        _bank_kept_lines = []
+        for _bline in text.split("\n"):
+            # Check if this line contains any bank-peer term
+            _matched = any(
+                re.search(_tp, _bline, re.IGNORECASE) for _tp in _BANK_PEER_TERMS
+            )
+            if not _matched:
+                _bank_kept_lines.append(_bline)
+                continue
+            # News links — always keep (they are external headlines, not analysis)
+            if _NEWS_LINK_RE.search(_bline):
+                _bank_kept_lines.append(_bline)
+                continue
+            # Table divider rows (---|---) — always keep
+            if _TABLE_DIV_RE.match(_bline):
+                _bank_kept_lines.append(_bline)
+                continue
+            # Peer-table data rows and narrative lines → remove
+            _bank_removed += 1
+            # (line is dropped by not appending)
+
+        if _bank_removed:
+            text = "\n".join(_bank_kept_lines)
+            # Collapse any triple-blank-line cascades left behind
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            audit.corrections.append(
+                Correction(
+                    "peer_scrub",
+                    f"{_bank_removed} bank-peer reference(s) in RE report",
+                    "removed",
+                    "re_bank_peer_scrub",
+                )
+            )
 
     # Real-estate tickers: fix wrong "Finance / Real Estate" sector label
     # TV sometimes classifies RE developers under Finance sector upstream.
