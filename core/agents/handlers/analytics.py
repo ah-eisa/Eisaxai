@@ -3029,7 +3029,16 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
 - Length: 600-800 words maximum
 """
                 else:
-                    _max_tokens = 4500
+                    # v4-flash is a reasoning model: reasoning_tokens are spent
+                    # BEFORE any visible content and BOTH count against max_tokens.
+                    # At 4500, observed reasoning of 2700-4500 tok left little/no
+                    # budget for the body — FAB truncated mid-content (finish=length,
+                    # reply_len=6501) and AAPL collapsed to reply_len=0 (reasoning ate
+                    # the entire 4500), dropping the whole report to the degraded stub.
+                    # 8000 leaves room for heavy reasoning (~4500) AND a complete
+                    # institutional body (~3000-3500 visible). finish=stop cases are
+                    # unaffected — they stop naturally well below the ceiling.
+                    _max_tokens = 8000
                     _mode_instruction = ""
 
                 if _low_data_compact_mode:
@@ -3042,36 +3051,76 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                 if _mode_instruction:
                     prompt = _mode_instruction + "\n\n" + prompt
 
-                # DIAG: log prompt size before call
-                logger.info(f"[DeepSeek] {target}: calling v4-flash prompt={len(prompt)} chars max_tokens={_max_tokens}")
-                _ds_t0 = _tc.time()
-                r = requests.post(
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {ds_key}",
-                             "Content-Type": "application/json"},
-                    json={"model": "deepseek-v4-flash",
-                          "messages": [{"role": "user", "content": prompt}],
-                          "max_tokens": _max_tokens,
-                          "temperature": 0},
-                    timeout=150
-                )
-                _ds_elapsed = _tc.time() - _ds_t0
-                logger.info(f"[DeepSeek] {target}: status={r.status_code} elapsed={_ds_elapsed:.1f}s")
-                try:
-                    resp_json = r.json()
-                except Exception as _je:
-                    logger.error(f"[DeepSeek] {target}: JSON parse failed: {_je} | body[:200]={r.text[:200]!r}")
-                    resp_json = {}
-                if "choices" in resp_json:
-                    _content = resp_json["choices"][0].get("message", {}).get("content") or ""
-                    _finish = resp_json["choices"][0].get("finish_reason")
-                    _usage = resp_json.get("usage", {})
-                    deepseek_reply = _content.strip()
-                    logger.info(
-                        f"[DeepSeek] {target}: reply_len={len(deepseek_reply)} finish={_finish} "
-                        f"reasoning_tok={_usage.get('completion_tokens_details', {}).get('reasoning_tokens')} "
-                        f"completion_tok={_usage.get('completion_tokens')}"
+                # Runaway-reasoning retry guard. v4-flash spends reasoning_tokens
+                # before any visible content; on rare prompts reasoning consumes the
+                # whole budget and the body comes back empty (reply_len=0,
+                # finish=length), collapsing the report to the degraded stub. If that
+                # happens, retry ONCE with a larger ceiling so reasoning can complete
+                # and the body still fits. temperature=0 is deterministic, so the only
+                # lever that helps is more headroom — hence the higher ceiling.
+                _DS_RETRY_CEILING = 12000
+                _DS_EMPTY_GUARD = 800
+                _ds_call_budget = _max_tokens
+                _ds_retries = 0
+                _ds_elapsed = 0.0
+                _status_code = 0
+                _finish = None
+                _usage = {}
+                resp_json = {}
+
+                def _call_deepseek(_budget):
+                    return requests.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}",
+                                 "Content-Type": "application/json"},
+                        json={"model": "deepseek-v4-flash",
+                              "messages": [{"role": "user", "content": prompt}],
+                              "max_tokens": _budget,
+                              "temperature": 0},
+                        timeout=150
                     )
+
+                while True:
+                    # DIAG: log prompt size before call
+                    logger.info(f"[DeepSeek] {target}: calling v4-flash prompt={len(prompt)} chars "
+                                f"max_tokens={_ds_call_budget} attempt={_ds_retries + 1}")
+                    _ds_t0 = _tc.time()
+                    r = _call_deepseek(_ds_call_budget)
+                    _ds_elapsed += _tc.time() - _ds_t0
+                    _status_code = r.status_code
+                    logger.info(f"[DeepSeek] {target}: status={r.status_code} elapsed={_tc.time() - _ds_t0:.1f}s")
+                    try:
+                        resp_json = r.json()
+                    except Exception as _je:
+                        logger.error(f"[DeepSeek] {target}: JSON parse failed: {_je} | body[:200]={r.text[:200]!r}")
+                        resp_json = {}
+                    if "choices" in resp_json:
+                        _content = resp_json["choices"][0].get("message", {}).get("content") or ""
+                        _finish = resp_json["choices"][0].get("finish_reason")
+                        _usage = resp_json.get("usage", {})
+                        deepseek_reply = _content.strip()
+                        _reasoning_tok = _usage.get('completion_tokens_details', {}).get('reasoning_tokens')
+                        logger.info(
+                            f"[DeepSeek] {target}: reply_len={len(deepseek_reply)} finish={_finish} "
+                            f"reasoning_tok={_reasoning_tok} completion_tok={_usage.get('completion_tokens')}"
+                        )
+                        # Empty/near-empty body capped by reasoning runaway → retry once larger.
+                        if (_finish == "length" and len(deepseek_reply) < _DS_EMPTY_GUARD
+                                and _ds_retries == 0 and _ds_call_budget < _DS_RETRY_CEILING):
+                            logger.warning(
+                                f"[DeepSeek] {target}: reasoning runaway "
+                                f"(reply_len={len(deepseek_reply)}, finish=length, "
+                                f"reasoning_tok={_reasoning_tok}) — retrying once with "
+                                f"max_tokens={_DS_RETRY_CEILING}"
+                            )
+                            _ds_retries = 1
+                            _ds_call_budget = _DS_RETRY_CEILING
+                            continue
+                    else:
+                        logger.warning(f"[DeepSeek] {target}: no 'choices' in response: keys={list(resp_json.keys())} body[:300]={str(resp_json)[:300]}")
+                    break
+
+                if "choices" in resp_json:
                     # ── Phase 6: structured LLM cost/usage observability ──────
                     # Single grep-able line for cost aggregation. No secrets,
                     # no prompt content. pregrounding flag included so token
@@ -3085,11 +3134,9 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                         _usage.get("prompt_tokens"), _usage.get("completion_tokens"),
                         _usage.get("total_tokens"),
                         _usage.get("prompt_cache_hit_tokens"), _usage.get("prompt_cache_miss_tokens"),
-                        len(prompt), _ds_elapsed, r.status_code, _finish, 0,
+                        len(prompt), _ds_elapsed, _status_code, _finish, _ds_retries,
                         _os_u.getenv("EISAX_PREGROUNDING", "0"),
                     )
-                else:
-                    logger.warning(f"[DeepSeek] {target}: no 'choices' in response: keys={list(resp_json.keys())} body[:300]={str(resp_json)[:300]}")
                 # Force correct date in response (DeepSeek often ignores prompt date)
                 from datetime import datetime as _dt
                 correct_date = _dt.now().strftime("%B %d, %Y")
