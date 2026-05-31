@@ -26,7 +26,7 @@ from fastapi.concurrency import run_in_threadpool
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
-from core.config import EXPORTS_DIR, FILE_CACHE_DIR
+from core.config import ENV_FILE, EXPORTS_DIR, FILE_CACHE_DIR
 
 logger = logging.getLogger("api_bridge")
 limiter = Limiter(key_func=get_remote_address)
@@ -188,8 +188,16 @@ async def upload_portfolio(
         ticker_col = next((c for c in df.columns if c in ['ticker','symbol','stock','name']), df.columns[0])
         weight_col = next((c for c in df.columns if c in ['weight','allocation','%','percent','value']), None)
         
-        tickers = df[ticker_col].str.upper().tolist()
-        
+        # Filter out rows where ticker is missing or empty before any math
+        _valid_rows = df[ticker_col].notna() & (
+            df[ticker_col].astype(str).str.strip().str.upper().isin(['NAN', 'NONE', '']) == False
+        )
+        df = df[_valid_rows].reset_index(drop=True)
+        tickers = df[ticker_col].str.strip().str.upper().tolist()
+
+        if not tickers:
+            return {"error": "No valid tickers found. Ensure your file has a 'ticker' or 'symbol' column with non-empty values."}
+
         if weight_col:
             weights = df[weight_col].tolist()
             # Normalize to percentages
@@ -212,6 +220,7 @@ async def upload_portfolio(
         # Build Portfolio Risk Report
         import yfinance as yf
         import numpy as np
+        from core.data import get_prices
         from dotenv import load_dotenv
         load_dotenv(str(ENV_FILE))
         def _to_float(v):
@@ -261,24 +270,152 @@ async def upload_portfolio(
         # ── Fetch 1yr price history + fundamentals ──────────────────────────────
         RF_RATE = 0.045   # US T-Bill risk-free rate (4.5%)
         LOOKBACK = "1y"
+        lookback_start = (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
 
         price_data = {}
+        prices_df = pd.DataFrame()
+        returns_df = pd.DataFrame()
+        price_fetch_error = None
         stock_info = {}
+
+        def _price_availability(px: pd.DataFrame, rets: pd.DataFrame | None = None) -> dict:
+            flags = {}
+            for _t in tickers:
+                _tu = str(_t).upper()
+                if _tu in ["CASH", "USD", "AED"]:
+                    flags[_t] = {
+                        "asset_type": "cash",
+                        "has_prices": False,
+                        "has_sufficient_returns": False,
+                        "price_rows": 0,
+                        "return_rows": 0,
+                        "first_date": None,
+                        "last_date": None,
+                    }
+                    continue
+                _series = px[_tu].dropna() if isinstance(px, pd.DataFrame) and _tu in px.columns else pd.Series(dtype="float64")
+                _ret_series = (
+                    rets[_tu].dropna()
+                    if isinstance(rets, pd.DataFrame) and _tu in rets.columns
+                    else pd.Series(dtype="float64")
+                )
+                flags[_t] = {
+                    "asset_type": "security",
+                    "has_prices": int(_series.shape[0]) > 0,
+                    "has_sufficient_returns": int(_ret_series.shape[0]) >= 2,
+                    "price_rows": int(_series.shape[0]),
+                    "return_rows": int(_ret_series.shape[0]),
+                    "first_date": _series.index[0].strftime("%Y-%m-%d") if not _series.empty else None,
+                    "last_date": _series.index[-1].strftime("%Y-%m-%d") if not _series.empty else None,
+                }
+            return flags
+
+        def _partial_price_response(message: str, px: pd.DataFrame, rets: pd.DataFrame | None = None):
+            _snap_id = str(uuid.uuid4())
+            _generated = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            _availability = _price_availability(px, rets)
+            return _clean_nan({
+                "status": "partial",
+                "snapshot_id": _snap_id,
+                "message": message,
+                "portfolio": portfolio,
+                "tickers": tickers,
+                "analysis": message,
+                "phase_h_meta": None,
+                "audit": {
+                    "report_id": _snap_id,
+                    "generated_utc": _generated,
+                    "price_as_of": None,
+                    "period": f"{lookback_start} → latest available",
+                    "data_source": "core.data.get_prices",
+                    "price_fetch_error": price_fetch_error,
+                    "data_availability": _availability,
+                },
+                "metrics": {
+                    "total_return_pct": None,
+                    "total_return_total_est_pct": None,
+                    "spx_return_pct": None,
+                    "alpha_pct": None,
+                    "alpha_total_est_pct": None,
+                    "ann_return_pct": None,
+                    "ann_vol_pct": None,
+                    "sharpe": None,
+                    "sortino": None,
+                    "var_95_pct": None,
+                    "max_drawdown_pct": None,
+                    "beta": None,
+                    "beta_equity": None,
+                    "div_yield_pct": None,
+                    "div_yield_equity_pct": None,
+                    "equity_allocation_pct": round(equity_alloc_total * 100, 2),
+                    "cash_allocation_pct": round(max(0.0, (1 - equity_alloc_total) * 100), 2),
+                    "risk_free_rate": "4.5% (US T-Bill)",
+                    "method": "Historical Simulation, 252 trading days",
+                    "data_availability": _availability,
+                },
+                "data_availability": _availability,
+            })
+
+        if valid_tickers:
+            try:
+                fetched_prices = get_prices(valid_tickers, start=lookback_start, end=None, force_refresh=False)
+                if fetched_prices is not None and not fetched_prices.empty:
+                    prices_df = fetched_prices.copy()
+                    prices_df.index = pd.to_datetime(prices_df.index, errors="coerce")
+                    prices_df = prices_df[~prices_df.index.isna()]
+                    prices_df.columns = [str(c).upper().strip() for c in prices_df.columns]
+                    selected_cols = [t for t in valid_tickers if t in prices_df.columns]
+                    prices_df = prices_df.loc[:, selected_cols]
+                    prices_df = prices_df.apply(pd.to_numeric, errors="coerce")
+                    prices_df = prices_df.sort_index()
+                    prices_df = prices_df[~prices_df.index.duplicated(keep="last")]
+                    prices_df = prices_df.reindex(prices_df.index.drop_duplicates().sort_values()).ffill()
+                    prices_df = prices_df.dropna(how="all", axis=0)
+                    price_data = {
+                        t: prices_df[t].dropna()
+                        for t in prices_df.columns
+                        if not prices_df[t].dropna().empty
+                    }
+            except Exception as _pe:
+                price_fetch_error = str(_pe)
+                logger.warning("Portfolio price fetch failed through get_prices for %s: %s", valid_tickers, _pe)
+
+        candidate_returns = pd.DataFrame()
+        if not prices_df.empty:
+            usable_price_cols = [c for c in prices_df.columns if prices_df[c].dropna().shape[0] >= 3]
+            prices_df = prices_df.loc[:, usable_price_cols].ffill()
+            if not prices_df.empty:
+                candidate_returns = prices_df.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+                usable_return_cols = [
+                    c for c in candidate_returns.columns
+                    if candidate_returns[c].dropna().shape[0] >= 2
+                ]
+                returns_df = candidate_returns.loc[:, usable_return_cols].dropna(how="all").fillna(0.0)
+                price_data = {
+                    t: prices_df[t].dropna()
+                    for t in prices_df.columns
+                    if t in usable_return_cols and not prices_df[t].dropna().empty
+                }
+
+        if returns_df.shape[0] < 2 or returns_df.shape[1] < 1:
+            _msg = (
+                "Insufficient overlapping price history to compute portfolio risk metrics. "
+                "The upload was parsed, but the price router did not return enough usable "
+                "return observations for VaR, volatility, drawdown, or Sharpe calculations."
+            )
+            return _partial_price_response(_msg, prices_df, candidate_returns)
+
         for t in valid_tickers:
             try:
                 tk = yf.Ticker(t)
-                hist = tk.history(period=LOOKBACK)
-                if hist.empty or hist["Close"].isna().all():
-                    hist = tk.history(period="6mo")  # fallback to 6M
-                if not hist.empty and not hist["Close"].isna().all():
-                    price_data[t] = hist["Close"].dropna()
                 info = tk.info
                 # trailingAnnualDividendYield is a reliable decimal fraction (0.004 = 0.4%).
                 # dividendYield returns as a percentage value (0.4 for 0.4%) — avoid it.
                 _raw_dy = float(info.get("trailingAnnualDividendYield") or 0)
                 _safe_dy = min(max(_raw_dy, 0.0), 0.15)   # clamp decimal [0, 15%]
+                _latest_px = price_data.get(t)
                 stock_info[t] = {
-                    "price":     info.get("regularMarketPrice") or info.get("previousClose", 0),
+                    "price":     info.get("regularMarketPrice") or info.get("previousClose") or (float(_latest_px.iloc[-1]) if _latest_px is not None and not _latest_px.empty else 0),
                     "beta":      _to_float(info.get("beta")),
                     "sector":    info.get("sector", "N/A"),
                     "pe":        _to_float(info.get("trailingPE")),
@@ -286,7 +423,16 @@ async def upload_portfolio(
                     "div_yield": _safe_dy,   # current market yield, NOT yield-on-cost
                 }
             except Exception as _fe:
-                logger.debug("Stock data fetch failed for %s: %s", t, _fe)
+                logger.debug("Stock info fetch failed for %s: %s", t, _fe)
+                _latest_px = price_data.get(t)
+                stock_info[t] = {
+                    "price": float(_latest_px.iloc[-1]) if _latest_px is not None and not _latest_px.empty else 0,
+                    "beta": None,
+                    "sector": "N/A",
+                    "pe": None,
+                    "mktcap": None,
+                    "div_yield": 0.0,
+                }
 
         # ── Benchmark: S&P 500 ───────────────────────────────────────────────
         spx_return = None
@@ -313,10 +459,7 @@ async def upload_portfolio(
         factor_exposure = {}
         port_beta_equity = None
 
-        if len(price_data) >= 2:
-            prices_df = pd.DataFrame(price_data).dropna()
-            returns_df = prices_df.pct_change().dropna()
-
+        if len(price_data) >= 1 and returns_df.shape[0] >= 2:
             w_arr = np.array([valid_weights.get(t, 0) for t in returns_df.columns])
             w_arr = w_arr / w_arr.sum() if w_arr.sum() > 0 else w_arr
 
@@ -489,12 +632,289 @@ async def upload_portfolio(
         alpha = (port_total_return - (spx_return or 0) * 100) if spx_return is not None else None
         alpha_total_est = (port_total_return_total_est - (spx_return or 0) * 100) if spx_return is not None else None
         risk_label = (
-            "Aggressive 🔴" if (_has_beta_total and port_beta_total > 1.5) else
-            "Moderate 🟡" if (_has_beta_total and port_beta_total > 1.0) else
-            "Conservative 🟢" if _has_beta_total else
-            "Unknown ⚪"
+            "Aggressive [HIGH]" if (_has_beta_total and port_beta_total > 1.5) else
+            "Moderate [MODERATE]" if (_has_beta_total and port_beta_total > 1.0) else
+            "Conservative [LOW]" if _has_beta_total else
+            "Unknown"
         )
         elevated_risk = ((_has_beta_total and port_beta_total > 1.5) or (tech_weight >= 0.70) or (eff_n < 2.8) or (cvar_95 <= -3.5))
+
+        # ════════════════════════════════════════════════════════════════════
+        # Phase F — Institutional parity layer (regime, confidence, implementation,
+        # benchmark, attribution, adaptive disclaimers, audit appendix)
+        # ════════════════════════════════════════════════════════════════════
+        import hashlib as _hashlib_pf
+
+        # ── Portfolio Regime Classification ─────────────────────────────────
+        _tech_w_pf = tech_weight if isinstance(tech_weight, (int, float)) else 0
+        _crypto_w_pf = sum(valid_weights_total.get(t, 0) for t in valid_tickers
+                           if stock_info.get(t, {}).get("sector", "").lower() in ("crypto", "cryptocurrency") or t.endswith("-USD"))
+        _energy_w_pf = sum(valid_weights_total.get(t, 0) for t in valid_tickers
+                           if stock_info.get(t, {}).get("sector", "").lower() in ("energy", "energy minerals", "industrial services"))
+        _div_yield_w_pf = port_div_yield_equity / 100 if isinstance(port_div_yield_equity, (int, float)) else 0
+        if _tech_w_pf + _crypto_w_pf > 0.50:
+            _regime_pf = "Momentum-Driven"
+            _regime_impl_pf = "Concentrated in long-duration growth and asymmetric satellite assets. High dispersion in risk-off regimes."
+        elif _tech_w_pf > 0.40:
+            _regime_pf = "Growth Concentrated"
+            _regime_impl_pf = "Allocation tilted toward long-duration growth equities. Sensitive to discount-rate compression and earnings-multiple contraction."
+        elif cash_pct / 100 + _div_yield_w_pf > 0.30:
+            _regime_pf = "Defensive Income"
+            _regime_impl_pf = "Income-generating sleeves dominate. Lower sensitivity to equity drawdowns; primary risk vector is duration and credit spread widening."
+        elif _energy_w_pf > 0.25:
+            _regime_pf = "Cyclical Value"
+            _regime_impl_pf = "Allocation tilted toward commodity-linked and cyclical exposure. Procyclical with global PMI cycle."
+        elif port_beta_total < 0.7 if _has_beta_total else False:
+            _regime_pf = "Defensive Income"
+            _regime_impl_pf = "Low aggregate beta. Capital preservation tilt with limited upside capture in equity rallies."
+        else:
+            _regime_pf = "Multi-Asset Macro"
+            _regime_impl_pf = "Balanced cross-asset construction; no single regime dominates. Targets diversification across factor and macro drivers."
+        _BENCH_REGIME_BEHAVIOR_PF = {
+            "Momentum-Driven":     "Outperforms in falling-rate, risk-on regimes; lags during commodity-led value rotations and rate-shock episodes.",
+            "Growth Concentrated": "Outperforms in falling-rate growth regimes (discount-rate compression); lags during inflation surprises and value rotations.",
+            "Defensive Income":    "Outperforms during equity drawdowns and disinflationary cycles; lags in strong risk-on rallies and steepening yield curves.",
+            "Cyclical Value":      "Outperforms during commodity-led reflationary cycles and global PMI expansions; lags in growth-led rallies and risk-off episodes.",
+            "Multi-Asset Macro":   "Designed for regime-balanced behavior; expect peer-like performance across most macro environments with reduced tail volatility.",
+        }
+        _regime_behavior_pf = _BENCH_REGIME_BEHAVIOR_PF.get(_regime_pf, "")
+
+        # ── Confidence Calibration ──────────────────────────────────────────
+        _n_holdings_pf = len(valid_tickers)
+        _missing_beta_pf = sum(1 for t in valid_tickers if stock_info.get(t, {}).get("beta") is None)
+        _missing_beta_share_pf = _missing_beta_pf / max(1, _n_holdings_pf)
+        _crypto_share_pf = _crypto_w_pf
+        _confidence_pf = 0.88
+        _confidence_pf -= 0.20 * _missing_beta_share_pf
+        _confidence_pf -= 0.15 * min(1.0, _crypto_share_pf / 0.20)
+        if _n_holdings_pf < 5:
+            _confidence_pf -= 0.10
+        _confidence_pf = max(0.40, min(0.92, _confidence_pf))
+        _evidence_breadth_pf = "Broad" if _n_holdings_pf >= 12 else ("Moderate" if _n_holdings_pf >= 6 else "Limited")
+        _coverage_quality_pf = "Full" if _missing_beta_share_pf < 0.15 else ("Partial" if _missing_beta_share_pf < 0.40 else "Sparse")
+        if _missing_beta_share_pf < 0.10 and _crypto_share_pf < 0.05:
+            _reliability_tier_pf = "Institutional"
+        elif _missing_beta_share_pf < 0.30 and _crypto_share_pf < 0.20:
+            _reliability_tier_pf = "Institutional-Lite"
+        else:
+            _reliability_tier_pf = "Indicative"
+        _tier_tag_pf = "[STRONG]" if _reliability_tier_pf == "Institutional" else ("[MODERATE]" if _reliability_tier_pf == "Institutional-Lite" else "[LOW]")
+
+        # ── Implementation Feasibility ──────────────────────────────────────
+        _n_active_pf = sum(1 for t in valid_tickers if valid_weights.get(t, 0) > 0.005)
+        _rebal_complexity_pf = "Low" if _n_active_pf <= 6 else ("Moderate" if _n_active_pf <= 12 else "High")
+        # Liquidity proxy: single-name positions have wider spreads vs ETFs.
+        # Uploaded portfolios are typically all single-name → assume Moderate baseline.
+        _liq_practicality_pf = "High" if _n_active_pf <= 8 else ("Moderate" if _n_active_pf <= 15 else "Limited")
+        _friction_pen_pf = _crypto_share_pf * 0.5 + _missing_beta_share_pf * 0.2
+        _execution_friction_pf = "Low" if _friction_pen_pf < 0.10 else ("Moderate" if _friction_pen_pf < 0.25 else "High")
+        _est_turnover_pf = max(5, min(40, round(8 + (_n_active_pf - 5) * 1.5 + _crypto_share_pf * 30, 0)))
+        _est_slippage_pf = round((1.0 - _crypto_share_pf) * 10 + _crypto_share_pf * 25, 1)
+        _max_w_pf = max((valid_weights_total.get(t, 0) for t in valid_tickers), default=0)
+        _deploy_score_pf = 100
+        _deploy_score_pf -= max(0, _n_active_pf - 10) * 3
+        _deploy_score_pf -= max(0, _max_w_pf - 0.25) * 100  # over-concentration
+        _deploy_score_pf -= _crypto_share_pf * 30
+        _deploy_score_pf -= _missing_beta_share_pf * 25
+        _deploy_score_pf = max(20, min(100, round(_deploy_score_pf, 0)))
+        _deploy_tier_pf = "High" if _deploy_score_pf >= 80 else ("Moderate" if _deploy_score_pf >= 60 else "Limited")
+        _deploy_tag_pf = "[STRONG]" if _deploy_tier_pf == "High" else ("[MODERATE]" if _deploy_tier_pf == "Moderate" else "[LOW]")
+        def _impl_tag_pf(level):
+            return {"Low": "[LOW]", "Moderate": "[MODERATE]", "High": "[HIGH]", "Limited": "[LOW]"}.get(level, f"[{level}]")
+
+        # ── Mandate Feasibility Constraint Diagnostics ──────────────────────
+        # Institutional concentration / beta / sector / liquidity / geography checks
+        _constraint_pf: list[dict] = []
+        # Single-name concentration: ≤25% institutional limit
+        _top_holding = max(((t, valid_weights_total.get(t, 0)) for t in valid_tickers), key=lambda x: x[1], default=("—", 0))
+        _top_name, _top_w = _top_holding
+        _status_top = "PASS" if _top_w <= 0.15 else ("NEAR CAP" if _top_w <= 0.25 else "BREACH")
+        _constraint_pf.append({
+            "name":       f"Single-name concentration · {_top_name}",
+            "limit_pct":  "≤ 25%",
+            "actual_pct": f"{_top_w*100:.1f}%",
+            "status":     _status_top,
+        })
+        # Sector concentration: ≤35% institutional limit
+        _top_sector_pf = max(sector_concentration.items(), key=lambda x: x[1], default=("—", 0)) if sector_concentration else ("—", 0)
+        _ts_name, _ts_w = _top_sector_pf
+        _status_sector = "PASS" if _ts_w <= 0.30 else ("NEAR CAP" if _ts_w <= 0.40 else "BREACH")
+        _constraint_pf.append({
+            "name":       f"Sector concentration · {_ts_name}",
+            "limit_pct":  "≤ 35%",
+            "actual_pct": f"{_ts_w*100:.1f}%",
+            "status":     _status_sector,
+        })
+        # Portfolio beta cap (mandate-defined)
+        if _has_beta_total:
+            _status_beta = "PASS" if port_beta_total <= 1.20 else ("NEAR CAP" if port_beta_total <= 1.50 else "BREACH")
+            _constraint_pf.append({
+                "name":       "Portfolio beta (vs SPX)",
+                "limit_pct":  "≤ 1.20",
+                "actual_pct": f"{port_beta_total:.2f}",
+                "status":     _status_beta,
+            })
+        # Volatility ceiling (typical balanced mandate)
+        _vol_pct_pf = ann_vol * 100 if isinstance(ann_vol, (int, float)) else 0
+        _status_vol = "PASS" if _vol_pct_pf <= 20 else ("NEAR CAP" if _vol_pct_pf <= 25 else "BREACH")
+        _constraint_pf.append({
+            "name":       "Annualized volatility",
+            "limit_pct":  "≤ 20%",
+            "actual_pct": f"{_vol_pct_pf:.1f}%",
+            "status":     _status_vol,
+        })
+        # Diversification floor: Effective N ≥ 5
+        _eff_n_pf = eff_n if isinstance(eff_n, (int, float)) else 0
+        _status_effn = "PASS" if _eff_n_pf >= 5 else ("NEAR CAP" if _eff_n_pf >= 3 else "LOW DIVERSIFICATION")
+        _constraint_pf.append({
+            "name":       "Effective N (independent bets)",
+            "limit_pct":  "≥ 5",
+            "actual_pct": f"{_eff_n_pf:.1f}",
+            "status":     _status_effn,
+        })
+        # Liquidity (cash buffer)
+        _cash_floor_pct = 1.0  # min 1% cash for liquidity
+        _status_cash = "PASS" if cash_pct >= _cash_floor_pct else "BELOW FLOOR"
+        _constraint_pf.append({
+            "name":       "Cash buffer (liquidity)",
+            "limit_pct":  "≥ 1%",
+            "actual_pct": f"{cash_pct:.1f}%",
+            "status":     _status_cash,
+        })
+
+        # ── Adaptive Disclaimers ────────────────────────────────────────────
+        _adaptive_pf: list[dict] = []
+        if _crypto_share_pf > 0.05:
+            _adaptive_pf.append({
+                "severity": "HIGH",
+                "topic":    "Crypto Liquidity Discontinuity",
+                "note":     (f"Crypto exposure of {_crypto_share_pf*100:.0f}% subject to 24/7 trading, regulatory regime shifts, "
+                             "and liquidity discontinuities during stress events. Classify as satellite, not core."),
+            })
+        if _top_w > 0.25:
+            _adaptive_pf.append({
+                "severity": "HIGH",
+                "topic":    "Single-Asset Concentration",
+                "note":     (f"Top position ({_top_name}) represents {_top_w*100:.0f}% of the portfolio. "
+                             "Idiosyncratic risk exceeds typical institutional concentration limits (25%)."),
+            })
+        if _ts_w > 0.35:
+            _adaptive_pf.append({
+                "severity": "HIGH",
+                "topic":    f"Sector Concentration · {_ts_name}",
+                "note":     (f"Sector weighting of {_ts_w*100:.0f}% in {_ts_name} exceeds institutional 35% sector cap. "
+                             "Factor crowding and idiosyncratic sector-event risk elevated."),
+            })
+        if _has_beta_total and port_beta_total > 1.20:
+            _adaptive_pf.append({
+                "severity": "HIGH" if port_beta_total > 1.40 else "MODERATE",
+                "topic":    "Elevated Market Sensitivity",
+                "note":     (f"Portfolio beta ({port_beta_total:.2f}) amplifies market drawdowns. "
+                             f"Loss expectation in a 20% market correction: approximately {port_beta_total * 20:.0f}%."),
+            })
+        if _eff_n_pf < 3 and _eff_n_pf > 0:
+            _adaptive_pf.append({
+                "severity": "HIGH",
+                "topic":    "Low Independent-Bet Count",
+                "note":     (f"Effective N = {_eff_n_pf:.1f}: portfolio behaves like fewer than 3 independent assets despite "
+                             f"holding {_n_holdings_pf}. Correlation clustering dominates."),
+            })
+        if _missing_beta_share_pf > 0.30:
+            _adaptive_pf.append({
+                "severity": "MODERATE",
+                "topic":    "Beta Data Coverage",
+                "note":     (f"{_missing_beta_share_pf*100:.0f}% of holdings lack beta data. "
+                             "Risk-classification confidence reduced. Verify benchmark sensitivity for missing names."),
+            })
+
+        # ── Benchmark-Relative Attribution (vs SPX) ─────────────────────────
+        if spx_return is not None and _has_beta_total:
+            _bench_ret_pf = spx_return  # decimal (e.g. 0.18 for 18%)
+            _port_ret_pf  = (port_total_return / 100) if isinstance(port_total_return, (int, float)) else 0
+            _market_premium_pf = max(0.0, _bench_ret_pf - 0.045)
+            _beta_contrib_pf = (port_beta_total - 1.0) * _market_premium_pf
+            _excess_ret_pf   = _port_ret_pf - _bench_ret_pf
+            _residual_pf     = _excess_ret_pf - _beta_contrib_pf
+            if abs(_beta_contrib_pf) > abs(_residual_pf) * 1.5:
+                _attr_verdict_pf = ("Outperformance appears primarily factor-driven (beta differential) rather than selection-driven."
+                                    if _excess_ret_pf > 0 else
+                                    "Underperformance attributable primarily to factor exposure (beta differential).")
+            elif abs(_residual_pf) > abs(_beta_contrib_pf) * 1.5:
+                _attr_verdict_pf = ("Outperformance concentrated in residual/selection effects — review concentration risk before attributing to skill."
+                                    if _excess_ret_pf > 0 else
+                                    "Underperformance concentrated in residual/selection effects — examine specific holdings.")
+            else:
+                _attr_verdict_pf = "Excess return roughly balanced between factor exposure and selection / concentration."
+            _attribution_pf = {
+                "excess_pct":   round(_excess_ret_pf * 100, 2),
+                "beta_pct":     round(_beta_contrib_pf * 100, 2),
+                "residual_pct": round(_residual_pf * 100, 2),
+                "verdict":      _attr_verdict_pf,
+            }
+        else:
+            _attribution_pf = None
+
+        # ── Benchmark Context (SPX) ─────────────────────────────────────────
+        if spx_return is not None:
+            _bench_spx_pct = spx_return * 100
+            _active_share_pf = sum(abs(valid_weights_total.get(t, 0) - 0)  # SPX is implicit single-asset bench
+                                    for t in valid_tickers) / 2
+            _track_pct_pf = abs(alpha) if alpha is not None else 0
+            _track_class_pf = "Low" if _track_pct_pf < 3 else ("Moderate" if _track_pct_pf < 6 else "High")
+            _active_class_pf = "Low" if _active_share_pf < 0.20 else ("Moderate" if _active_share_pf < 0.40 else "High")
+            _drift_signals_pf = []
+            if _tech_w_pf > 0.40:
+                _drift_signals_pf.append("Tech-overweight")
+            if _crypto_share_pf > 0.02:
+                _drift_signals_pf.append("Crypto-tilted")
+            if _has_beta_total and port_beta_total > 1.20:
+                _drift_signals_pf.append("Higher-beta than benchmark")
+            elif _has_beta_total and port_beta_total < 0.80:
+                _drift_signals_pf.append("Lower-beta than benchmark")
+            if cash_pct > 10:
+                _drift_signals_pf.append(f"Cash-heavy ({cash_pct:.0f}%)")
+            if not _drift_signals_pf:
+                _drift_signals_pf.append("Aligned with benchmark composition")
+            _benchmark_pf = {
+                "label":           "S&P 500 Total Return",
+                "bench_ret_pct":   round(_bench_spx_pct, 1),
+                "tracking_pct":    round(_track_pct_pf, 2),
+                "tracking_class":  _track_class_pf,
+                "active_share_pct": round(_active_share_pf * 100, 1),
+                "active_class":    _active_class_pf,
+                "style_drift":     " · ".join(_drift_signals_pf),
+            }
+        else:
+            _benchmark_pf = None
+
+        # ── Audit Appendix ──────────────────────────────────────────────────
+        _audit_input_pf = (
+            f"holdings={tuple(sorted(valid_tickers))}|"
+            f"weights={tuple(sorted((t, round(w,4)) for t,w in valid_weights_total.items()))}|"
+            f"cash_pct={round(cash_pct,2)}|"
+            f"date={now_str if 'now_str' in dir() else ''}"
+        )
+        _snapshot_id_pf = _hashlib_pf.sha256(_audit_input_pf.encode()).hexdigest()[:12]
+        _holdings_hash_pf = _hashlib_pf.sha256(",".join(sorted(valid_tickers)).encode()).hexdigest()[:12]
+        _audit_pf = {
+            "snapshot_id":     _snapshot_id_pf,
+            "holdings_hash":   _holdings_hash_pf,
+            "methodology":     "Historical Simulation · 252 trading days · CLARABEL QP optimizer (rebalance suggestions)",
+            "n_holdings":      _n_holdings_pf,
+            "data_window":     "Trailing 252 trading days",
+            "benchmark":       (_benchmark_pf or {}).get("label", "n/a"),
+            "rf_rate_pct":     4.5,
+            "confidence_pct":  round(_confidence_pf * 100, 0),
+        }
+        _model_constraints_pf = [
+            "Historical simulation uses 252-day trailing window; structural breaks beyond that window are not captured.",
+            "Correlation matrix is point-in-time; pairwise correlations rise toward 1.0 during liquidity events.",
+            "Volatility is non-stationary; realized vol can diverge materially from in-sample estimates during regime shifts.",
+            "Beta estimates assume linear market sensitivity; convex behavior (gamma) ignored.",
+            "Optimizer rebalance suggestions assume frictionless execution; transaction costs and slippage are out-of-scope.",
+            "Crypto and frontier-market positions evaluated with reduced confidence — historical proxies less stable.",
+        ]
+
         verdict_line = (
             f"Equity sleeve returned **{_fmt_safe(port_total_return, '+.1f')}%**; estimated total-portfolio return "
             f"(including {_fmt_safe(cash_pct)}% cash) is **{_fmt_safe(port_total_return_total_est, '+.1f')}%**. "
@@ -507,15 +927,85 @@ async def upload_portfolio(
             f"Alpha: N/A (benchmark unavailable). "
             f"Risk: **{risk_label}** ({_fmt_beta(port_beta_total)}). Sharpe (equity sleeve): **~{_fmt_safe(sharpe)}**."
         )
-        lines.append("# 📊 EisaX Portfolio Risk Report")
-        lines.append(f"**Date:** {now_str}  |  **Period:** 1 Year  |  **Risk-Free Rate:** 4.5% (US T-Bill)")
-        lines.append("")
-        lines.append("## 🎯 Executive Summary")
-        lines.append(f"> {verdict_line}")
+        lines.append("# EisaX Portfolio Risk Report")
+        lines.append(f"**Date:** {now_str}  |  **Period:** 1 Year  |  **Risk-Free Rate:** 4.5% (US T-Bill)  |  **Snapshot ID:** `{_snapshot_id_pf}`")
         lines.append("")
 
-        # ── Holdings ───────────────────────────────────────────────────────
-        lines.append("## 📋 Holdings")
+        # ── Section A — Executive Summary ──────────────────────────────────
+        lines.append("## A. Executive Summary")
+        lines.append("")
+        # Top-line metric table with institutional severity tags
+        def _ret_tag(v):
+            if v is None: return "[N/A]"
+            return "[STRONG]" if v > 10 else ("[MODERATE]" if v > 0 else "[LOW]")
+        def _vol_tag(v):
+            if v is None: return "[N/A]"
+            return "[LOW]" if v < 12 else ("[MODERATE]" if v < 20 else "[HIGH]")
+        def _sharpe_tag(v):
+            if v is None: return "[N/A]"
+            return "[STRONG]" if v > 1.2 else ("[GOOD]" if v > 0.8 else ("[ACCEPTABLE]" if v > 0.5 else "[BELOW MANDATE]"))
+        def _beta_tag(v):
+            if v is None: return "[N/A]"
+            return "[LOW]" if v < 0.7 else ("[MODERATE]" if v < 1.1 else "[HIGH]")
+        _ret_v = port_total_return if isinstance(port_total_return, (int, float)) else None
+        _vol_v = (ann_vol * 100) if isinstance(ann_vol, (int, float)) else None
+        _sharpe_v = sharpe if isinstance(sharpe, (int, float)) else None
+        _beta_v = port_beta_total if (_has_beta_total and isinstance(port_beta_total, (int, float))) else None
+        lines.append("| Metric | Value | Assessment |")
+        lines.append("|--------|-------|------------|")
+        lines.append(f"| Equity-Sleeve 1Y Return | **~{_ret_v:+.1f}%** | {_ret_tag(_ret_v)} |" if _ret_v is not None else "| Equity-Sleeve 1Y Return | N/A | [N/A] |")
+        lines.append(f"| Total-Portfolio 1Y Return | **~{port_total_return_total_est:+.1f}%** | Includes ~{cash_pct:.0f}% cash drag |")
+        if spx_return is not None and alpha is not None:
+            lines.append(f"| vs S&P 500 (Alpha) | **~{alpha:+.1f}%** | {'[STRONG]' if alpha > 3 else ('[ACCEPTABLE]' if alpha > 0 else '[BELOW BENCHMARK]')} |")
+        lines.append(f"| Annualized Volatility | **~{_vol_v:.1f}%** | {_vol_tag(_vol_v)} |" if _vol_v is not None else "| Annualized Volatility | N/A | [N/A] |")
+        lines.append(f"| Sharpe Ratio | **~{_sharpe_v:.2f}** | {_sharpe_tag(_sharpe_v)} |" if _sharpe_v is not None else "| Sharpe Ratio | N/A | [N/A] |")
+        lines.append(f"| Portfolio Beta (Total) | **~{_beta_v:.2f}** | {_beta_tag(_beta_v)} |" if _beta_v is not None else "| Portfolio Beta (Total) | N/A | [N/A] |")
+        lines.append(f"| CVaR 95% (1-Day) | **~{cvar_95:.2f}%** | [{('CRITICAL' if cvar_95 < -4 else ('HIGH' if cvar_95 < -3 else ('MODERATE' if cvar_95 < -2 else 'LOW')))}] |")
+        lines.append(f"| Max Drawdown (1Y) | **~{max_dd:.1f}%** | [{('CRITICAL' if max_dd < -25 else ('HIGH' if max_dd < -15 else ('MODERATE' if max_dd < -10 else 'LOW')))}] |")
+        lines.append("")
+        # Regime + Confidence + Implementation + Benchmark strips
+        lines.append(f"**Portfolio Regime:** **{_regime_pf}**")
+        lines.append(f"> {_regime_impl_pf}")
+        if _regime_behavior_pf:
+            lines.append(f"> **Regime Behavior vs Benchmark:** {_regime_behavior_pf}")
+        lines.append("")
+        lines.append(f"**Confidence Calibration** · Score: **{_confidence_pf*100:.0f}%** · Evidence Breadth: **{_evidence_breadth_pf}** · Coverage Quality: **{_coverage_quality_pf}** · Reliability Tier: **{_reliability_tier_pf}** {_tier_tag_pf}")
+        lines.append("")
+        lines.append(f"**Implementation Feasibility** · Deployability: **{_deploy_tier_pf}** {_deploy_tag_pf} ({_deploy_score_pf:.0f}/100) · Rebalancing Complexity: **{_rebal_complexity_pf}** {_impl_tag_pf(_rebal_complexity_pf)} · Liquidity: **{_liq_practicality_pf}** {_impl_tag_pf(_liq_practicality_pf)} · Execution Friction: **{_execution_friction_pf}** {_impl_tag_pf(_execution_friction_pf)} · Est. Turnover ~{_est_turnover_pf:.0f}%/yr · Est. Slippage ~{_est_slippage_pf:.0f} bp")
+        lines.append("")
+        if _benchmark_pf:
+            lines.append(f"**Benchmark Context** · Reference: **{_benchmark_pf['label']}** · Bench Return ~{_benchmark_pf['bench_ret_pct']:+.1f}% · Tracking Deviation: **{_benchmark_pf['tracking_class']}** {_impl_tag_pf(_benchmark_pf['tracking_class'])} ({_benchmark_pf['tracking_pct']:.1f}% vs alpha) · Active Share: **{_benchmark_pf['active_class']}** {_impl_tag_pf(_benchmark_pf['active_class'])} ({_benchmark_pf['active_share_pct']:.0f}%) · Style Drift: **{_benchmark_pf['style_drift']}**")
+            lines.append("")
+        lines.append("> *Values are approximate, derived from 252-day historical simulation. Not a guarantee of future performance.*")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        # ── Section B — Mandate Feasibility Analysis ───────────────────────
+        lines.append("## B. Mandate Feasibility Analysis")
+        lines.append("")
+        lines.append("> Institutional constraint diagnostics applied to the uploaded construction. Each check shows the conventional limit, the actual observed value, and the resulting status.")
+        lines.append("")
+        lines.append("| Constraint | Limit | Actual | Status |")
+        lines.append("|------------|-------|--------|--------|")
+        _STATUS_TAG_PF = {
+            "PASS":            "[PASS]",
+            "NEAR CAP":        "[NEAR CAP]",
+            "BREACH":          "[BREACH]",
+            "BELOW FLOOR":     "[AT FLOOR]",
+            "LOW DIVERSIFICATION": "[LOW DIVERSIFICATION]",
+        }
+        for c in _constraint_pf:
+            _tag = _STATUS_TAG_PF.get(c["status"], f"[{c['status']}]")
+            lines.append(f"| {c['name']} | {c['limit_pct']} | {c['actual_pct']} | {_tag} |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        # ── Section D — Allocation Logic (Holdings, Sectors, Attribution, Factors) ──
+        lines.append("## D. Allocation Logic")
+        lines.append("")
+        lines.append("### Holdings")
         lines.append("| Ticker | Weight (Total) | Weight (Equity Sleeve) | Sector | Beta | P/E | Div Yield |")
         lines.append("|--------|----------------|------------------------|--------|------|-----|-----------|")
         for t in valid_tickers:
@@ -541,22 +1031,21 @@ async def upload_portfolio(
 
         # ── Risk Metrics ───────────────────────────────────────────────────
         lines.append("")
-        lines.append("## 📈 Risk Metrics")
+        lines.append("### Detailed Risk Metrics")
         lines.append("*Method: Historical Simulation (252 trading days) · rf = 4.5% · equity-sleeve normalized*")
         lines.append("")
         lines.append("| Metric | Value | Assessment |")
         lines.append("|--------|-------|------------|")
-        lines.append(f"| 1Y Return (Equity Sleeve) | {_fmt_safe(port_total_return, '+.1f')}% | {'🟢 Strong' if port_total_return > 15 else '🟡 Moderate' if port_total_return > 0 else '🔴 Negative'} |")
+        lines.append(f"| 1Y Return (Equity Sleeve) | {_fmt_safe(port_total_return, '+.1f')}% | [{'STRONG' if port_total_return > 15 else ('MODERATE' if port_total_return > 0 else 'LOW')}] |")
         lines.append(f"| Estimated 1Y Return (Total Portfolio) | {_fmt_safe(port_total_return_total_est, '+.1f')}% | Includes {_fmt_safe(cash_pct)}% cash drag |")
         if spx_return is not None and alpha is not None:
-            alpha_icon = "🟢" if alpha > 0 else "🔴"
-            lines.append(f"| vs S&P 500 (Alpha) | {_fmt_safe(alpha, '+.1f')}% | {alpha_icon} {'Outperforming' if alpha > 0 else 'Underperforming'} benchmark |")
+            lines.append(f"| vs S&P 500 (Alpha) | {_fmt_safe(alpha, '+.1f')}% | [{'STRONG' if alpha > 3 else ('ACCEPTABLE' if alpha > 0 else 'BELOW BENCHMARK')}] |")
         elif spx_return is None:
-            lines.append(f"| vs S&P 500 (Alpha) | N/A | Alpha: N/A (benchmark unavailable) |")
-        lines.append(f"| Annualized Volatility | {_fmt_safe(ann_vol * 100 if isinstance(ann_vol, (int, float)) else None)}% | {'🔴 High' if ann_vol > 0.30 else '🟡 Moderate' if ann_vol > 0.15 else '🟢 Low'} |")
-        lines.append(f"| Sharpe Ratio (1Y, rf=4.5%) | {_fmt_safe(sharpe, '.2f')} | {'🟢 Excellent' if sharpe > 1.5 else '🟡 Acceptable' if sharpe > 0.5 else '🔴 Poor'} |")
-        lines.append(f"| Sortino Ratio (1Y, rf=4.5%) | {_fmt_safe(sortino, '.2f')} | {'🟢 Good' if sortino > 1.0 else '🟡 Acceptable' if sortino > 0.5 else '🔴 Poor'} downside-adjusted |")
-        lines.append(f"| Portfolio Beta (Total Weight) | {_fmt_beta(port_beta_total)} | {'🔴 High Risk' if (_has_beta_total and port_beta_total > 1.5) else '🟡 Moderate' if (_has_beta_total and port_beta_total > 1) else '🟢 Defensive' if _has_beta_total else '⚪ N/A (missing beta data)'} |")
+            lines.append(f"| vs S&P 500 (Alpha) | N/A | Benchmark data unavailable |")
+        lines.append(f"| Annualized Volatility | {_fmt_safe(ann_vol * 100 if isinstance(ann_vol, (int, float)) else None)}% | [{'HIGH' if ann_vol > 0.30 else ('MODERATE' if ann_vol > 0.15 else 'LOW')}] |")
+        lines.append(f"| Sharpe Ratio (1Y, rf=4.5%) | {_fmt_safe(sharpe, '.2f')} | [{'STRONG' if sharpe > 1.5 else ('ACCEPTABLE' if sharpe > 0.5 else 'BELOW MANDATE')}] |")
+        lines.append(f"| Sortino Ratio (1Y, rf=4.5%) | {_fmt_safe(sortino, '.2f')} | [{'STRONG' if sortino > 1.0 else ('ACCEPTABLE' if sortino > 0.5 else 'BELOW MANDATE')}] downside-adjusted |")
+        lines.append(f"| Portfolio Beta (Total Weight) | {_fmt_beta(port_beta_total)} | {'[HIGH]' if (_has_beta_total and port_beta_total > 1.5) else ('[MODERATE]' if (_has_beta_total and port_beta_total > 1) else ('[LOW]' if _has_beta_total else '[N/A] (missing beta data)'))} |")
         lines.append(f"| Portfolio Beta (Equity Sleeve) | {_fmt_beta(port_beta_equity)} | {'Normalized over non-cash assets' if _has_beta_equity else 'N/A (insufficient beta coverage)'} |")
         lines.append(f"| VaR 95% 1-Day (Historical) | {_fmt_safe(var_95, '.2f')}% | 95% of days, loss ≤ this |")
         lines.append(f"| CVaR 95% (Expected Shortfall) | {_fmt_safe(cvar_95, '.2f')}% | Avg loss **when** VaR is breached — tail risk |")
@@ -569,7 +1058,7 @@ async def upload_portfolio(
 
         # ── Sector Concentration ───────────────────────────────────────────
         lines.append("")
-        lines.append("## 🏭 Sector Exposure")
+        lines.append("### Sector Exposure")
         lines.append("| Sector | Weight | HHI Contribution |")
         lines.append("|--------|--------|-----------------|")
         for sec, w in sorted(sector_concentration.items(), key=lambda x: -x[1]):
@@ -579,7 +1068,22 @@ async def upload_portfolio(
 
         # ── Correlation & Diversification Analysis ────────────────────────
         lines.append("")
-        lines.append("## 🔗 Correlation & Diversification")
+        lines.append("---")
+        lines.append("")
+        lines.append("## C. Risk Diagnostics")
+        lines.append("")
+        # Adaptive Disclosures table — surfaces only what materially applies
+        if _adaptive_pf:
+            lines.append("### Adaptive Risk Disclosures")
+            lines.append("")
+            lines.append("*Conditional on the constructed portfolio — only risks that materially apply are surfaced.*")
+            lines.append("")
+            lines.append("| Severity | Topic | Note |")
+            lines.append("|----------|-------|------|")
+            for _d in _adaptive_pf:
+                lines.append(f"| [{_d['severity']}] | {_d['topic']} | {_d['note']} |")
+            lines.append("")
+        lines.append("### Correlation & Diversification")
         lines.append(corr_matrix_str)
         lines.append("")
         eff_n_label = "🔴 Low" if eff_n < 1.5 else "🟡 Moderate" if eff_n < 2.5 else "🟢 Good"
@@ -600,7 +1104,7 @@ async def upload_portfolio(
 
         # ── Stress Tests (Historical + Simulated) ─────────────────────────
         lines.append("")
-        lines.append("## 🧪 Stress Testing")
+        lines.append("### Stress Testing")
         lines.append("*Historical crises use actual observed returns + sector-adjusted amplification (NOT linear beta)*")
         lines.append("")
         lines.append("| Scenario | SPX Actual | Portfolio Est. | Notes |")
@@ -613,7 +1117,7 @@ async def upload_portfolio(
 
         # ── EisaX Risk Assessment ─────────────────────────────────────────
         lines.append("")
-        lines.append("## 💡 EisaX Risk Assessment")
+        lines.append("### Aggregate Risk Assessment")
         _top_sector = max(sector_concentration, key=sector_concentration.get) if sector_concentration else "N/A"
         _top_sector_pct = sector_concentration.get(_top_sector, 0) * 100
         if _has_beta_total and port_beta_total > 1.5:
@@ -645,7 +1149,9 @@ async def upload_portfolio(
         # Shows each holding's contribution to total return (Brinson model)
         # ══════════════════════════════════════════════════════════════════════
         if len(price_data) >= 1:
-            lines.append("## 📐 Performance Attribution (1Y, Equity Sleeve)")
+            lines.append("---")
+            lines.append("")
+            lines.append("### Performance Attribution (1Y, Equity Sleeve)")
             lines.append("*Brinson-Hood-Beebower: each holding's contribution to equity-sleeve return*")
             lines.append("")
             lines.append("| Ticker | Weight (Equity Sleeve) | 1Y Return | Contribution | Attribution |")
@@ -681,7 +1187,7 @@ async def upload_portfolio(
         # ── 2. FACTOR EXPOSURE (Fama-French Proxy) ───────────────────────────
         # Approximates factor tilts using beta, P/E, market cap, momentum
         # ══════════════════════════════════════════════════════════════════════
-        lines.append("## 🧬 Factor Exposure Analysis")
+        lines.append("### Factor Exposure Analysis")
         lines.append("*Fama-French proxy: factor tilts computed from fundamentals + price momentum*")
         lines.append("")
 
@@ -748,7 +1254,9 @@ async def upload_portfolio(
         # with institutional mandate limits (single stock, sector, beta, eff N)
         # ══════════════════════════════════════════════════════════════════════
         if len(price_data) >= 2:
-            lines.append("## ⚙️ Institutional Optimization Engine")
+            lines.append("---")
+            lines.append("")
+            lines.append("## E. Rebalancing Plan — Institutional Optimization Engine")
             lines.append("*Convex QP · CLARABEL solver · Zero-tolerance constraint enforcement*")
             lines.append("")
             try:
@@ -1324,7 +1832,7 @@ CRITICAL:
                 ds_resp = _rq.post(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {deepseek_key}", "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat", "messages": [{"role": "user", "content": ds_prompt}],
+                    json={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": ds_prompt}],
                           "max_tokens": 900, "temperature": 0.25},
                     timeout=40
                 )
@@ -1345,18 +1853,30 @@ CRITICAL:
                             cio_analysis += (
                                 "\n\n> Decision Boundary: This analysis provides strategic guidance, not execution instructions."
                             )
-                        lines.append("## 🧠 CIO Deep Analysis (AI-Powered)")
+                        lines.append("---")
+                        lines.append("")
+                        lines.append("## F. AI Commentary Layer — CIO Synthesis")
+                        lines.append("")
+                        lines.append("*AI-generated synthesis. Sections A–E above are deterministic and reproducible from the optimizer state.*")
                         lines.append(cio_analysis)
                 else:
                     lines.append(f"*CIO analysis unavailable (API {ds_resp.status_code})*")
             else:
-                lines.append("## 🧠 Portfolio Assessment")
-                lines.append("**Risk Level: Aggressive** — High-beta tech concentration. "
-                              "Reduce TSLA, add VIG/XLV/JPM for balance." if (_has_beta_total and port_beta_total > 1.5) else
-                              "**Risk Level: Moderate** — Monitor correlation clusters and rebalance quarterly.")
+                lines.append("---")
+                lines.append("")
+                lines.append("## F. AI Commentary Layer — Portfolio Synthesis")
+                lines.append("")
+                lines.append("*AI-generated synthesis. Sections A–E above are deterministic and reproducible.*")
+                lines.append("**Risk Profile: Aggressive** — Elevated beta and sector concentration. "
+                             "Reduce top single-name exposure and add diversifying defensive sleeves." if (_has_beta_total and port_beta_total > 1.5) else
+                             "**Risk Profile: Moderate** — Monitor correlation clusters and rebalance on a 6–12 month cadence.")
         except Exception as _e:
             logger.warning("DeepSeek CIO analysis failed: %s", _e)
-            lines.append("## 🧠 Portfolio Assessment")
+            lines.append("---")
+            lines.append("")
+            lines.append("## F. AI Commentary Layer — Portfolio Synthesis")
+            lines.append("")
+            lines.append("*AI-generated synthesis. Sections A–E above are deterministic and reproducible.*")
             _risk_label = "Aggressive" if (_has_beta_total and port_beta_total > 1.5) else "Moderate-Aggressive" if (_has_beta_total and port_beta_total > 1.2) else "Moderate" if _has_beta_total else "Unknown"
             _top_holding = max(valid_weights, key=valid_weights.get) if valid_weights else "N/A"
             _top_w = valid_weights.get(_top_holding, 0) * 100
@@ -1395,9 +1915,9 @@ CRITICAL:
         _snap_id   = str(_uuid_mod.uuid4())
         _generated = _dt_mod.datetime.now(_dt_mod.timezone.utc)
         _gen_str   = _generated.strftime("%Y-%m-%d %H:%M:%S UTC")
-        _price_asof = prices_df.index[-1].strftime("%Y-%m-%d") if len(price_data) >= 2 else "N/A"
-        _period_start = prices_df.index[0].strftime("%Y-%m-%d") if len(price_data) >= 2 else "N/A"
-        _tickers_str = ", ".join(_opt_tickers if 'price_data' in dir() and len(price_data) >= 2 else valid_tickers)
+        _price_asof = prices_df.index[-1].strftime("%Y-%m-%d") if len(price_data) >= 1 else "N/A"
+        _period_start = prices_df.index[0].strftime("%Y-%m-%d") if len(price_data) >= 1 else "N/A"
+        _tickers_str = ", ".join(list(returns_df.columns) if 'returns_df' in dir() and not returns_df.empty else valid_tickers)
 
         # Build preliminary report for hashing (before audit section appended)
         _pre_report = "\n".join(lines)
@@ -1405,7 +1925,31 @@ CRITICAL:
 
         lines.append("")
         lines.append("---")
-        lines.append("## 📋 Audit Trail")
+        lines.append("---")
+        lines.append("")
+        lines.append("## G. Audit Appendix")
+        lines.append("")
+        lines.append("| Field | Value |")
+        lines.append("|-------|-------|")
+        lines.append(f"| Snapshot ID | `{_audit_pf['snapshot_id']}` |")
+        lines.append(f"| Holdings Hash | `{_audit_pf['holdings_hash']}` |")
+        lines.append(f"| Methodology | {_audit_pf['methodology']} |")
+        lines.append(f"| Data Window | {_audit_pf['data_window']} |")
+        lines.append(f"| Holdings Count | {_audit_pf['n_holdings']} |")
+        lines.append(f"| Benchmark | {_audit_pf['benchmark']} |")
+        lines.append(f"| Risk-Free Rate | {_audit_pf['rf_rate_pct']:.1f}% |")
+        lines.append(f"| Confidence Score | {_audit_pf['confidence_pct']:.0f}% |")
+        lines.append("")
+        lines.append("> *Reproducible: same holdings + same data window → same Snapshot ID → identical output.*")
+        lines.append("")
+        lines.append("### Model Constraints — Structural Limitations of the Engine")
+        lines.append("")
+        for _mc in _model_constraints_pf:
+            lines.append(f"- {_mc}")
+        lines.append("")
+        lines.append("> *Transparency note: the constraints above are inherent to historical-simulation portfolio analytics. Surfaced explicitly to support institutional review and governance.*")
+        lines.append("")
+        lines.append("### Legacy Audit Trail (Operational Log)")
         lines.append("*For compliance, reproducibility, and institutional trust*")
         lines.append("")
         lines.append("| Field | Value |")
@@ -1414,7 +1958,7 @@ CRITICAL:
         lines.append(f"| **Generated** | {_gen_str} |")
         lines.append(f"| **Price Data As-Of** | {_price_asof} |")
         lines.append(f"| **Period Analysed** | {_period_start} → {_price_asof} (252 trading days) |")
-        lines.append(f"| **Data Source** | Yahoo Finance (yfinance) — 15-min delayed |")
+        lines.append(f"| **Data Source** | core.data.get_prices — TV-first price router; yfinance benchmark fallback |")
         lines.append(f"| **Tickers Fetched** | {_tickers_str} |")
         lines.append(f"| **Risk-Free Rate** | 4.50% (US 3-Month T-Bill) |")
         lines.append(f"| **Methodology** | Historical Simulation · Brinson Attribution · Fama-French proxy |")
@@ -1443,7 +1987,7 @@ CRITICAL:
                 "div_yield_equity": round(port_div_yield_equity, 3),
             }
             _sources_for_mem = [{
-                "source":       "Yahoo Finance (yfinance)",
+                "source":       "core.data.get_prices",
                 "tickers":      valid_tickers,
                 "period":       f"{_period_start} → {_price_asof}",
                 "fetched_at":   _gen_str,
@@ -1461,18 +2005,50 @@ CRITICAL:
         except Exception as _mem_err:
             logger.warning("[PortfolioMemory] Save failed: %s", _mem_err)
 
+        # ── Phase H augmentation for uploaded portfolios ──────────────────
+        # Wraps the existing `report` markdown with H1 (benchmark relative),
+        # H2 (execution-what-if vs from-cash), H4 (factor decomposition).
+        # H3 / H5 are off by default for uploads unless EISAX_PHASE_H_UPLOAD_FULL=1.
+        _phase_h_meta = None
+        try:
+            from phase_h.orchestrator import augment_result as _ph_aug
+            _ph_input = {
+                "weights":      dict(valid_weights or {}),
+                "metrics":      {"profile": "uploaded"},
+                "feasibility":  {"status": "feasible"},
+                "confidence":   {"reliability_tier": "Indicative"},
+                "report_md":    report,
+            }
+            _ph_full = os.environ.get("EISAX_PHASE_H_UPLOAD_FULL", "0").strip().lower() in {"1","true","yes","on"}
+            _ph_out = _ph_aug(
+                _ph_input,
+                language="en",
+                rebalance_frequency="quarterly",
+                committee_mode=("1pager" if _ph_full else None),
+                horizon_years=5.0,
+                asset_kind=None,
+                region_tilt=None,
+                benchmark_ticker=None,
+                w_prev=None,
+            )
+            report = _ph_out.get("report_md", report)
+            _phase_h_meta = _ph_out.get("phase_h_meta")
+        except Exception as _ph_exc:  # pragma: no cover — never fail upload on H
+            logger.warning("[PhaseH/upload] augment failed: %r", _ph_exc)
+
         return _clean_nan({
             "status":      "success",
             "snapshot_id": _snap_id,
             "portfolio":   portfolio,
             "tickers":     tickers,
             "analysis":    report,
+            "phase_h_meta": _phase_h_meta,
             "audit": {
                 "report_id":     _snap_id,
                 "generated_utc": _gen_str,
                 "price_as_of":   _price_asof,
                 "period":        f"{_period_start} → {_price_asof}",
-                "data_source":   "Yahoo Finance (yfinance)",
+                "data_source":   "core.data.get_prices",
                 "report_hash":   f"sha256:{_report_hash}",
                 "optimizer":     "CLARABEL (cvxpy)",
             },
