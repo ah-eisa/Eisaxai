@@ -255,6 +255,32 @@ async def upload_portfolio(
             except (ValueError, TypeError):
                 return fallback
 
+        def _date_index(idx):
+            _idx = pd.to_datetime(idx, errors="coerce")
+            if getattr(_idx, "tz", None) is not None:
+                _idx = _idx.tz_convert(None)
+            return _idx.normalize()
+
+        def _regression_beta(asset_returns, mkt_returns, min_obs=20):
+            try:
+                _joined = pd.concat(
+                    [
+                        pd.to_numeric(asset_returns, errors="coerce").rename("asset"),
+                        pd.to_numeric(mkt_returns, errors="coerce").rename("market"),
+                    ],
+                    axis=1,
+                    join="inner",
+                ).replace([np.inf, -np.inf], np.nan).dropna()
+                if _joined.shape[0] < min_obs:
+                    return None
+                _mkt_var = float(_joined["market"].var())
+                if not np.isfinite(_mkt_var) or _mkt_var <= 0:
+                    return None
+                _beta = float(_joined["asset"].cov(_joined["market"]) / _mkt_var)
+                return _beta if np.isfinite(_beta) else None
+            except Exception:
+                return None
+
         valid_tickers = [t for t in tickers if t.upper() not in ["CASH","USD","AED"]]
         valid_weights_total = {t: portfolio.get(t, 0.0) for t in valid_tickers}
         
@@ -436,12 +462,46 @@ async def upload_portfolio(
 
         # ── Benchmark: S&P 500 ───────────────────────────────────────────────
         spx_return = None
+        spx_returns = pd.Series(dtype="float64")
         try:
-            spx = yf.Ticker("^GSPC").history(period=LOOKBACK)
-            if spx.empty or spx["Close"].isna().all():
-                spx = yf.Ticker("^GSPC").history(period="6mo")
-            if not spx.empty:
-                spx_return = float((spx["Close"].dropna().iloc[-1] / spx["Close"].dropna().iloc[0]) - 1)
+            _spx_close = pd.Series(dtype="float64")
+            try:
+                _spx_px = get_prices(["^GSPC"], start=lookback_start, end=None, force_refresh=False)
+                if _spx_px is not None and not _spx_px.empty:
+                    _spx_px = _spx_px.copy()
+                    _spx_px.index = _date_index(_spx_px.index)
+                    _spx_px = _spx_px[~_spx_px.index.isna()]
+                    _spx_col = next(
+                        (c for c in _spx_px.columns if str(c).upper().strip() == "^GSPC"),
+                        _spx_px.columns[0],
+                    )
+                    _spx_close = pd.to_numeric(_spx_px[_spx_col], errors="coerce").dropna()
+            except Exception as _spx_pe:
+                logger.debug("SPX price fetch through get_prices failed: %s", _spx_pe)
+
+            if _spx_close.empty:
+                spx = yf.Ticker("^GSPC").history(period=LOOKBACK)
+                if spx.empty or spx["Close"].isna().all():
+                    spx = yf.Ticker("^GSPC").history(period="6mo")
+                if not spx.empty:
+                    _spx_close = pd.to_numeric(spx["Close"], errors="coerce").dropna()
+                    _spx_close.index = _date_index(_spx_close.index)
+
+            _spx_close = _spx_close.sort_index()
+            _spx_close = _spx_close[~_spx_close.index.duplicated(keep="last")]
+            if not _spx_close.empty:
+                spx_return = float((_spx_close.iloc[-1] / _spx_close.iloc[0]) - 1)
+                _target_idx = _date_index(returns_df.index)
+                _aligned_spx = (
+                    _spx_close
+                    .reindex(_spx_close.index.union(_target_idx))
+                    .sort_index()
+                    .ffill()
+                    .reindex(_target_idx)
+                )
+                spx_returns = _aligned_spx.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+                spx_returns.index = returns_df.index
+                spx_returns.name = "^GSPC"
         except Exception:
             pass
 
@@ -1259,6 +1319,8 @@ async def upload_portfolio(
             lines.append("## E. Rebalancing Plan — Institutional Optimization Engine")
             lines.append("*Convex QP · CLARABEL solver · Zero-tolerance constraint enforcement*")
             lines.append("")
+            class _OptimizerSkip(Exception):
+                pass
             try:
                 import cvxpy as cp
                 from scipy.optimize import minimize as _scimin
@@ -1271,9 +1333,20 @@ async def upload_portfolio(
                 _mu       = np.array([float(returns_df[t].mean() * 252) for t in _opt_tickers])
                 _cov_raw  = returns_df[_opt_tickers].cov().values * 252
                 _cov      = np.array(_cov_raw, dtype=float) + np.eye(_n) * 1e-8   # PSD regularisation
-                _missing_beta = [t for t in _opt_tickers if stock_info.get(t, {}).get("beta") is None]
+                _missing_beta = []
+                for _t in _opt_tickers:
+                    if stock_info.get(_t, {}).get("beta") is not None:
+                        continue
+                    _fallback_beta = _regression_beta(returns_df[_t], spx_returns)
+                    if _fallback_beta is None:
+                        _missing_beta.append(_t)
+                    else:
+                        stock_info.setdefault(_t, {})["beta"] = _fallback_beta
                 if _missing_beta:
-                    raise ValueError(f"Missing beta data for optimization: {', '.join(_missing_beta)}")
+                    raise _OptimizerSkip(
+                        "beta unavailable after regression fallback for "
+                        + ", ".join(_missing_beta)
+                    )
                 _betas_v  = np.array([max(float(stock_info.get(t, {}).get("beta")), 0.01)
                                       for t in _opt_tickers])
                 _MIN_W    = 0.01          # 1 % floor per holding
@@ -1745,6 +1818,10 @@ async def upload_portfolio(
                         lines.append(f"| {_lbl} | {_bef} | {_aft} | {_dstr} | {_vfn(_dlt)} |")
                     lines.append("")
 
+            except _OptimizerSkip as _opt_skip:
+                logger.warning("Optimization engine skipped: %s", _opt_skip)
+                lines.append(f"*Optimization engine skipped: {_opt_skip}*")
+                lines.append("")
             except Exception as _opt_e:
                 logger.warning("Optimization engine failed: %s", _opt_e, exc_info=True)
                 lines.append(f"*Optimization engine error: {_opt_e}*")
