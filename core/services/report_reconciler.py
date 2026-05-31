@@ -380,6 +380,115 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
             )
         )
 
+    # ── 13. General output-polish guards (idempotent; no-op when absent) ─
+    # These catch recurring LLM rendering artifacts surfaced in live portal
+    # QA. Each is deterministic and safe to run on already-clean text.
+    _polish = 0
+
+    # 13a. Duplicated consecutive phrase: "in current dataset in current
+    # dataset" → "in current dataset". Collapse an immediately-repeated
+    # 2-6 word run (case-insensitive, whitespace-tolerant).
+    def _dedup_phrase(m: "re.Match") -> str:
+        return m.group(1)
+    _new, _n = re.subn(
+        r"\b([A-Za-z][\w'/-]*(?:\s+[\w'/-]+){1,5})\s+\1\b",
+        _dedup_phrase, text, flags=re.IGNORECASE,
+    )
+    if _n:
+        text = _new
+        _polish += _n
+        audit.corrections.append(
+            Correction("formatting", f"{_n} duplicated phrase(s)",
+                       "collapsed", "dup_phrase_fix")
+        )
+
+    # 13b. Orphan "Full" artifact immediately before a subsection heading,
+    # e.g. "Full\n## Section" or "**Full**\n###". Strip the stray token only
+    # when it stands alone on its own line right before a heading/bold head.
+    _new, _n = re.subn(
+        r"(?m)^\s*\*{0,2}Full\*{0,2}\s*\n(?=\s*(?:#{1,6}\s|\*\*[A-Z]))",
+        "", text,
+    )
+    if _n:
+        text = _new
+        _polish += _n
+        audit.corrections.append(
+            Correction("formatting", f"{_n} orphan 'Full' artifact(s)",
+                       "stripped", "orphan_full_fix")
+        )
+
+    # 13c. Malformed valuation string: a metric label glued directly to a
+    # currency symbol with no space, e.g. "P/Eد.إ3.40" or "ROE﷼12". Insert a
+    # single space. Also fix currency glued to an opening paren digit run
+    # like "د.إ3.41(price" → "د.إ3.41 (price".
+    _cur = r"(?:د\.إ|﷼|ج\.م|ر\.ق|\$)"
+    _before_val = text
+    # Metric label glued to a currency symbol: "P/Eد.إ" → "P/E د.إ"
+    text = re.sub(
+        rf"(P/E|EV/EBITDA|P/B|ROE|ROA|yield)({_cur})",
+        r"\1 \2", text, flags=re.IGNORECASE,
+    )
+    # Currency+number glued to an opening paren with NO existing space:
+    # "د.إ3.41(price" → "د.إ3.41 (price". The negative-lookbehind for a space
+    # keeps this idempotent (already-spaced text is not re-matched).
+    text = re.sub(
+        rf"({_cur}\s*[\d,]+\.?\d*)(?<!\s)(\()",
+        r"\1 \2", text,
+    )
+    if text != _before_val:
+        _polish += 1
+        audit.corrections.append(
+            Correction("formatting", "malformed valuation string(s)",
+                       "spaced", "valuation_string_fix")
+        )
+
+    # 13d. Cap/qualify extreme theoretical valuation upside when forward data
+    # is missing. If the report flags partial/missing coverage AND shows an
+    # upside >= 300%, append a one-time caveat next to the first such figure.
+    _has_partial = bool(re.search(
+        r"(?i)data\s+coverage\s+is\s+partial|missing\s+forward|forward\s+(?:eps|p/e)\s+(?:unavailable|n/?a)|limited\s+fundamental\s+visibility",
+        text,
+    ))
+    if _has_partial and "theoretical — forward data unavailable" not in text:
+        def _cap_upside(m: "re.Match") -> str:
+            return f"{m.group(0)} *(theoretical — forward data unavailable)*"
+        _new, _n = re.subn(
+            r"\+?\d{3,5}(?:\.\d+)?%\s*(?:upside|implied upside)",
+            _cap_upside, text, count=1, flags=re.IGNORECASE,
+        )
+        if _n:
+            text = _new
+            _polish += _n
+            audit.corrections.append(
+                Correction("valuation", "extreme upside w/ missing forward data",
+                           "qualified", "extreme_upside_qualify")
+            )
+
+    # 13e. Real-estate sector-wording leakage (subtype-scoped). On RE reports
+    # the LLM sometimes describes the company as part of the "financial
+    # sector" or subtitles a peer section "Finance Sector". Rewrite the
+    # sector word to real-estate context. Narrow, case-insensitive.
+    if fs.sector_subtype == SectorSubtype.REAL_ESTATE_DEVELOPER:
+        _re_word_fixes = [
+            (r"\bGCC\s+financial\s+sector\b", "GCC real-estate sector"),
+            (r"\bfinancial\s+sector\b", "real-estate sector"),
+            (r"(Peer\s+Comparison[^\n]*?)\bFinance\s+Sector\b", r"\1Real-Estate Sector"),
+            (r"\bFinance\s+Sector\s+Across\s+Gulf", "Real-Estate Sector Across Gulf"),
+            (r"GCC\s+financial[\s-]+real[\s-]?estate\s+peer[\s-]?average",
+             "GCC real-estate peer average"),
+            (r"financial\s+real-?estate\s+peer", "real-estate peer"),
+        ]
+        _re_n = 0
+        for _pat, _rep in _re_word_fixes:
+            text, _c = re.subn(_pat, _rep, text, flags=re.IGNORECASE)
+            _re_n += _c
+        if _re_n:
+            _polish += _re_n
+            audit.corrections.append(
+                Correction("sector_label", f"{_re_n} financial-sector wording leak(s) on RE report",
+                           "rewritten to real-estate", "re_sector_wording_fix")
+            )
+
     logger.info(
         "[Reconciler] %s subtype=%s %s",
         fs.ticker, fs.sector_subtype.value, audit.summary(),
