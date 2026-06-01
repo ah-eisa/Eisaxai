@@ -247,6 +247,43 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
                 audit, "pct_sma_combo", "rebuild_full_comparison",
             )
 
+            # Form D: "Price at X is trading below the SMA50 (W) by -Z%, but
+            # above the SMA200 (V) by +Y%." — the SMA50-first word order with a
+            # "trading ... the" connector and a trailing "by N%". v4-flash both
+            # mis-states the direction word AND the magnitude here, so rebuild
+            # the entire clause deterministically from SSOT pct values. Note
+            # SMA50 comes first in this phrasing (pct50/pos50 lead).
+            text = _swap_n(
+                text,
+                r"Price\s+at\s+(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?\s*[\d,]+\.\d{1,4}"
+                r"\s*(?:د\.إ|﷼|ج\.م|ر\.ق|\$)?\s+is\s+trading\s+"
+                r"(?:above|below)\s+the\s+SMA\s*50\s*\([^)]+\)\s+by\s+[+\-]?\d+\.\d+%"
+                r"\s*,?\s*(?:but|and)\s+"
+                r"(?:above|below)\s+the\s+SMA\s*200\s*\([^)]+\)\s+by\s+[+\-]?\d+\.\d+%",
+                (
+                    f"Price at {cur}{fs.price:.2f} is trading {pos50} the "
+                    f"SMA50 ({cur}{fs.sma50:.2f}) by {pct50:+.1f}%, but {pos} the "
+                    f"SMA200 ({cur}{fs.sma200:.2f}) by {pct:+.1f}%"
+                ),
+                audit, "pct_sma_trading", "rebuild_trading_below_above",
+            )
+
+            # Form E: standalone "-8.4% below SMA50" / "below SMA50 by -8.4%"
+            # echoes elsewhere in the body (risk/timing bullets). Fix only the
+            # SMA50 direction+magnitude token where it diverges from SSOT.
+            text = _swap_n(
+                text,
+                r"[+\-]?\d+\.\d+%\s+(?:above|below)\s+SMA\s*50\b",
+                f"{abs(pct50):.1f}% {pos50} SMA50",
+                audit, "pct_sma50_echo", "rebuild_sma50_echo",
+            )
+            text = _swap_n(
+                text,
+                r"(?:above|below)\s+SMA\s*50\s+by\s+[+\-]?\d+\.\d+%",
+                f"{pos50} SMA50 by {pct50:+.1f}%",
+                audit, "pct_sma50_echo", "rebuild_sma50_echo_by",
+            )
+
     # ── 5. Fair-Value math equation integrity check ─────────────────────
     text = _validate_fv_math(text, fs, audit)
 
@@ -440,6 +477,23 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
         audit.corrections.append(
             Correction("formatting", "malformed valuation string(s)",
                        "spaced", "valuation_string_fix")
+        )
+
+    # 13f. Duplicated currency symbol around a number, e.g. the fact-check
+    # row "| Live Price | د.إ3.33 د.إ |" (prefix currency + trailing currency
+    # for the same unit). Keep the leading currency+number, drop the trailing
+    # duplicate symbol. Only collapses when BOTH symbols are the same unit.
+    _before_dupcur = text
+    for _sym in ("د\\.إ", "﷼", "ج\\.م", "ر\\.ق", r"\$"):
+        # "<sym>NN.NN <sym>" → "<sym>NN.NN"
+        text = re.sub(rf"({_sym}\s*[\d,]+\.?\d*)\s+{_sym}(?=\s|\||$)", r"\1", text)
+        # "NN.NN <sym> <sym>" → "NN.NN <sym>"
+        text = re.sub(rf"([\d,]+\.?\d*\s*{_sym})\s+{_sym}(?=\s|\||$)", r"\1", text)
+    if text != _before_dupcur:
+        _polish += 1
+        audit.corrections.append(
+            Correction("formatting", "duplicated currency symbol(s)",
+                       "collapsed", "dup_currency_fix")
         )
 
     # 13d. Cap/qualify extreme theoretical valuation upside when forward data
