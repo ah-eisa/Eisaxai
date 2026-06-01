@@ -1349,6 +1349,19 @@ async def upload_portfolio(
                     )
                 _betas_v  = np.array([max(float(stock_info.get(t, {}).get("beta")), 0.01)
                                       for t in _opt_tickers])
+                # port_beta (set at fn top from port_beta_equity) may be None for
+                # GCC/crypto/commodity books where the upstream weighted-beta could
+                # not be computed. By here every _opt_ticker has a valid beta (via
+                # yfinance or the regression fallback above), so recompute the
+                # equity-sleeve portfolio beta from _betas_v as the weight-blend.
+                # This gives the optimizer section a real number for all downstream
+                # comparisons/formatting (was crashing at `if port_beta > 1.30`).
+                if not _beta_is_valid(port_beta):
+                    _ow = np.array([max(float(valid_weights.get(t, 0.0)), 0.0)
+                                    for t in _opt_tickers])
+                    _ows = _ow.sum()
+                    if _ows > 0:
+                        port_beta = float((_betas_v @ _ow) / _ows)
                 _MIN_W    = 0.01          # 1 % floor per holding
                 _PORT_V   = 100_000       # $100k reference for dollar amounts
 
@@ -1401,7 +1414,14 @@ async def upload_portfolio(
                             f"| Sector: **{_sec}** | ≤40% | {_sw*100:.1f}% |"
                             f" 🔴 −{_exc*100:.1f}pp | Reduce by ~${_exc*_PORT_V:,.0f} / add non-{_sec} |"
                         )
-                if port_beta > 1.30:
+                if not _beta_is_valid(port_beta):
+                    # Insufficient beta coverage — show the row as N/A instead of
+                    # raising on a None > float comparison (the report still ships).
+                    lines.append(
+                        "| Portfolio beta | ≤1.30 | N/A | ⚪ Insufficient beta"
+                        " coverage | Add holdings with available beta data |"
+                    )
+                elif port_beta > 1.30:
                     _has_breach = True
                     _exc = port_beta - 1.30
                     lines.append(
