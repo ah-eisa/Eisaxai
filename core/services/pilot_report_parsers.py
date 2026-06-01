@@ -373,11 +373,53 @@ def _market_beta_risk(fundamentals: dict[str, Any]) -> str:
 
 
 def _commodity_cycle_risk(report_text: str, fundamentals: dict[str, Any], risk_map: list[dict[str, Any]]) -> str:
+    """Commodity-cycle risk severity.
+
+    GATED BY SECTOR: commodity-cycle exposure is only a real risk axis for assets
+    structurally tied to a commodity (energy / materials / metals / mining / oil &
+    gas / utilities) or for commodity / crypto instruments. Pure technology,
+    financial, real-estate, consumer, healthcare, etc. names must NEVER be labelled
+    with commodity-cycle risk just because the macro narrative happens to mention
+    "oil"/"energy" (e.g. Iran-Hormuz, energy costs) or "cyclical" — that is
+    cross-asset context, not the company's own commodity exposure.
+    """
+    # ── Sector allow-list gate ───────────────────────────────────────────────
+    # Reliable sector signal: fundamentals.sector/industry if present, else the
+    # report top-card "**Sector:** X" line.
+    sector_blob = " ".join([
+        _clean_text(fundamentals.get("sector")),
+        _clean_text(fundamentals.get("industry")),
+    ]).lower()
+    if not sector_blob.strip():
+        _ms = re.search(r"\*\*sector:\*\*\s*([^\n|]+)", report_text or "", re.IGNORECASE)
+        if _ms:
+            sector_blob = _ms.group(1).strip().lower()
+
+    _COMMODITY_SECTORS = (
+        "energy", "commodit", "material", "metal", "mining", "oil", "gas",
+        "petroleum", "utilit",
+    )
+    _sector_is_commodity = any(tok in sector_blob for tok in _COMMODITY_SECTORS)
+
+    _atype = _clean_text(fundamentals.get("asset_type")).lower()
+    _sym = _clean_text(fundamentals.get("symbol") or fundamentals.get("ticker")).upper()
+    _is_commodity_asset = (
+        _atype in ("commodity", "crypto")
+        or _sym.endswith("=F")
+        or _sym.endswith("-USD")
+        or "cryptocurrency" in sector_blob
+        or "crypto" in sector_blob
+    )
+
+    if not (_sector_is_commodity or _is_commodity_asset):
+        # Off-thesis for this asset class — commodity-cycle risk is not applicable.
+        return "LOW"
+
+    # ── Within commodity-linked assets, grade severity from the risk map ─────
     blob = " ".join(
         [
             report_text or "",
-            _clean_text(fundamentals.get("sector")),
-            _clean_text(fundamentals.get("industry")),
+            sector_blob,
             " ".join(_clean_text(item.get("risk")) for item in risk_map),
         ]
     ).lower()
