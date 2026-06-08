@@ -229,6 +229,69 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
             f"Price at {cur}{fs.price:.2f} is {abs(pct):.1f}% {pos} SMA200 ({cur}{fs.sma200:.2f})",
             audit, "pct_sma200_solo", "rebuild_price_at_solo_sma200",
         )
+        # Form F: free-form narrative phrasings that say "the SMA200" outside the
+        # canonical "SMA200 (price)" structure — v4-flash mis-states direction
+        # AND magnitude in these. Rebuild the direction+magnitude from SSOT while
+        # preserving the trailing context. Covers, e.g.:
+        #   "0.9% above the SMA200 support of X" / "0.9% above the SMA200, a ..."
+        #   "0.9% above the SMA200 support — a break ..." / "above the SMA200 by N%".
+        # Idempotent: re-running on corrected text reproduces the same tokens.
+        text = _swap_n(
+            text,
+            r"[+\-]?\d+\.\d+%\s+(?:above|below)\s+the\s+SMA\s*200\b",
+            f"{abs(pct):.1f}% {pos} the SMA200",
+            audit, "pct_sma200_narr", "rebuild_pct_the_sma200",
+        )
+        text = _swap_n(
+            text,
+            r"(?:above|below)\s+the\s+SMA\s*200\s*(?:\([^)]*\))?\s+by\s+[+\-]?\d+\.\d+%",
+            f"{pos} the SMA200 by {pct:+.1f}%",
+            audit, "pct_sma200_narr", "rebuild_the_sma200_by",
+        )
+        # Form J: canonical solo phrasing "N% above/below SMA200 (<price>)" with no
+        # "the" and no "Price is…by" wrapper, e.g. "...but +0.9% above SMA200
+        # (د.إ3.41)". Rebuild the direction+magnitude from SSOT; preserve the
+        # parenthetical. Each report uses its OWN FactSheet pct, so a correct
+        # statement (NVDA "+8.9% above SMA200 ($188.57)") rebuilds to itself.
+        text = _swap_n(
+            text,
+            r"[+\-]?\d+\.\d+%\s+(?:above|below)(\s+SMA\s*200\s*\([^)]*\))",
+            rf"{abs(pct):.1f}% {pos}\g<1>",
+            audit, "pct_sma200_narr", "rebuild_pct_sma200_paren",
+        )
+        # Form H: reversed structure where the percentage trails the SMA200
+        # reference, e.g. "the SMA200 at 3.41 د.إ (current price +0.9% above)".
+        # Anchored on SMA200 (no parens/newline in the gap) so a neighbouring
+        # 52W-high "(+21% above)" in the same sentence is never touched.
+        text = _swap_n(
+            text,
+            r"(SMA\s*200[^()\n]{0,40}\(\s*(?:current\s+)?price\s+)[+\-]?\d+\.\d+%\s+(?:above|below)",
+            rf"\g<1>{abs(pct):.1f}% {pos}",
+            audit, "pct_sma200_narr", "rebuild_sma200_reversed_paren",
+        )
+        # Qualitative current-state direction (no magnitude): "price (is) above/
+        # below (the) SMA200". The connector set excludes conditional verbs
+        # (closes/breaks/falls/holds), so future-trigger phrasings are untouched.
+        text = _swap_n(
+            text,
+            r"(\bprice\s+(?:(?:is|currently|now|trading|just)\s+){0,2})(?:above|below)(\s+(?:the\s+)?SMA\s*200\b)",
+            rf"\g<1>{pos}\g<2>",
+            audit, "pct_sma200_narr", "rebuild_sma200_qualitative_dir",
+        )
+        # Form I: inverted framing — "(SMA200) is N% above/below current price"
+        # (the SMA stated relative to price). When the LLM mis-anchors SMA200 it
+        # produces e.g. "(SMA200) is only 0.9% below current price" even though
+        # price sits below the SMA. Rebuild from SSOT on a price basis: the SMA's
+        # direction is the inverse of price-vs-SMA, magnitude = |sma-price|/price.
+        _inv200_pos = "above" if pct < 0 else "below"
+        _inv200_mag = abs((fs.sma200 - fs.price) / fs.price * 100) if fs.price else abs(pct)
+        text = _swap_n(
+            text,
+            r"((?:the\s+)?SMA\s*200\s*\)?(?:\s*\([^)]*\))?\s+is\s+(?:only\s+|currently\s+|now\s+)?)"
+            r"[+\-]?\d+\.\d+%\s+(?:above|below)(\s+(?:the\s+)?(?:current\s+)?price\b|\s*[—–,;.)])",
+            rf"\g<1>{_inv200_mag:.1f}% {_inv200_pos}\g<2>",
+            audit, "pct_sma200_narr", "rebuild_sma200_inverted_vs_price",
+        )
         # Form C: "Price at X is Y% above SMA200 (V) and Z% below SMA50 (W)"
         if fs.sma50 and fs.price_vs_sma50_pct is not None:
             pct50 = fs.price_vs_sma50_pct
@@ -282,6 +345,59 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
                 r"(?:above|below)\s+SMA\s*50\s+by\s+[+\-]?\d+\.\d+%",
                 f"{pos50} SMA50 by {pct50:+.1f}%",
                 audit, "pct_sma50_echo", "rebuild_sma50_echo_by",
+            )
+
+            # Form G: SMA50 analogue of Form F — free-form "the SMA50" phrasings.
+            # Covers "well below the SMA50 (X) by -11.5%" (paren-then-by, missed by
+            # Form E), "N% above the SMA50", and "above the SMA50 by N%". The
+            # optional "well" qualifier is dropped so direction stays coherent.
+            text = _swap_n(
+                text,
+                r"[+\-]?\d+\.\d+%\s+(?:above|below)\s+the\s+SMA\s*50\b",
+                f"{abs(pct50):.1f}% {pos50} the SMA50",
+                audit, "pct_sma50_narr", "rebuild_pct_the_sma50",
+            )
+            text = _swap_n(
+                text,
+                r"(?:well\s+)?(?:above|below)\s+the\s+SMA\s*50\s*\([^)]*\)\s+by\s+[+\-]?\d+\.\d+%",
+                f"{pos50} the SMA50 ({cur}{fs.sma50:.2f}) by {pct50:+.1f}%",
+                audit, "pct_sma50_narr", "rebuild_the_sma50_paren_by",
+            )
+            text = _swap_n(
+                text,
+                r"(?:well\s+)?(?:above|below)\s+the\s+SMA\s*50\s+by\s+[+\-]?\d+\.\d+%",
+                f"{pos50} the SMA50 by {pct50:+.1f}%",
+                audit, "pct_sma50_narr", "rebuild_the_sma50_by",
+            )
+            # Form J: canonical solo "N% above/below SMA50 (<price>)" (no "the").
+            text = _swap_n(
+                text,
+                r"[+\-]?\d+\.\d+%\s+(?:above|below)(\s+SMA\s*50\s*\([^)]*\))",
+                rf"{abs(pct50):.1f}% {pos50}\g<1>",
+                audit, "pct_sma50_narr", "rebuild_pct_sma50_paren",
+            )
+            # Form H + qualitative direction for SMA50 (mirror of the SMA200 set).
+            text = _swap_n(
+                text,
+                r"(SMA\s*50[^()\n]{0,40}\(\s*(?:current\s+)?price\s+)[+\-]?\d+\.\d+%\s+(?:above|below)",
+                rf"\g<1>{abs(pct50):.1f}% {pos50}",
+                audit, "pct_sma50_narr", "rebuild_sma50_reversed_paren",
+            )
+            text = _swap_n(
+                text,
+                r"(\bprice\s+(?:(?:is|currently|now|trading|just)\s+){0,2})(?:above|below)(\s+(?:the\s+)?SMA\s*50\b)",
+                rf"\g<1>{pos50}\g<2>",
+                audit, "pct_sma50_narr", "rebuild_sma50_qualitative_dir",
+            )
+            # Form I: inverted framing for SMA50 — "(SMA50) is N% above/below price".
+            _inv50_pos = "above" if pct50 < 0 else "below"
+            _inv50_mag = abs((fs.sma50 - fs.price) / fs.price * 100) if fs.price else abs(pct50)
+            text = _swap_n(
+                text,
+                r"((?:the\s+)?SMA\s*50\s*\)?(?:\s*\([^)]*\))?\s+is\s+(?:only\s+|currently\s+|now\s+)?)"
+                r"[+\-]?\d+\.\d+%\s+(?:above|below)(\s+(?:the\s+)?(?:current\s+)?price\b|\s*[—–,;.)])",
+                rf"\g<1>{_inv50_mag:.1f}% {_inv50_pos}\g<2>",
+                audit, "pct_sma50_narr", "rebuild_sma50_inverted_vs_price",
             )
 
     # ── 5. Fair-Value math equation integrity check ─────────────────────
@@ -542,6 +658,35 @@ def reconcile_report(text: str, fs: FactSheet) -> tuple[str, ReconciliationAudit
                 Correction("sector_label", f"{_re_n} financial-sector wording leak(s) on RE report",
                            "rewritten to real-estate", "re_sector_wording_fix")
             )
+
+    # ── 14. Action/Timing vs Entry-Timing-WAIT consistency ──────────────
+    # When the body's authoritative entry-timing reads WAIT, the Layer-1
+    # Quick View must not present an "execute now" stance. The scorecard
+    # ADX/RSI fallback occasionally derives a BUY-NOW taxonomy (→ Timing:
+    # Attractive / Action: Scale In) that contradicts an "Entry Timing: WAIT"
+    # line elsewhere in the body. Align the Quick-View axes to the WAIT
+    # signal (Action→Wait, Timing→Extended). Deterministic + idempotent.
+    if re.search(r"Entry\s+Timing\b[^\n]{0,16}\bWAIT\b", text, re.IGNORECASE):
+        text = _swap_n(
+            text,
+            r"\*\*Action(?:\s*\(Timing\))?:\*\*\s*Scale\s+In\b",
+            "**Action (Timing):** Wait",
+            audit, "action_timing", "scalein_to_wait_on_entry_wait",
+        )
+        text = _swap_n(
+            text,
+            r"(\*\*Timing:\*\*\s*)Attractive\b",
+            r"\g<1>Extended",
+            audit, "action_timing", "attractive_to_extended_on_entry_wait",
+        )
+        # Compact one-line header variant: "... | Timing: **Attractive** | ..."
+        # (bold on the value, not the label).
+        text = _swap_n(
+            text,
+            r"(\bTiming:\s*)\*\*Attractive\*\*",
+            r"\g<1>**Extended**",
+            audit, "action_timing", "attractive_bold_to_extended_on_entry_wait",
+        )
 
     logger.info(
         "[Reconciler] %s subtype=%s %s",

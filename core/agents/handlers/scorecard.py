@@ -106,10 +106,16 @@ class ScorecardMixin:
                 "> الهدف من هذا الإطار هو دعم القرار وليس إصدار أوامر تنفيذية مباشرة."
             )
 
+        # Canonicalize conviction → Evidence Strength
+        try:
+            from core.services.decision_policy import canonical_evidence as _ev
+            _evidence_label = _ev(conviction)
+        except Exception:
+            _evidence_label = conviction
         return (
             "\n\n---\n"
             "## Decision Framework (Advisory Layer)\n"
-            f"- **Verdict Confidence:** {confidence}% (Conviction: {conviction})\n"
+            f"- **Calibration:** {confidence}% · **Evidence Strength:** {_evidence_label}\n"
             f"{_conviction_note_line}"
             "- **Time Horizon:** Tactical 1-3 months | Strategic 12-36 months\n"
             f"- **No-Action Case:** {no_action_en}\n"
@@ -428,6 +434,32 @@ class ScorecardMixin:
             # ── English timing preserved before Arabic translation ─────────────
             _entry_timing_en = _entry_timing  # always English; needed for decision logic
 
+            # ── Canonical taxonomy (Verdict / Timing / Evidence) ───────────────
+            # Used by Score Card headlines below — produces the 4-axis labels.
+            try:
+                from core.services.decision_policy import (
+                    canonical_verdict, canonical_timing, canonical_evidence,
+                )
+                # Extract just the canonical timing keyword from the verbose _entry_timing string
+                _entry_timing_upper = (_entry_timing_en or "").upper()
+                if "BUY NOW" in _entry_timing_upper:
+                    _timing_raw = "BUY NOW"
+                elif "REDUCE" in _entry_timing_upper:
+                    _timing_raw = "EXTENDED"
+                elif "WAIT" in _entry_timing_upper:
+                    _timing_raw = "WAIT"
+                elif "ADD ON DIP" in _entry_timing_upper or "ACCUMULATE" in _entry_timing_upper:
+                    _timing_raw = "NEUTRAL"
+                else:
+                    _timing_raw = _entry_timing_en or "NEUTRAL"
+                _taxonomy_verdict  = canonical_verdict(verdict_sc)
+                _taxonomy_timing   = canonical_timing(_timing_raw)
+                _taxonomy_evidence = canonical_evidence(conviction)
+            except Exception:
+                _taxonomy_verdict, _taxonomy_timing, _taxonomy_evidence = (
+                    verdict_sc, _entry_timing_en, conviction
+                )
+
             # Arabic timing labels (user-facing Quick View only; English kept in prompt)
             # _is_arabic_request lives in _handle_analytics scope — guard against NameError here
             _is_ar_sc = False
@@ -447,13 +479,49 @@ class ScorecardMixin:
                 _entry_timing = _TIMING_AR.get(_entry_timing, _entry_timing)
 
             # ── Persist decision data for _handle_analytics (no regex needed) ──
+            # Canonical 4-axis taxonomy + risk bucket — single source of truth for all Layer 1 renders.
+            try:
+                from core.services.decision_policy import (
+                    canonical_verdict as _cv_dp,
+                    canonical_timing  as _ct_dp,
+                    canonical_evidence as _ce_dp,
+                    canonical_execution as _cx_dp,
+                )
+                _tax_verdict   = _cv_dp(verdict_sc)
+                _tax_timing    = _ct_dp(_taxonomy_timing if '_taxonomy_timing' in dir() else _entry_timing_en)
+                _tax_evidence  = _ce_dp(conviction)
+                _tax_execution = _cx_dp(_tax_verdict, _tax_timing)
+            except Exception:
+                _tax_verdict, _tax_timing, _tax_evidence, _tax_execution = verdict_sc, _entry_timing_en, conviction, "Hold Steady"
+
+            # Risk bucket: derived from beta + RSI + drawdown + coverage
+            try:
+                _risk_beta = float(sc_data.get('beta') or 1.0)
+                _risk_rsi  = float((summary or {}).get('rsi') or 50)
+                _risk_dd   = abs(float((summary or {}).get('max_drawdown') or 0))
+                _risk_score = 0
+                if _risk_beta >= 1.5:  _risk_score += 2
+                elif _risk_beta >= 1.1: _risk_score += 1
+                if _risk_rsi >= 75:   _risk_score += 2
+                elif _risk_rsi >= 65: _risk_score += 1
+                if _risk_dd >= 0.30:  _risk_score += 1
+                _risk_label = "High" if _risk_score >= 3 else "Moderate" if _risk_score >= 1 else "Low"
+            except Exception:
+                _risk_label = "Moderate"
+
             self._last_scorecard_decision = {
-                'verdict':     verdict_sc,
-                'timing_en':   _entry_timing_en,   # English; used for WAIT/BUY logic
-                'timing':      _entry_timing,       # Display form (may be translated)
+                'verdict':     verdict_sc,            # legacy raw value (BUY/HOLD/ACCUMULATE/REDUCE/SELL)
+                'timing_en':   _entry_timing_en,
+                'timing':      _entry_timing,
                 'score':       final,
-                'conviction':  conviction,
+                'conviction':  conviction,            # legacy raw (Low/Medium/High)
                 'emoji':       emoji,
+                # ── Canonical taxonomy (4-axis) ─────────────────────────────────
+                'tax_verdict':   _tax_verdict,        # Buy / Hold / Reduce / Sell
+                'tax_timing':    _tax_timing,         # Attractive / Neutral / Extended
+                'tax_evidence':  _tax_evidence,       # Limited / Moderate / Strong
+                'tax_execution': _tax_execution,      # Scale In / Wait / Reduce Exposure / Hold Steady
+                'tax_risk':      _risk_label,         # High / Moderate / Low
             }
 
             if _is_crypto_t:
@@ -491,7 +559,7 @@ class ScorecardMixin:
 ---
 
 ## 🎯 EisaX Crypto Score Card
-**{target}** | Fundamental: **{verdict_display} {emoji}** | Timing: **{_entry_timing}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
+**{target}** | Verdict: **{_taxonomy_verdict} {emoji}** | Timing: **{_taxonomy_timing}** | Evidence: **{_taxonomy_evidence}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
 
 *Crypto-specific scoring: Network Dominance, SMA200 Valuation, ATH Recovery, On-Chain Metrics*
 
@@ -528,7 +596,7 @@ class ScorecardMixin:
 ---
 
 ## 🎯 EisaX Proprietary Score Card
-**{target}** | Fundamental: **{verdict_display} {emoji}** | Timing: **{_entry_timing}** | Conviction: **{conviction}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
+**{target}** | Verdict: **{_taxonomy_verdict} {emoji}** | Timing: **{_taxonomy_timing}** | Evidence: **{_taxonomy_evidence}** | EisaX Score: **{final}/100** | Blended: **{sc_data.get('blended_score', final)}/100**
 
 *Conviction driven by: {", ".join(filter(None, [
     # Upside — only show as positive driver when conviction is Medium/High (final >= 60)
@@ -592,6 +660,10 @@ class ScorecardMixin:
                     bar = "█" * filled + "░" * (10 - filled)
                     f_emoji = "🔴" if pct >= 65 else ("🟡" if pct >= 35 else "🟢")
                     sc_md += f"\n| {fname} | {pct}% Risk | {f_emoji} `{bar}` |"
+                elif fname == "Analyst Sentiment" and sc_data.get('_analyst_na'):
+                    # No real Wall Street coverage → show N/A rather than a 0%
+                    # bar that reads like a bearish analyst signal.
+                    sc_md += f"\n| {fname} | N/A | ⚪ `░░░░░░░░░░` |"
                 else:
                     pct = int((val / max_v) * 100)
                     filled = int((val / max_v) * 10)
@@ -872,6 +944,40 @@ class ScorecardMixin:
             _fg_row = (f"| Fear & Greed | — | {_fg_emoji} {int(_fg_score)} — {_fg_rating} | ➕ |\n"
                        if _fg_score is not None else "")
 
+            # Source label — reflects EisaX routing policy:
+            # GCC/MENA equities: TradingView pipeline cache is authoritative
+            # Commodities (=F): TradingView commodities snapshot
+            # US equities: TradingView US snapshot, yfinance for analyst/forward fields
+            # Crypto (-USD): yfinance/CoinGecko
+            _t_up_src = str(ticker).upper()
+            _is_gcc_src = _t_up_src.endswith(
+                (".AE", ".DU", ".SR", ".CA", ".KW", ".QA", ".BH", ".MA", ".TN")
+            )
+            _is_comm_src = _t_up_src.endswith("=F")
+            _is_crypto_src = _t_up_src.endswith(("-USD", "-USDT"))
+            if _is_gcc_src:
+                _source_label = (
+                    "*Source: **TradingView Live Cache** (price · P/E TTM · market cap · "
+                    "div yield · technicals — authoritative for GCC) · "
+                    "StockAnalysis (forward P/E · growth) · CNN Fear & Greed*"
+                )
+            elif _is_comm_src:
+                _source_label = (
+                    "*Source: **TradingView Live Cache** (commodities snapshot — "
+                    "price · technicals) · CNN Fear & Greed*"
+                )
+            elif _is_crypto_src:
+                _source_label = (
+                    "*Source: Yahoo Finance + CoinGecko (market cap) + "
+                    "CNN Fear & Greed — live at time of query*"
+                )
+            else:
+                _source_label = (
+                    "*Source: **TradingView Live Cache** (price · P/E TTM · market cap · "
+                    "div yield · technicals) · Yahoo Finance (forward P/E · analyst · "
+                    "growth · earnings date) · StockAnalysis · CNN Fear & Greed*"
+                )
+
             return f"""\n\n---
 🔍 **FACT-CHECK** *(Verified {_today})*
 
@@ -885,7 +991,7 @@ class ScorecardMixin:
 | 52W Range | — | {_range_live} | ➕ |
 {_fg_row}📅 **Next Earnings:** {_earnings_live}{_earnings_flag}
 
-*Source: Yahoo Finance + StockAnalysis + CNN Fear&Greed — live at time of query*"""
+{_source_label}"""
         except Exception as e:
             logger.error(f"[FactCheck] build failed: {e}")
             return ""

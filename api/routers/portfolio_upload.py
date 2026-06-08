@@ -652,6 +652,16 @@ async def upload_portfolio(
             if stock_info.get(t, {}).get("sector", "").lower() in
                ["technology", "communication services", "consumer cyclical"]
         )
+        # Display-only: TRUE Technology-sector weight. The broad `tech_weight`
+        # above is the high-beta GROWTH sleeve (incl. consumer-cyclical names
+        # like TSLA and communication names) used for crisis-amplification math.
+        # User-facing "Technology weight" labels must reflect the actual sector,
+        # not lump Consumer Cyclical into "Technology".
+        tech_weight_strict = sum(
+            valid_weights.get(t, 0)
+            for t in valid_tickers
+            if stock_info.get(t, {}).get("sector", "").strip().lower() == "technology"
+        )
         scenario_lines = []
         for label, spx_ret, tech_mult, note in _CRISIS_SCENARIOS:
             # Blend: non-tech portion tracks beta linearly; tech amplified by sector mult
@@ -1146,7 +1156,9 @@ async def upload_portfolio(
         lines.append("### Correlation & Diversification")
         lines.append(corr_matrix_str)
         lines.append("")
-        eff_n_label = "🔴 Low" if eff_n < 1.5 else "🟡 Moderate" if eff_n < 2.5 else "🟢 Good"
+        # Align with the institutional diversification floor (Effective N ≥ 5):
+        # "Good" must not appear below the floor that the audit appendix enforces.
+        eff_n_label = "🔴 Low" if eff_n < 3 else "🟡 Moderate" if eff_n < 5 else "🟢 Good"
         avg_corr_label = "🔴 High" if avg_corr > 0.60 else "🟡 Moderate" if avg_corr > 0.35 else "🟢 Low"
         lines.append(f"| Metric | Value | Interpretation |")
         lines.append(f"|--------|-------|----------------|")
@@ -1171,8 +1183,9 @@ async def upload_portfolio(
         lines.append("|----------|------------|----------------|-------|")
         for sl in scenario_lines:
             lines.append(sl)
-        lines.append(f"\n> **Tech Weight:** {tech_weight*100:.0f}% of equity. "
-                     f"In risk-off events, tech typically amplifies market moves by 1.2–1.8×. "
+        lines.append(f"\n> **Tech Weight:** {tech_weight_strict*100:.0f}% of equity in Technology. "
+                     f"In risk-off events, high-beta growth (Technology + Consumer-Cyclical + Communications — "
+                     f"{tech_weight*100:.0f}% combined) typically amplifies market moves by 1.2–1.8×. "
                      f"{'Linear beta alone (equity β=' + _fmt_beta(port_beta_equity) + ') understates true drawdown risk.' if _has_beta_equity else 'Equity beta unavailable (N/A) — avoid beta-based inference until data coverage improves.'}")
 
         # ── EisaX Risk Assessment ─────────────────────────────────────────
@@ -1980,9 +1993,9 @@ CRITICAL:
             lines.append(
                 f"**Risk Profile: {_risk_label}** — total β={_fmt_beta(port_beta_total)} (equity β={_fmt_beta(port_beta_equity)}), CVaR={cvar_95:.2f}%/day, "
                 f"Sharpe={sharpe:.2f}, Effective N={eff_n:.1f} independent bets. "
-                f"Portfolio is {int(tech_weight*100)}% Technology with {_top_holding} as lead position ({_top_w:.0f}%). "
+                f"Portfolio is {int(tech_weight_strict*100)}% Technology with {_top_holding} as lead position ({_top_w:.0f}%). "
                 + ("Concentration risk is the primary concern — reduce single-sector exposure and add uncorrelated assets (TLT, GLD, BRK-B) to improve Effective N toward ≥4."
-                   if tech_weight > 0.6 else
+                   if tech_weight_strict > 0.6 else
                    "Risk profile is within institutional bounds. Monitor rolling Sharpe for momentum deterioration.")
             )
 
