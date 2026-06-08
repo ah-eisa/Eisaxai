@@ -1448,6 +1448,28 @@ class AnalyticsMixin:
             except Exception:
                 summary[_sk] = _sd
 
+        # ── SSOT SMA dedup (prevents PRE-COMPUTED vs GROUND-TRUTH conflict) ───
+        # The prompt's PRE-COMPUTED block derives price-vs-SMA from
+        # summary['sma_50'/'sma_200'], while the pre-grounding GROUND TRUTH block
+        # uses the FactSheet's TradingView SMA. When these disagree (e.g. ADNOCGAS
+        # summary SMA200=3.25 vs TV 3.41) the model sees two conflicting numbers,
+        # anchors to the stale one, and inverts price-vs-SMA direction (and can
+        # leak its reasoning). `fund` already holds the TV-authoritative SMA
+        # (injected from the market cache, the same SSOT the FactSheet uses), so
+        # align summary to it before any pre-compute. Only fires when fund carries
+        # a TradingView-authoritative SMA, or to fill a missing summary value.
+        _tv_authoritative = "tradingview" in str(fund.get("data_source", "")).lower()
+        for _ssk, _fk in (("sma_50", "sma50"), ("sma_200", "sma200")):
+            try:
+                _tv_sma = float(fund.get(_fk) or 0)
+            except (TypeError, ValueError):
+                _tv_sma = 0.0
+            _cur_sma = float(summary.get(_ssk) or 0)
+            if _tv_sma > 0 and (_tv_authoritative or _cur_sma <= 0) and abs(_tv_sma - _cur_sma) > 1e-6:
+                logger.info("[SSOT-SMA] %s: summary['%s'] %s → TV-authoritative %.4f",
+                            target, _ssk, summary.get(_ssk), _tv_sma)
+                summary[_ssk] = _tv_sma
+
         # ── Sanitize fund dict: replace NaN/inf in numeric fields ──────────────
         import math as _math_fund
         _FUND_NUMERIC_FIELDS = ["pe_ratio", "eps", "revenue_growth", "roe", "roic",
@@ -3168,6 +3190,36 @@ Skip sections 3,4,5,6,8,9. Total response: max 400 words. Be direct and actionab
                     r'(\*\*DATE:\*\*\s*)(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+20\d{2}',
                     r'\g<1>' + correct_date, deepseek_reply
                 )
+                # ── Reasoning-leak scrub (defense-in-depth) ──────────────────
+                # v4-flash occasionally leaks internal chain-of-thought into the
+                # body (e.g. when prompt blocks disagreed: "Let me re-read…",
+                # "The pre-computed says…", "Which to use?"). The PGD SMA dedup
+                # removes the conflict that triggers it; this strips any residual
+                # meta-reasoning. Conservative: only drops plain deliberation
+                # lines — never headings, tables, or bold-label bullets.
+                if deepseek_reply:
+                    _LEAK_TERMS = _re.compile(
+                        r'(?i)(pre-?computed|GROUND\s+TRUTH|LIVE\s+TECHNICAL\s+FACTS|'
+                        r'data\s+block|use\s+these\s+exact|copy\s+these\s+numbers|'
+                        r'do\s+not\s+contradict|the\s+instruction\s+says|from\s+a\s+different\s+feed)'
+                    )
+                    _DELIB = _re.compile(
+                        r'(?i)^\s*(wait[,\.]|let me (re-?read|reconsider|re-?examine|check|think|pick)|'
+                        r'conflict\s+resolved|which\s+to\s+use|this\s+is\s+a\s+contradiction|'
+                        r"i\s+will\s+(use|follow|note)|i'?ll\s+(use|follow|note)|"
+                        r'no,?\s+better\s+to|the\s+memo\s+must\s+be|so\s+sma\s*\d+\s*=)'
+                    )
+                    _kept, _dropped = [], 0
+                    for _ln in deepseek_reply.split('\n'):
+                        _s = _ln.lstrip()
+                        _structural = _s.startswith('#') or _s.startswith('|') or bool(_re.match(r'^[-*]\s+\*\*', _s))
+                        if not _structural and (_LEAK_TERMS.search(_ln) or _DELIB.match(_ln)):
+                            _dropped += 1
+                            continue
+                        _kept.append(_ln)
+                    if _dropped:
+                        deepseek_reply = '\n'.join(_kept)
+                        logger.info("[ReasoningLeak] %s: stripped %d leaked CoT line(s)", target, _dropped)
                 if deepseek_reply:
                     deepseek_reply = apply_language_locks(
                         deepseek_reply,
