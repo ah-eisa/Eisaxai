@@ -10,6 +10,7 @@ Streamlit entry points are skipped at stage 2 (they'd launch a server).
 """
 import sys
 import os
+import re
 import py_compile
 import subprocess
 
@@ -52,6 +53,27 @@ def resolve_module(filepath: str):
         return None          # skip — Streamlit entry point
     return IMPORTABLE.get(r) # None = unknown file, still run syntax check only
 
+def scan_silent_excepts(filepath: str):
+    """Advisory (non-blocking): flag `except ...: pass` — swallowed errors.
+
+    The 429-storm bug (summarizer hammering a dead quota silently) was exactly
+    this pattern. Nudge the author to log when the except wraps an external call.
+    """
+    try:
+        with open(filepath, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except Exception:
+        return
+    hits = [
+        i + 1                                 # 1-based line of the `except`
+        for i in range(len(lines) - 1)
+        if re.match(r"^\s*except\b.*:\s*$", lines[i])
+        and re.match(r"^\s*pass\s*$", lines[i + 1])
+    ]
+    if hits:
+        print(f"⚠ Silent excepts  : {os.path.basename(filepath)} — `except: pass` at "
+              f"line(s) {hits} — log the error if it wraps an external/LLM/DB call")
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if len(sys.argv) < 2:
@@ -72,6 +94,9 @@ def main():
     except py_compile.PyCompileError as exc:
         print(f"✗ SYNTAX ERROR    : {exc}")
         sys.exit(1)
+
+    # ── Stage 3 (advisory, non-blocking): silent except: pass ─────────────────
+    scan_silent_excepts(filepath)
 
     # ── Stage 2: import smoke test ────────────────────────────────────────────
     module = resolve_module(filepath)

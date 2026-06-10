@@ -476,8 +476,8 @@ def _stockanalysis_uae(ticker: str) -> dict:
         df = get_stock_data(ticker, "AE", period="1m")
         if df is not None and not df.empty:
             result["price"] = round(float(df["Close"].iloc[-1]), 3)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[realtime_data] AE price fetch failed for %s: %s", ticker, e)
 
     # ── Market Cap & Shares ──────────────────────────────────────
     mc_raw = _rx(r'marketCap[\"\':\s]+([0-9.e+\-]+)')
@@ -861,8 +861,8 @@ def deepcrawl_stock(ticker: str) -> dict:
                         for k, v in ctx.items():
                             if k not in sa_data or not sa_data[k]:
                                 sa_data[k] = v
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("[realtime_data] DFM context enrichment failed for %s: %s", ticker, e)
                 return sa_data
             # Fallback: dfm_lookup only
             try:

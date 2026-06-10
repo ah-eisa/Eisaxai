@@ -801,8 +801,8 @@ def _get_fx_rate(currency: str) -> Optional[float]:
         )
         if resp.status_code == 200:
             return resp.json().get("rates", {}).get(currency)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[fi_fetchers] FX rate fetch failed for %s: %s", currency, e)
     return None
 
 
