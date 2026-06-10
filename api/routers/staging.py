@@ -124,9 +124,13 @@ def _resolve_staging_access(request: Request) -> dict:
         if auth_user.lower() in _STAGING_ADMIN_USERS:
             return {"role": "admin", "username": auth_user, "demo": False, "method": "basic_auth"}
         return {"role": "guest", "username": auth_user, "demo": True, "method": "basic_auth"}
-    host = (request.headers.get("host") or "").lower()
+    # SECURITY: do NOT trust the Host header — it is fully client-controlled, so
+    # an external request can spoof `Host: 127.0.0.1` to claim admin. With
+    # forwarded_allow_ips="127.0.0.1" in the gunicorn config, uvicorn rewrites
+    # request.client.host to the real client IP, so a loopback peer here is a
+    # genuine same-host backend caller, not proxied external traffic.
     client_host = getattr(request.client, "host", "") if request.client else ""
-    if host.startswith(("127.0.0.1", "localhost")) or client_host in {"127.0.0.1", "::1", "localhost"}:
+    if client_host in {"127.0.0.1", "::1"}:
         return {"role": "admin", "username": "internal", "demo": False, "method": "internal"}
     return {"role": "guest", "username": "public-demo", "demo": True, "method": "public"}
 

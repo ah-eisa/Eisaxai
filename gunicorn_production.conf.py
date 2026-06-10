@@ -40,6 +40,13 @@ graceful_timeout = 30
 keepalive = 5
 worker_tmp_dir = "/dev/shm"    # avoids inotify/filesystem heartbeat issues on ARM64
 
+# ── Proxy trust ───────────────────────────────────────────────────────────────
+# Trust X-Forwarded-* ONLY from the local nginx peer. With this set, uvicorn
+# rewrites request.client.host to the real client IP, so app-layer logic that
+# checks for a loopback peer (e.g. _resolve_staging_access) cannot be fooled by
+# external traffic. Without it, every proxied request would look like 127.0.0.1.
+forwarded_allow_ips = "127.0.0.1"
+
 loglevel = "info"
 errorlog = "/home/ubuntu/investwise/logs/gunicorn_test_error.log"
 accesslog = "/home/ubuntu/investwise/logs/gunicorn_test_access.log"
