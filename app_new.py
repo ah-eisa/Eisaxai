@@ -71,8 +71,14 @@ try:
     from engine import start_scheduler as _start_news_scheduler
     _news_init_db()
     app.include_router(_news_router, prefix="/v1")
-    _start_news_scheduler()
-    logger.info("[NewsEngine] Router included at /v1/news — scheduler started")
+    # News collection is owned by the dedicated eisax-news.service. This app only
+    # serves the /v1/news API; collecting here too would duplicate scrape+summarize
+    # cycles against the shared news.db. Opt in with EISAX_GUNICORN_NEWS_SCHEDULER=1.
+    if os.getenv("EISAX_GUNICORN_NEWS_SCHEDULER", "0") == "1":
+        _start_news_scheduler()
+        logger.info("[NewsEngine] Router included at /v1/news — scheduler started (opt-in)")
+    else:
+        logger.info("[NewsEngine] Router included at /v1/news — collection delegated to eisax-news.service")
 except Exception as _ne:
     logger.warning("[NewsEngine] Failed to include router: %s", _ne)
 

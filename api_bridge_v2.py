@@ -145,12 +145,17 @@ try:
     # O_EXCL lock file; absent (default → "1") means single-worker setup.
     import logging as _lg
     _scheduler_owner = os.getenv("EISAX_SCHEDULER_OWNER", "1") == "1"
-    if _scheduler_owner:
+    # News collection is owned by the dedicated eisax-news.service. Gunicorn only
+    # serves the /v1/news API; it does NOT collect unless explicitly opted in via
+    # EISAX_GUNICORN_NEWS_SCHEDULER=1. This avoids 3-4x redundant scrape+summarize
+    # cycles (prod + staging + legacy app_new all wrote to the same news.db).
+    _gunicorn_collects = os.getenv("EISAX_GUNICORN_NEWS_SCHEDULER", "0") == "1"
+    if _scheduler_owner and _gunicorn_collects:
         _start_news_scheduler()
-        _lg.getLogger(__name__).info("[NewsEngine] Router included at /v1/news — scheduler started")
+        _lg.getLogger(__name__).info("[NewsEngine] Router included at /v1/news — scheduler started (gunicorn opt-in)")
     else:
         _lg.getLogger(__name__).info(
-            "[NewsEngine] Router included at /v1/news — scheduler skipped (worker is not owner)"
+            "[NewsEngine] Router included at /v1/news — collection delegated to eisax-news.service"
         )
 except Exception as _ne:
     import logging as _lg
