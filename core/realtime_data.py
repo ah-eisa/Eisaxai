@@ -969,11 +969,9 @@ def _deepcrawl_local_fallback(ticker: str) -> dict:
         # Price — prefer fast_info value (already fetched, no extra cost)
         price = _fi_price or info.get("regularMarketPrice") or info.get("currentPrice") or 0
         if price:
-            try:
-                from core.price_cache import set as _pc_set
-                _pc_set(ticker, float(price))
-            except Exception:
-                pass
+            # Never write price_cache from the yfinance fallback path.
+            # TV cache is the authoritative source across markets; a YF value
+            # cached here would override TV on subsequent reads within the TTL.
             result["price"] = float(price)
 
         # Market cap — prefer fast_info (avoids one .info dict lookup)

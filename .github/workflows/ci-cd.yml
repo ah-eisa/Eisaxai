@@ -1,0 +1,151 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════
+  # Stage 1 — Unit + Integration Tests (runs on the server via SSH)
+  # The full venv is already set up there; no heavyweight install needed.
+  # ══════════════════════════════════════════════════════════════════
+  unit-tests:
+    name: "🧪 pytest (220 tests)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Configure SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+      - name: Run pytest on server
+        id: pytest
+        shell: bash
+        run: |
+          set +e
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          HOST="ubuntu@129.151.148.2"
+
+          # Pull latest main, then run tests (ignore minicpm which needs ollama)
+          OUTPUT=$(ssh $SSH_OPTS "$HOST" "
+            set -e
+            cd /home/ubuntu/investwise
+            git pull origin main --ff-only 2>&1
+            source venv/bin/activate
+            python -m pytest tests/ -q \
+              --ignore=tests/test_minicpm_integration.py \
+              --tb=short \
+              --no-header \
+              2>&1
+          " 2>&1)
+
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+
+          # Extract summary line
+          SUMMARY=$(echo "$OUTPUT" | tail -3)
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          exit $EXIT_CODE
+
+  # ══════════════════════════════════════════════════════════════════
+  # Stage 2 — Deploy (graceful gunicorn reload)
+  # Only runs on push to main AND after tests pass.
+  # ══════════════════════════════════════════════════════════════════
+  deploy:
+    name: "🚀 Deploy (reload workers)"
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+
+    steps:
+      - name: Configure SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+      - name: Graceful reload gunicorn
+        shell: bash
+        run: |
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          HOST="ubuntu@129.151.148.2"
+
+          ssh $SSH_OPTS "$HOST" "
+            sudo systemctl reload eisax-gunicorn.service
+            sleep 3
+            echo 'Workers reloaded:'
+            systemctl status eisax-gunicorn.service --no-pager | grep -E 'Active:|├─|└─' | head -8
+          "
+
+  # ══════════════════════════════════════════════════════════════════
+  # Stage 3 — Smoke Tests (verify production is healthy after deploy)
+  # ══════════════════════════════════════════════════════════════════
+  smoke-test:
+    name: "🔥 Smoke Tests (production)"
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+
+    steps:
+      - name: Configure SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+      - name: Run smoke tests
+        id: smoke
+        shell: bash
+        run: |
+          set +e
+          SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+          HOST="ubuntu@129.151.148.2"
+
+          root_code="$(ssh $SSH_OPTS "$HOST" "curl -sk -o /dev/null -w '%{http_code}' https://ai.eisax.com/")"
+          login_code="$(ssh $SSH_OPTS "$HOST" "curl -sk -o /dev/null -w '%{http_code}' -X POST https://ai.eisax.com/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"wrong@example.com\",\"password\":\"wrong\"}'")"
+          health_status="$(ssh $SSH_OPTS "$HOST" "curl -sk https://localhost:8000/v1/health -H 'access-token: \${SECURE_TOKEN}' | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[\"status\"])' 2>/dev/null || echo unknown")"
+
+          failed=0
+          [ "$root_code"   != "200" ] && failed=1
+          [ "$login_code"  != "401" ] && failed=1
+          [ "$health_status" = "down" ] && failed=1
+
+          echo "root_code=$root_code"         >> "$GITHUB_OUTPUT"
+          echo "login_code=$login_code"        >> "$GITHUB_OUTPUT"
+          echo "health_status=$health_status"  >> "$GITHUB_OUTPUT"
+          echo "failed=$failed"                >> "$GITHUB_OUTPUT"
+
+          echo "Root: $root_code | Login(wrong): $login_code | Health: $health_status"
+
+      - name: Telegram alert on failure
+        if: steps.smoke.outputs.failed == '1'
+        shell: bash
+        run: |
+          msg="❌ EisaX smoke test FAILED%0APush: ${{ github.sha }}%0ARoot: ${{ steps.smoke.outputs.root_code }}%0ALogin: ${{ steps.smoke.outputs.login_code }}%0AHealth: ${{ steps.smoke.outputs.health_status }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=933252341" \
+            -d "text=$msg" > /dev/null
+
+      - name: Telegram success notification
+        if: steps.smoke.outputs.failed == '0'
+        shell: bash
+        run: |
+          short_sha="${{ github.sha }}"
+          msg="✅ EisaX deployed successfully%0ASHA: ${short_sha:0:7}%0AHealth: ${{ steps.smoke.outputs.health_status }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=933252341" \
+            -d "text=$msg" > /dev/null
+
+      - name: Fail workflow if smoke tests failed
+        if: steps.smoke.outputs.failed == '1'
+        run: exit 1

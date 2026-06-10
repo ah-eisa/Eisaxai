@@ -29,6 +29,68 @@ DB = str(BASE_DIR / "analysis_cache.db")
 L1_TTL_SECONDS = 5 * 60
 L2_TTL_SECONDS = 30 * 60
 L3_TTL_SECONDS = 60 * 60
+
+# Bump CACHE_VERSION whenever a code change should invalidate all prior
+# cached reports — data-source routing changes, prompt rewrites, scoring
+# logic changes, etc. The version is folded into the cache key so old
+# entries become unreachable without manual DB purge.
+#   v2 — 2026-05-26: TradingView unified as authoritative source for
+#                    GCC/US/commodities; bumped to evict pre-fix entries
+#                    that still contained StockAnalysis 4.05 / 5.23 / 16.9
+#                    for ADNOCGAS.AE.
+#   v3 — 2026-05-27: Phase-4 phrase repair (Sell chasing → avoid chasing)
+#                    + static-sequence flag landed; evict v2 entries that
+#                    cached the broken LLM paraphrase.
+#   v4 — 2026-05-27: Institutional polish — strip LLM reasoning leaks
+#                    "(pre-computed, exact copy)", FV/Scenario disambiguation
+#                    footnote, "Wait/Hmm/Let me think" preamble stripper.
+#   v5 — 2026-05-27: Broaden reasoning-leak regex to cover "(pre-computed
+#                    scenarios)", "(pre-computed, exact values)" and any
+#                    parenthetical containing the phrase.
+#   v6 — 2026-05-27: Final institutional blockers — FV math claim repair,
+#                    SMA200 injected into S/R ladder, irrelevant news
+#                    filtered out, "No formal analyst coverage" reworded,
+#                    orphan "refer to EisaX Score" position-sizing pointer
+#                    stripped.
+#   v7 — 2026-05-27: Broadened FV math regex (handles "Forward EPS 0.20
+#                    د.إ × 17x sector P/E" — period inside class), analyst
+#                    wording variants ("found"/"available"/"reported"),
+#                    FV/Scenario footnote detector accepts plain
+#                    "Valuation Range:" header without "Table".
+#   v8 — 2026-05-27: SMA200 ladder injection now falls back to TradingView
+#                    pipeline cache when LLM doesn't mention SMA200 in
+#                    body. Analyst phrase accepts "was found" / "was
+#                    available" / "was provided" variants.
+#   v9 — 2026-05-27: Sector classification override layer — Gulf real-estate
+#                    developers (EMAAR/ALDAR/DAMAC/etc.) tagged as Finance
+#                    upstream are now rewritten to "Real Estate / Real Estate
+#                    Development"; bank peer table is replaced with a curated
+#                    real-estate peer set; oil/commodity risk boilerplate is
+#                    replaced with a real-estate risk taxonomy; fact-check
+#                    Live Price row forced to local currency.
+#   v10 — 2026-05-27: Bugfix on v9 — peer-table substitution regex now
+#                    handles blank line between heading and table, and
+#                    risk-taxonomy injection accepts H2 ("## 4. Key
+#                    Risks") not just H3.
+#   v11 — 2026-05-27: Real-estate cleanup hardening — bank-peer narrative
+#                    paragraph in Section 6 (vs EMIRATESNBD / FAB / ...)
+#                    is now replaced with a neutral note; lingering Brent
+#                    crude / OPEC sentences stripped from real-estate
+#                    reports; AR language detector tightened to explicit
+#                    Arabic headings only.
+#   v12 — 2026-05-27: Bank-peer narrative scrub now accepts markdown-bold
+#                    opener ("vs **FAB (ADX:FAB):**"); RE risk taxonomy
+#                    injection no longer gated on commodity boilerplate
+#                    presence so it always fires for real-estate tickers.
+#   v13 — 2026-05-27: Bank-peer scrub also accepts leading bold BEFORE
+#                    the "vs" token ("**vs EMIRATESNBD ..."), not just
+#                    around the ticker.
+#   v14 — 2026-05-27: Section 6 secondary sweep — any sentence in the
+#                    Peer Comparison body that still mentions a bank
+#                    ticker by name is now dropped, catching stray
+#                    comparison clauses the primary "vs <bank>" scrub
+#                    missed.
+CACHE_VERSION = 14
 TIMESTAMP_BUCKET_SECONDS = 5 * 60
 
 _L3_TABLE = "analysis_cache_entries"
@@ -50,7 +112,10 @@ class CacheKey:
 
     @property
     def global_key(self) -> str:
-        return f"{self.ticker}:{self.analysis_type}:{self.timestamp_bucket}"
+        # CACHE_VERSION is part of the key so code changes that affect report
+        # content (e.g. data-source routing) can invalidate all prior entries
+        # by bumping the version — no manual cache purge needed.
+        return f"v{CACHE_VERSION}:{self.ticker}:{self.analysis_type}:{self.timestamp_bucket}"
 
     @property
     def user_key(self) -> str | None:

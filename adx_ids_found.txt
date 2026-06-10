@@ -1,0 +1,6 @@
+ADX Investing.com IDs — Deep Crawl Results
+============================================================
+
+# Add to UAE_INVESTING in market_data_engine.py:
+
+# Not found: ['ADNOCDIST.AE', 'ADNOCGAS.AE', 'ADNOCDRILL.AE', 'IHC.AE', 'ADIB.AE', 'ADCB.AE', 'EAND.AE', 'ALPHADHABI.AE', 'FERTIGLOBE.AE', 'NMDC.AE', 'DANA.AE', 'RAKBANK.AE', 'AGTHIA.AE', 'WAHA.AE']

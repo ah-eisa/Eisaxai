@@ -78,6 +78,7 @@ COMMODITIES = {
 # Fields to pull from TradingView for every equity/crypto market
 TV_FIELDS = [
     "name", "close", "change", "volume", "market_cap_basic",
+    "Perf.5D",
     "price_earnings_ttm", "dividend_yield_recent",
     "earnings_per_share_diluted_ttm", "sector",
     "RSI", "MACD.macd", "MACD.signal",

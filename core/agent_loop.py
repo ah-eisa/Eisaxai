@@ -121,7 +121,7 @@ async def run_agent(
             iterations += 1
             # ── Call DeepSeek with tools ──────────────────────────────────────
             payload = {
-                "model":       "deepseek-chat",
+                "model":       "deepseek-v4-flash",
                 "messages":    messages,
                 "tools":       TOOLS_SCHEMA,
                 "tool_choice": "auto",
@@ -136,7 +136,7 @@ async def run_agent(
                     "reply": "عذراً، خدمة التحليل غير متاحة حالياً. حاول مرة أخرى.",
                     "tools_used": tools_used,
                     "iterations": iterations,
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
                 }
 
             choice  = data["choices"][0]

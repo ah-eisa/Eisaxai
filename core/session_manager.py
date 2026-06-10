@@ -138,7 +138,8 @@ class SessionManager:
     def get_or_create_session(self, user_id: str, session_id: Optional[str] = None,
                                ip: Optional[str] = None, user_agent: Optional[str] = None) -> str:
         if not session_id:
-            session_id = f"session_{int(datetime.now().timestamp())}"
+            import uuid
+            session_id = f"session_{uuid.uuid4().hex}"
         with db.get_cursor() as (conn, c):
             c.execute(
                 "INSERT OR IGNORE INTO sessions (session_id, user_id, ip, user_agent) VALUES (?, ?, ?, ?)",

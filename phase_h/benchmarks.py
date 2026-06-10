@@ -79,6 +79,10 @@ _LABEL_PATCH = {
         "en": "Environments where portfolio likely lags",
         "ar": "البيئات التي يرجح أن تتأخر فيها المحفظة",
     },
+    "insufficient_history_block": {
+        "en": "Insufficient overlapping history to compute benchmark-relative diagnostics for this asset. This module is hidden when the rolling window has zero coverage.",
+        "ar": "السجل غير كاف لاحتساب مقاييس الأداء النسبي. يُخفى هذا القسم عندما تكون نافذة التحليل صفرًا.",
+    },
     "insufficient_regime_history": {
         "en": "insufficient regime history",
         "ar": "سجل الأنظمة غير كاف",
@@ -359,12 +363,56 @@ def compute_benchmark_relative(
         return _degenerate_payload(selected, [f"benchmark engine degraded: {exc!r}"])
 
 
+def _benchmark_payload_is_empty(payload: BenchmarkRelative) -> bool:
+    """Detect a degenerate benchmark payload — zero window or all-zero metrics.
+
+    A renderer should suppress the full table and decomposition when the
+    underlying numbers carry no information; otherwise a wall of zeros
+    masquerades as real diagnostics.
+    """
+    if not payload:
+        return True
+    if int(payload.get("window_months") or 0) <= 0:
+        return True
+    metric_keys = (
+        "active_return_pct", "tracking_error_pct", "information_ratio",
+        "rolling_alpha_12m_pct", "relative_drawdown_pct",
+        "upside_capture", "downside_capture", "relative_volatility",
+        "active_share_pct",
+    )
+    nonzero = 0
+    for k in metric_keys:
+        v = payload.get(k)
+        if v is None:
+            continue
+        try:
+            if abs(float(v)) > 1e-9:
+                nonzero += 1
+        except (TypeError, ValueError):
+            continue
+    # Rolling beta defaults to 1.0 for a single asset vs itself; not informative.
+    return nonzero == 0
+
+
 def render_benchmark_relative_md(
     payload: BenchmarkRelative, language: str = "en"
 ) -> str:
     """Render the H1 institutional benchmark-relative markdown block."""
     if not PHASE_H_BENCHMARK or not payload:
         return ""
+
+    # Suppress degenerate payloads (window=0 or all-zero metrics) — surfacing
+    # a table of zeros misleads readers into thinking the analysis ran.
+    if _benchmark_payload_is_empty(payload):
+        heading = section_heading(3, "benchmark_relative_diagnostics", language)
+        notes = payload.get("notes") or []
+        note_line = ""
+        if notes:
+            note_line = f" ({', '.join(str(n) for n in notes if n)})"
+        return (
+            f"{heading}\n\n"
+            f"> ℹ️ {L('insufficient_history_block', language)}{note_line}\n"
+        )
 
     heading = section_heading(3, "benchmark_relative_diagnostics", language)
     window = payload.get("window_months", 0)

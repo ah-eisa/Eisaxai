@@ -1,24 +1,9 @@
 """
 core/services/market_route_handler.py
-───────────────────────────────────────
-Route handlers for STOCK_ANALYSIS, FINANCIAL (CIO/PORTFOLIO_OPTIMIZE),
-PORTFOLIO CRUD and GENERAL (Gemini) — extracted from process_message.
-
-Public API
-──────────
-    handle_stock_analysis(orchestrator, session_id, user_id,
-                          message, instruction, user_ctx) -> dict
-
-    handle_financial(orchestrator, session_id, user_id,
-                     message, instruction, handler, user_ctx) -> dict | None
-        Returns None if it falls through (caller continues to GENERAL).
-
-    handle_portfolio(session_id, user_id, message, reply_saver) -> dict
-
-    handle_general(orchestrator, session_id, user_id,
-                   message, instruction, user_ctx) -> dict
+---------------------------------------
+Route handlers: handle_stock_analysis, handle_financial, handle_portfolio, handle_general.
+Screening moved to core.services.market_screener.
 """
-
 from __future__ import annotations
 
 import logging
@@ -26,530 +11,18 @@ import os
 import re as _re
 from typing import Any, Callable
 
+from core.services.market_screener import (
+    _detect_market_intent, _detect_market_from_message,
+    _coerce_dt, _fmt_snapshot_ts, _resolve_cache_age_minutes,
+    _get_market_stocks_from_cache, _to_float, _get_row_yield_pct,
+    _get_row_payout_ratio, _sustainability_flag, _fmt_num,
+    _get_row_rsi, _get_row_change_pct, _apply_quality_filter,
+    _div_stability_score, _detect_screening_type, _extract_sector_filter,
+    _row_sector_text, _screen_rows, _fmt_screen_metric,
+    _build_screening_reply, _handle_dividend_screening, handle_screening,
+)
+
 logger = logging.getLogger(__name__)
-
-
-# ── Screening intent helpers ──────────────────────────────────────────────────
-
-_LIST_KEYWORDS = [
-    "أفضل", "best", "top", "أعلى", "اقترح", "recommend",
-    "أسهم توزيعات", "dividend stocks", "dividend yield", "top stocks",
-    "أسهم دفاعية", "defensive stocks", "ranking", "قائمة",
-    "أعلى عائد", "highest yield", "screen", "فلتر", "screening", "rank",
-    "قائمة أسهم", "top performers", "gainers", "losers", "top gainers", "top losers",
-]
-
-_PORTFOLIO_KEYWORDS = [
-    "محفظة", "portfolio", "optimize", "وزّع", "وزع", "allocate",
-    "ابني", "build", "construct", "توزيع الأصول",
-]
-
-_SCREENING_SIGNALS = (
-    "dividend", "توزيعات", "yield", "عائد", "defensive", "دفاعية",
-    "rsi", "oversold", "overbought", "gainers", "losers", "أعلى ارتفاع", "أعلى انخفاض",
-)
-
-_MARKET_NAME_MAP = {
-    "uae": "الإمارات (ADX/DFM)",
-    "ksa": "السعودية (تداول)",
-    "egypt": "مصر (EGX)",
-    "kuwait": "الكويت",
-    "qatar": "قطر",
-}
-
-_MARKET_HINTS = {
-    "uae": ["uae", "الإمارات", "امارات", "إمارات", "adx", "dfm", "دبي", "أبوظبي", "ابوظبي"],
-    "ksa": ["ksa", "السعودية", "سعودية", "سعودي", "تداول", "tadawul", "ارامكو", "aramco"],
-    "egypt": ["مصر", "egypt", "egx", "بورصة", "البورصة"],
-    "kuwait": ["كويت", "الكويت", "kuwait"],
-    "qatar": ["قطر", "qatar"],
-}
-
-_MARKET_CURRENCY_MAP = {
-    "uae": "د.إ",
-    "ksa": "ر.س",
-    "egypt": "ج.م",
-    "kuwait": "د.ك",
-    "qatar": "ر.ق",
-}
-
-
-def _detect_market_intent(message: str) -> str:
-    """Returns 'screening' or 'portfolio' or 'unknown'."""
-    msg_lower = (message or "").lower()
-    list_score = sum(1 for kw in _LIST_KEYWORDS if kw.lower() in msg_lower)
-    port_score = sum(1 for kw in _PORTFOLIO_KEYWORDS if kw.lower() in msg_lower)
-    if list_score > port_score:
-        return "screening"
-    if port_score > 0:
-        return "portfolio"
-    return "unknown"
-
-
-def _detect_market_from_message(message: str) -> str:
-    ml = (message or "").lower()
-    for market_code, hints in _MARKET_HINTS.items():
-        if any(w in ml for w in hints):
-            return market_code
-    return "uae"
-
-
-def _coerce_dt(value: Any) -> Any:
-    try:
-        import datetime as _dt
-
-        if value is None:
-            return None
-        if hasattr(value, "to_pydatetime"):
-            value = value.to_pydatetime()
-        if isinstance(value, _dt.datetime):
-            if value.tzinfo is None:
-                return value.replace(tzinfo=_dt.timezone.utc)
-            return value.astimezone(_dt.timezone.utc)
-        if isinstance(value, (int, float)):
-            if value > 1e12:
-                value = value / 1000.0
-            return _dt.datetime.fromtimestamp(value, tz=_dt.timezone.utc)
-        if isinstance(value, str):
-            txt = value.strip()
-            if not txt:
-                return None
-            txt = txt.replace("Z", "+00:00")
-            try:
-                parsed = _dt.datetime.fromisoformat(txt)
-                if parsed.tzinfo is None:
-                    return parsed.replace(tzinfo=_dt.timezone.utc)
-                return parsed.astimezone(_dt.timezone.utc)
-            except Exception:
-                return None
-    except Exception:
-        return None
-    return None
-
-
-def _fmt_snapshot_ts(snapshot_ts: Any, stocks: list[dict]) -> str:
-    import datetime as _dt
-
-    dt_obj = _coerce_dt(snapshot_ts)
-    if dt_obj is None and stocks:
-        dt_obj = _coerce_dt(stocks[0].get("_snapshot_ts"))
-    if dt_obj is None:
-        dt_obj = _dt.datetime.now(_dt.timezone.utc)
-    return dt_obj.strftime("%Y-%m-%d %H:%M UTC")
-
-
-def _resolve_cache_age_minutes(cache_age_min: float | None, snapshot_ts: Any, stocks: list[dict]) -> float:
-    import datetime as _dt
-
-    if cache_age_min is not None:
-        return max(0.0, float(cache_age_min))
-    dt_obj = _coerce_dt(snapshot_ts)
-    if dt_obj is None and stocks:
-        dt_obj = _coerce_dt(stocks[0].get("_snapshot_ts"))
-    if dt_obj is None:
-        return 0.0
-    now = _dt.datetime.now(_dt.timezone.utc)
-    return max(0.0, (now - dt_obj).total_seconds() / 60.0)
-
-
-def _get_market_stocks_from_cache(market: str) -> tuple[list[dict], float | None, Any]:
-    """
-    Load latest live market snapshot rows from pipeline cache.
-    Returns (rows, age_minutes, snapshot_ts).
-    """
-    market_code = (market or "uae").lower()
-    if market_code not in _MARKET_NAME_MAP:
-        market_code = "uae"
-
-    # Primary path: pipeline cache singleton
-    try:
-        from pipeline import cache as _pipeline_cache
-        df, snapshot_ts = _pipeline_cache.get_latest(market_code)
-        age = _pipeline_cache.cache_age_minutes(market_code)
-        if df is not None and not df.empty:
-            rows = df.to_dict(orient="records")
-            if snapshot_ts is None and rows:
-                snapshot_ts = rows[0].get("_snapshot_ts")
-            return rows, age, snapshot_ts
-    except Exception as exc:
-        logger.debug("[Screening] pipeline cache load failed for %s: %s", market_code, exc)
-
-    # Fallback path: direct allocator snapshot loader
-    try:
-        from global_allocator import _load_latest_snapshot
-        df = _load_latest_snapshot(market_code)
-        if df is not None and not df.empty:
-            rows = df.to_dict(orient="records")
-            snapshot_ts = rows[0].get("_snapshot_ts") if rows else None
-            return rows, None, snapshot_ts
-    except Exception as exc:
-        logger.debug("[Screening] allocator snapshot load failed for %s: %s", market_code, exc)
-
-    return [], None, None
-
-
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        if isinstance(value, str):
-            v = value.strip().replace(",", "").replace("%", "")
-            return float(v) if v else default
-        return float(value)
-    except Exception:
-        return default
-
-
-def _get_row_yield_pct(stock_row: dict) -> float:
-    """
-    Normalize dividend yield to percent.
-    TV cache usually stores percent directly in dividend_yield_recent.
-    """
-    raw = (
-        stock_row.get("div_yield")
-        or stock_row.get("dividend_yield")
-        or stock_row.get("dividendYield")
-        or stock_row.get("dividend_yield_recent")
-        or 0
-    )
-    dy = _to_float(raw, 0.0)
-    if 0 < dy <= 1:
-        dy *= 100.0
-    return max(0.0, dy)
-
-
-def _get_row_payout_ratio(s: dict) -> float | None:
-    """Calculate payout ratio from available data. Returns None if not computable."""
-    try:
-        price = _to_float(s.get("close") or s.get("price") or s.get("current_price") or 0)
-        dy_pct = _get_row_yield_pct(s)
-        eps = _to_float(s.get("earnings_per_share_diluted_ttm") or s.get("eps") or 0)
-        if price > 0 and dy_pct > 0 and eps > 0:
-            dps = (dy_pct / 100) * price
-            return round((dps / eps) * 100, 1)
-    except Exception:
-        pass
-    return None
-
-
-def _sustainability_flag(payout: float | None) -> str:
-    """Return emoji sustainability indicator based on payout ratio."""
-    if payout is None:
-        return "—"
-    if payout <= 50:
-        return "🟢"
-    if payout <= 70:
-        return "🟡"
-    if payout <= 90:
-        return "🟠"
-    return "🔴"
-
-
-def _fmt_num(value: Any, digits: int = 2, fallback: str = "—") -> str:
-    num = _to_float(value, default=float("nan"))
-    if num != num:  # NaN
-        return fallback
-    return f"{num:.{digits}f}"
-
-
-def _get_row_rsi(stock_row: dict) -> float:
-    return _to_float(stock_row.get("RSI") or stock_row.get("rsi") or stock_row.get("rsi_14"), 0.0)
-
-
-def _get_row_change_pct(stock_row: dict) -> float:
-    return _to_float(stock_row.get("change") or stock_row.get("change_percent") or stock_row.get("chg"), 0.0)
-
-
-def _apply_quality_filter(stocks: list[dict], screening_type: str = "dividend") -> list[dict]:
-    """Remove anomalous/illiquid stocks before ranking."""
-    out: list[dict] = []
-    for s in stocks:
-        # Skip zero/near-zero volume rows (likely stale, halted, or anomalous).
-        vol = _to_float(s.get("volume") or 0)
-        if vol < 50_000:
-            continue
-
-        # Filter clear RSI outliers that are usually data quality issues.
-        rsi = _to_float(s.get("RSI") or s.get("rsi") or 50)
-        if rsi >= 99 or rsi <= 5:
-            continue
-
-        # Unrealistically high dividend yields are often anomalies/special events.
-        if screening_type == "dividend":
-            dy = _get_row_yield_pct(s)
-            if dy > 25:
-                continue
-
-        # Drop micro-caps if market cap exists and is too small for liquid screening.
-        mc = _to_float(s.get("market_cap_basic") or 0)
-        if mc > 0 and mc < 200_000_000:
-            continue
-
-        out.append(s)
-    return out
-
-
-def _div_stability_score(s: dict) -> float:
-    """Composite dividend ranking score balancing yield and stability proxies."""
-    dy = _get_row_yield_pct(s)
-    mc = _to_float(s.get("market_cap_basic") or 0) / 1e9  # billions
-    pe = _to_float(s.get("price_earnings_ttm") or 0)
-    rsi = _to_float(s.get("RSI") or s.get("rsi") or 50)
-    vol = _to_float(s.get("volume") or 0)
-
-    score = dy  # base: yield %
-
-    # Market cap bonus — much stronger weighting
-    if mc > 50:
-        score += 6    # mega cap (EMAAR, FAB, ENBD)
-    elif mc > 10:
-        score += 4    # large cap
-    elif mc > 2:
-        score += 2    # mid cap
-    elif mc > 0.5:
-        score += 1    # small cap
-    # micro cap: no bonus
-
-    # P/E bonus: profitable and reasonably valued
-    if 3 < pe < 15:
-        score += 1.5
-    elif 15 <= pe < 25:
-        score += 0.5
-
-    # RSI: healthy range bonus
-    if 35 <= rsi <= 65:
-        score += 0.5
-
-    # Volume bonus: liquid
-    if vol > 5_000_000:
-        score += 1.5
-    elif vol > 1_000_000:
-        score += 1
-    elif vol > 200_000:
-        score += 0.5
-
-    # Payout ratio — most important for sustainability
-    payout = _get_row_payout_ratio(s)
-    if payout is not None:
-        if payout <= 40:
-            score += 4
-        elif payout <= 60:
-            score += 2
-        elif payout <= 80:
-            score += 0
-        elif payout <= 100:
-            score -= 3
-        else:
-            score -= 6
-
-    return score
-
-
-_SECTOR_ALIAS_HINTS = {
-    "banks": ["bank", "banks", "بنك", "بنوك", "مصرف", "مصارف"],
-    "real estate": ["real estate", "realestate", "عقار", "عقاري"],
-    "energy": ["energy", "oil", "gas", "طاقة", "نفط", "غاز"],
-    "telecommunication": ["telecom", "telecommunication", "communications", "اتصالات"],
-    "utilities": ["utilities", "utility", "مرافق"],
-    "healthcare": ["health", "healthcare", "medical", "دواء", "صحي", "رعاية صحية"],
-    "consumer staples": ["consumer staples", "staples", "سلع أساسية", "اغذية", "أغذية"],
-    "industrials": ["industrial", "industrials", "صناعي", "صناعة"],
-}
-
-_DEFENSIVE_SECTOR_HINTS = (
-    "utilities", "health", "healthcare", "consumer staples", "telecom", "communications",
-)
-
-
-def _detect_screening_type(message: str) -> str:
-    ml = (message or "").lower()
-
-    if any(w in ml for w in ["oversold", "تشبع بيعي", "rsi منخفض", "rsi تحت 35"]):
-        return "rsi_oversold"
-    if any(w in ml for w in ["overbought", "تشبع شرائي", "rsi مرتفع", "rsi فوق 65"]):
-        return "rsi_overbought"
-    if any(w in ml for w in ["top gainers", "gainers", "أعلى ارتفاع", "الأعلى ارتفاعاً", "الاسهم الصاعدة"]):
-        return "top_gainers"
-    if any(w in ml for w in ["top losers", "losers", "أعلى انخفاض", "الأكثر انخفاضاً", "الاسهم الهابطة"]):
-        return "top_losers"
-    if "sector" in ml or "قطاع" in ml:
-        return "sector"
-    if any(w in ml for w in ["defensive", "دفاعية"]):
-        return "defensive"
-    if any(w in ml for w in ["dividend", "توزيعات", "yield", "عائد"]):
-        return "dividend"
-    return "dividend"
-
-
-def _extract_sector_filter(message: str, stocks: list[dict]) -> str:
-    ml = (message or "").lower()
-    for sector_key, hints in _SECTOR_ALIAS_HINTS.items():
-        if any(h in ml for h in hints):
-            return sector_key
-
-    unique_sectors = {
-        str(s.get("sector") or "").strip()
-        for s in stocks
-        if str(s.get("sector") or "").strip()
-    }
-    for sector_name in unique_sectors:
-        if sector_name and sector_name.lower() in ml:
-            return sector_name
-    return ""
-
-
-def _row_sector_text(stock_row: dict) -> str:
-    return str(stock_row.get("sector") or "—").strip() or "—"
-
-
-def _screen_rows(
-    stocks: list[dict],
-    screening_type: str,
-    message: str,
-    top_n: int = 10,
-) -> tuple[list[dict], str, str]:
-    filtered_stocks = _apply_quality_filter(stocks, screening_type)
-
-    if screening_type == "rsi_oversold":
-        rows = [s for s in filtered_stocks if 0 < _get_row_rsi(s) < 35]
-        rows.sort(key=_get_row_rsi)
-        return rows[:top_n], "أكثر الأسهم تشبعاً بيعياً (RSI < 35)", "RSI"
-
-    if screening_type == "rsi_overbought":
-        rows = [s for s in filtered_stocks if _get_row_rsi(s) > 65]
-        rows.sort(key=_get_row_rsi, reverse=True)
-        return rows[:top_n], "أكثر الأسهم تشبعاً شرائياً (RSI > 65)", "RSI"
-
-    if screening_type == "top_gainers":
-        rows = sorted(filtered_stocks, key=_get_row_change_pct, reverse=True)
-        return rows[:top_n], "أعلى الأسهم ارتفاعاً", "التغير %"
-
-    if screening_type == "top_losers":
-        rows = sorted(filtered_stocks, key=_get_row_change_pct)
-        return rows[:top_n], "أعلى الأسهم انخفاضاً", "التغير %"
-
-    if screening_type == "sector":
-        sector_term = _extract_sector_filter(message, filtered_stocks)
-        if sector_term:
-            rows = [s for s in filtered_stocks if sector_term.lower() in _row_sector_text(s).lower()]
-            rows.sort(key=_get_row_yield_pct, reverse=True)
-            return rows[:top_n], f"أفضل أسهم قطاع {sector_term}", "القطاع"
-
-    if screening_type == "defensive":
-        rows = [
-            s for s in filtered_stocks
-            if any(h in _row_sector_text(s).lower() for h in _DEFENSIVE_SECTOR_HINTS)
-        ]
-        if rows:
-            rows.sort(key=_get_row_yield_pct, reverse=True)
-            return rows[:top_n], "أفضل الأسهم الدفاعية", "Dividend Yield"
-
-    rows = [s for s in filtered_stocks if _get_row_yield_pct(s) > 0]
-    if screening_type == "dividend":
-        rows.sort(key=_div_stability_score, reverse=True)
-    else:
-        rows.sort(key=_get_row_yield_pct, reverse=True)
-    return rows[:top_n], "أفضل أسهم التوزيعات", "Dividend Yield"
-
-
-def _fmt_screen_metric(stock_row: dict, metric_label: str) -> str:
-    if metric_label == "Dividend Yield":
-        return f"{_get_row_yield_pct(stock_row):.2f}%"
-    if metric_label == "RSI":
-        return _fmt_num(_get_row_rsi(stock_row), 1)
-    if metric_label == "التغير %":
-        chg = _get_row_change_pct(stock_row)
-        return f"{chg:+.2f}%"
-    if metric_label == "القطاع":
-        return _row_sector_text(stock_row)
-    return _fmt_num(stock_row.get(metric_label), 2)
-
-
-def _build_screening_reply(message: str, market: str | None = None, forced_type: str | None = None) -> str:
-    market_code = (market or _detect_market_from_message(message)).lower()
-    stocks, cache_age_min, snapshot_ts = _get_market_stocks_from_cache(market_code)
-    if not stocks:
-        return "⚠️ بيانات السوق غير متاحة حالياً — جاري التحديث\nحاول تاني خلال دقيقتين"
-
-    _num_match = _re.search(r"\b(\d+)\b", message)
-    top_n = int(_num_match.group(1)) if _num_match and 3 <= int(_num_match.group(1)) <= 20 else 10
-
-    screening_type = forced_type or _detect_screening_type(message)
-    top, title, metric_label = _screen_rows(stocks, screening_type, message, top_n=top_n)
-    if not top:
-        return "⚠️ لا تتوفر نتائج كافية للفلاتر المطلوبة حالياً"
-
-    market_name = _MARKET_NAME_MAP.get(market_code, market_code.upper())
-    currency = _MARKET_CURRENCY_MAP.get(market_code, "")
-    age_min = _resolve_cache_age_minutes(cache_age_min, snapshot_ts, stocks)
-    ts_text = _fmt_snapshot_ts(snapshot_ts, stocks)
-
-    if screening_type == "dividend":
-        rows = [
-            "| # | الشركة | الرمز | السعر | Div Yield | Payout | P/E | الاستدامة |",
-            "|---|--------|-------|-------|-----------|--------|-----|-----------|",
-        ]
-    else:
-        rows = [
-            f"| # | الشركة | الرمز | السعر | {metric_label} | P/E | RSI |",
-            "|---|--------|-------|-------|----------|-----|-----|",
-        ]
-    for i, s in enumerate(top, 1):
-        ticker = str(s.get("ticker") or "").strip()
-        name = s.get("name") or (ticker.split(":", 1)[-1] if ticker else "N/A")
-        price = _to_float(s.get("price") or s.get("current_price") or s.get("close") or 0, 0.0)
-        pe = _fmt_num(s.get("price_earnings_ttm") or s.get("pe_ratio") or s.get("pe") or s.get("forwardPE"), 2)
-        if screening_type == "dividend":
-            dy_pct = _get_row_yield_pct(s)
-            payout = _get_row_payout_ratio(s)
-            sustain = _sustainability_flag(payout)
-            payout_str = f"{payout:.0f}%" if payout is not None else "—"
-            rows.append(
-                f"| {i} | {name} | {ticker or '—'} | {currency}{price:,.2f} | {dy_pct:.2f}% | {payout_str} | {pe} | {sustain} |"
-            )
-        else:
-            metric_val = _fmt_screen_metric(s, metric_label)
-            rsi = _fmt_num(_get_row_rsi(s), 1)
-            rows.append(
-                f"| {i} | {name} | {ticker or '—'} | {currency}{price:,.2f} | {metric_val} | {pe} | {rsi} |"
-            )
-
-    table = "\n".join(rows)
-    return (
-        f"🏆 {title} — {market_name}\n"
-        f"*{len(top)} سهم | آخر تحديث: {age_min:.0f} دقيقة*\n\n"
-        f"{table}\n\n"
-        f"> المصدر: EisaX Live Cache ({ts_text})"
-    )
-
-
-def _handle_dividend_screening(message: str, market: str | None = None) -> str:
-    """Backward-compatible dividend screening adapter."""
-    return _build_screening_reply(message, market=market, forced_type="dividend")
-
-
-async def handle_screening(
-    message: str,
-    session_id: str,
-    user_id: str,
-    orchestrator,
-    instruction: str = "",
-    **kwargs,
-) -> dict:
-    """Public SCREENER route handler backed by live pipeline cache."""
-    screening_input = f"{message or ''} {instruction or ''}".strip()
-    reply_text = _build_screening_reply(screening_input)
-    try:
-        orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
-        orchestrator.session_mgr.save_message(session_id, user_id, "assistant", reply_text)
-    except Exception as exc:
-        logger.warning("[SCREENER] session save failed: %s", exc)
-    return {
-        "reply": reply_text,
-        "session_id": session_id,
-        "agent_name": "EisaX Market Screener",
-        "model": "SCREENER",
-    }
 
 
 # ── STOCK_ANALYSIS ─────────────────────────────────────────────────────────────
@@ -595,17 +68,27 @@ async def handle_stock_analysis(
             )
         else:
             _resolved_ticker = None
-            try:
-                from core.ticker_resolver import resolve_ticker as _resolve
-            except Exception:
-                from core.tools.ticker_resolver import resolve_ticker as _resolve
-            _resolved_ticker = _resolve(message) or _resolve(instruction or "")
+            # Priority 1: parse instruction — it always carries the resolved symbol
+            # e.g. "analyze 1180.SR", "analyze GC=F", "analyze COMI.CA"
+            if instruction:
+                _instr_m = _re.search(r"analyze\s+(\S+)", instruction.strip(), _re.IGNORECASE)
+                if _instr_m:
+                    _resolved_ticker = _instr_m.group(1).strip().upper()
+            # Priority 2: ticker_resolver on message text
+            if not _resolved_ticker:
+                try:
+                    from core.ticker_resolver import resolve_ticker as _resolve
+                except Exception:
+                    from core.tools.ticker_resolver import resolve_ticker as _resolve
+                _resolved_ticker = _resolve(message) or _resolve(instruction or "")
+            # Priority 3: regex fallback — extended to handle exchange-suffixed and
+            # futures tickers like 1180.SR or GC=F
             if not _resolved_ticker:
                 _combined = f"{message} {instruction or ''}".upper()
-                _candidates = _re.findall(r"\b([A-Z]{2,6}(?:=[A-Z])?)\b", _combined)
-                _skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE"}
+                _candidates = _re.findall(r"\b([A-Z0-9]{2,10}(?:\.[A-Z]{2})?(?:=[A-Z])?)\b", _combined)
+                _skip = {"AND", "THE", "FOR", "WITH", "PRICE", "STOCK", "ANALYZE", "ANALYSIS"}
                 for _tk in _candidates:
-                    if _tk not in _skip:
+                    if _tk not in _skip and not _tk.isdigit():
                         _resolved_ticker = _tk
                         break
             if _resolved_ticker:
@@ -620,6 +103,12 @@ async def handle_stock_analysis(
             if _cached:
                 age_min = _cached["cache_age"] // 60
                 reply = _cached["reply"]
+                # Rule-based editorial on cache hits (handles pre-editorial cached entries)
+                try:
+                    from core.editorial import rule_based_clean as _editorial_rule
+                    reply = _editorial_rule(reply)
+                except Exception:
+                    pass
                 # Add subtle cache indicator
                 reply += f"\n\n*ℹ️ تحليل محدّث (منذ {age_min} دقيقة)*"
                 orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
@@ -735,36 +224,12 @@ async def handle_stock_analysis(
         for _ms in _mode_strip:
             _clean_instruction = _re.sub(rf"(?i)\b{_re.escape(_ms.strip())}\b\s*", "", _clean_instruction).strip()
 
-        # ── G-9-B: Inject live sentiment context before LLM call ─────────────
-        try:
-            from core.sentiment import SentimentAnalyzer as _SA
-            _sent_ticker = None
-            try:
-                from core.ticker_resolver import resolve_ticker as _rt
-            except Exception:
-                try:
-                    from core.tools.ticker_resolver import resolve_ticker as _rt
-                except Exception:
-                    _rt = None
-            if _rt:
-                _sent_ticker = _rt(_clean_instruction) or _rt(message or "")
-            if _sent_ticker and _sent_ticker != "UNKNOWN":
-                _sent = _SA().analyze_ticker(_sent_ticker, use_cache=True)
-                if _sent.get("article_count", 0) > 0:
-                    _emoji = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}.get(_sent["label"], "⚪")
-                    _conf  = f"{int(_sent.get('confidence',0)*100)}%"
-                    _fresh = _sent.get("freshness", "unknown")
-                    _sentiment_ctx = (
-                        f"\n\n[📰 Real-time News Sentiment for {_sent_ticker}: "
-                        f"{_emoji} {_sent['label'].upper()} | score={_sent['score']:+.2f} | "
-                        f"confidence={_conf} | freshness={_fresh} | "
-                        f"based on {_sent['article_count']} articles | "
-                        f"bullish={_sent['bullish_count']} bearish={_sent['bearish_count']} neutral={_sent['neutral_count']}]"
-                    )
-                    _clean_instruction = _clean_instruction + _sentiment_ctx
-                    logger.info("[sentiment] injected %s context: %s score=%.2f", _sent_ticker, _sent["label"], _sent["score"])
-        except Exception as _sent_exc:
-            logger.debug("[sentiment] context injection skipped: %s", _sent_exc)
+        # ── G-9-B: Sentiment context (disabled — kept for future use) ─────────
+        # Injecting sentiment text into _clean_instruction causes extract_tickers()
+        # to parse English words in the sentiment string (REAL/TIME/NEWS/SCORE/NG)
+        # as stock tickers, triggering multi-ticker analysis and 5+ minute runtimes.
+        # The FinancialAgent already fetches live news internally via NewsEngine.
+        # logger.debug("[sentiment] skipped — FinancialAgent handles news internally")
 
         agent = orchestrator.financial_agent
         if agent:
@@ -819,9 +284,9 @@ async def handle_stock_analysis(
                 raise ValueError(f"FinancialAgent returned empty reply for: {instruction[:60]}")
 
     except Exception as exc:
-        logger.warning("FinancialAgent failed: %s — falling back to Gemini with live price", exc)
+        logger.warning("FinancialAgent failed: %s — falling back to DeepSeek with live price", exc)
 
-    # ── Gemini fallback with live price injection ─────────────────────────────
+    # ── DeepSeek fallback with live price injection ───────────────────────────
     result = await _stock_gemini_fallback(orchestrator, session_id, user_id, message, instruction)
     # ── Save to analysis cache ───────────────────────────────────────────────
     try:
@@ -831,7 +296,7 @@ async def handle_stock_analysis(
                 _cache_key,
                 {
                     "reply": result["reply"],
-                    "model": result.get("model", "Gemini (fallback)"),
+                    "model": result.get("model", "deepseek-v4-flash"),
                 },
                 level="all",
             )
@@ -847,7 +312,7 @@ async def _stock_gemini_fallback(
     message:      str,
     instruction:  str,
 ) -> dict:
-    """Last-resort Gemini analysis when FinancialAgent fails."""
+    """Last-resort DeepSeek analysis when FinancialAgent fails."""
     from datetime import datetime as _dt
     try:
         today = _dt.now().strftime("%B %d, %Y")
@@ -892,10 +357,10 @@ async def _stock_gemini_fallback(
                 "reply":      fb_reply,
                 "session_id": session_id,
                 "agent_name": "EisaX Financial Analyst",
-                "model":      "Gemini (fallback)",
+                "model":      "deepseek-v4-flash",
             }
     except Exception as fb_err:
-        logger.error("STOCK_ANALYSIS Gemini fallback also failed: %s", fb_err)
+        logger.error("STOCK_ANALYSIS DeepSeek fallback also failed: %s", fb_err)
 
     err_reply = "⚠️ Live market data is temporarily unavailable. Please try again in a moment."
     orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
@@ -1084,7 +549,8 @@ async def handle_financial(
         # ── GLOBAL ALLOCATOR (Portfolio Build) ────────────────────────────────────
     try:
         from portfolio_builder import detect_and_build
-        alloc_reply = detect_and_build(message)
+        _lang = (user_ctx or {}).get("report_language") or (user_ctx or {}).get("language") or "en"
+        alloc_reply = detect_and_build(message, language=_lang)
         if alloc_reply:
             import logging
             logging.getLogger(__name__).info("[GlobalAllocator] Built portfolio for: %s", message[:50])
@@ -1307,7 +773,7 @@ async def handle_portfolio(
         return {"reply": reply_text, "session_id": session_id, "agent_name": "EisaX", "model": "error"}
 
 
-# ── GENERAL (Gemini) ────────────────────────────────────────────────────────────
+# ── GENERAL ────────────────────────────────────────────────────────────────────
 
 async def handle_general(
     orchestrator: Any,
@@ -1319,13 +785,12 @@ async def handle_general(
     chat_history: list = None,
 ) -> dict:
     """
-    Handle general questions via Gemini with Playbook + optional memory/RAG context.
+    Handle general questions via DeepSeek with Playbook + optional memory/RAG context.
     """
     try:
-        from core.orchestrator import MEMORY_ENABLED, GEMINI_MODEL
+        from core.orchestrator import MEMORY_ENABLED
     except Exception:
         MEMORY_ENABLED = False
-        GEMINI_MODEL   = "gemini-2.0-flash"
 
     _user_name = user_ctx.get("name") if user_ctx else None
 
@@ -1407,17 +872,14 @@ async def handle_general(
 
     full_prompt = f"{system_prompt}\n\n{memory_context}\n{rag_context}{history_block}\nUser: {message}\n\nAssistant:"
 
-    if not orchestrator.gemini_client:
-        reply_text = "عذراً، خدمة الذكاء الاصطناعي غير متاحة حالياً."
-    else:
-        try:
-            reply_text = (
-                orchestrator._gemini_generate(full_prompt, label="GENERAL")
-                or "عذراً، لم أستطع فهم السؤال."
-            )
-        except Exception as exc:
-            logger.error("Gemini failed: %s", exc)
-            reply_text = "عذراً، حدث خطأ مؤقت. حاول مرة أخرى."
+    try:
+        reply_text = (
+            orchestrator._gemini_generate(full_prompt, label="GENERAL")
+            or "عذراً، لم أستطع فهم السؤال."
+        )
+    except Exception as exc:
+        logger.error("[GENERAL] LLM failed: %s", exc)
+        reply_text = "عذراً، حدث خطأ مؤقت. حاول مرة أخرى."
 
     orchestrator.session_mgr.save_message(session_id, user_id, "user", message)
     orchestrator.session_mgr.save_message(session_id, user_id, "assistant", reply_text)
@@ -1433,5 +895,5 @@ async def handle_general(
         "response":   reply_text,
         "session_id": session_id,
         "agent_name": "EisaX AI",
-        "model":      GEMINI_MODEL,
+        "model":      "deepseek-v4-flash",
     }

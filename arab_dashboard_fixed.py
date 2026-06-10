@@ -27,6 +27,8 @@ import sqlite3 as _sl
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from config import DEEPSEEK_API_KEY, DEFAULT_MODEL
+from core.streamlit_auth import require_auth, show_user_badge
+from core.portfolio_db import save_portfolio as _ptf_save, load_portfolios as _ptf_load, delete_portfolio as _ptf_delete
 
 _WL_DB = Path('/home/ubuntu/investwise/data/watchlists.db')
 _WL_DB.parent.mkdir(parents=True, exist_ok=True)
@@ -58,12 +60,103 @@ def _wl_remove(ticker, user_id='default'):
 RSI_OVERSOLD   = 30
 RSI_OVERBOUGHT = 70
 CACHE_STALE_MINUTES = 30
-DEEPSEEK_MODEL = DEFAULT_MODEL or "deepseek-chat"
+DEEPSEEK_MODEL = DEFAULT_MODEL or "deepseek-v4-flash"
 
 PIE_COLORS       = ["#0f4c81","#0ea5a4","#3b82f6","#8b5cf6","#f59e0b","#10b981","#f97316","#ef4444"]
 COLOR_SCALE_CHANGE = [(0.0,"#ef4444"),(0.5,"#f8fafc"),(1.0,"#10b981")]
 COLOR_SCALE_RSI    = [(0.0,"#10b981"),(0.5,"#f59e0b"),(1.0,"#ef4444")]
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
+
+# ── EisaX Agent (lazy singleton) ─────────────────────────────────────────────
+_eisax_agent = None
+
+@st.cache_resource
+def _get_eisax_agent():
+    """Load MultiAgentOrchestrator once per Streamlit process."""
+    try:
+        from core.orchestrator import MultiAgentOrchestrator
+        return MultiAgentOrchestrator()
+    except Exception as _e:
+        return None
+
+_REPORTS_DIR = Path("/home/ubuntu/investwise/static/reports")
+
+def _clip_ai_context(text: str, limit: int = 12000) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n\n[Context truncated]"
+
+def _is_portfolio_query(message: str) -> bool:
+    msg = (message or "").lower()
+    keywords = (
+        "portfolio", "allocation", "rebalance", "holdings", "position", "risk",
+        "محفظ", "توزيع", "مخاطر", "صفقات", "مراكز", "اعادة توازن", "إعادة توازن",
+    )
+    return any(keyword in msg for keyword in keywords)
+
+def _should_use_agent_for_ai(message: str, file_block: str = "") -> bool:
+    if (file_block or "").strip():
+        return True
+    msg = (message or "").lower()
+    agent_keywords = (
+        "pdf", "report", "export", "download",
+        "تقرير", "تصدير", "تحميل",
+    )
+    return any(keyword in msg for keyword in agent_keywords)
+
+def _agent_chat(uid: int, message: str, session_id: str,
+                portfolio_ctx: str = "", file_block: str = "") -> tuple[str, str, dict | None]:
+    """
+    Call EisaX agent synchronously from Streamlit.
+    Returns (reply, session_id, download_info | None).
+    download_info = {"filename": "...", "path": Path(...)} when agent generates a PDF.
+    Falls back to ("", session_id, None) if agent unavailable — caller handles.
+    """
+    import asyncio
+    import concurrent.futures
+
+    agent = _get_eisax_agent()
+    if agent is None:
+        return "", session_id, None
+
+    # Only inject portfolio context when the question is actually about the
+    # user's portfolio. Injecting it into every message confuses the router.
+    parts = []
+    if file_block:
+        parts.append(f"[FILE ANALYSIS]\nFile content below:\n\n{_clip_ai_context(file_block)}")
+    if portfolio_ctx and (_is_portfolio_query(message) or file_block):
+        parts.append(f"[PORTFOLIO CONTEXT — user's actual positions]\n{portfolio_ctx}")
+    parts.append(f"User message: {message}")
+    full_message = "\n\n".join(parts)
+
+    async def _call():
+        return await agent.process_message(
+            user_id=str(uid),          # ← real uid, matches PortfolioTracker in Tab 5
+            message=full_message,
+            session_id=session_id or None,
+        )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            result = ex.submit(asyncio.run, _call()).result(timeout=55)
+
+        reply    = result.get("reply") or result.get("response") or ""
+        new_sid  = result.get("session_id", session_id)
+
+        # ── Extract download info if agent produced a PDF ────────────────
+        dl_info  = None
+        raw_url  = result.get("download_url") or result.get("url") or ""
+        if raw_url:
+            filename = raw_url.split("/")[-1]
+            pdf_path = _REPORTS_DIR / filename
+            if pdf_path.exists():
+                dl_info = {"filename": filename, "path": pdf_path}
+
+        return reply, new_sid, dl_info
+
+    except Exception:
+        return "", session_id, None
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -73,13 +166,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Auth gate — must come after set_page_config ───────────────────────────────
+_current_user = require_auth()   # stops + shows login if not authenticated
+_uid = _current_user["id"]       # int user id, used for per-user data
+
 # ── Session state defaults ────────────────────────────────────────────────────
 for key, default in [
     ("language", "ar"),
     ("dark_mode", False),
-    ("watchlist", _wl_load()),
+    ("watchlist", _wl_load(str(_uid))),
     ("_wl_loaded", True),
     ("ai_history", []),
+    ("ai_session_id", None),   # EisaX agent session — persists across Tab 7 messages
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -446,7 +544,89 @@ def build_ai_market_context(df: "pd.DataFrame", user_query: str, max_rows: int =
     return context_block, len(preview)
 
 
-def ask_eisa_ai(messages, market_context: str, stock_count: int, language: str) -> str:
+def _build_portfolio_ai_context(uid: int, df: "pd.DataFrame") -> str:
+    """
+    Build a compact portfolio summary for injection into the AI system prompt.
+    Uses PortfolioTracker positions + current prices from parquet cache df.
+    Returns empty string if no positions found.
+    """
+    try:
+        from core.portfolio_tracker import PortfolioTracker as _PT
+        tracker_state = _PT().get_portfolio(str(uid))
+        positions = tracker_state.get("positions", [])
+        cash      = float(tracker_state.get("cash", 0.0) or 0.0)
+
+        position_items: list[tuple[str, dict]] = []
+        if isinstance(positions, dict):
+            for ticker, pos in positions.items():
+                if not ticker or not isinstance(pos, dict):
+                    continue
+                position_items.append((str(ticker).strip().upper(), pos))
+        else:
+            for pos in positions or []:
+                if not isinstance(pos, dict):
+                    continue
+                ticker = str(pos.get("ticker", "")).strip().upper()
+                if not ticker:
+                    continue
+                position_items.append((ticker, pos))
+
+        if not position_items:
+            return ""
+
+        # Build price lookup from parquet df (ticker -> close)
+        price_map: dict = {}
+        if df is not None and not df.empty and "close" in df.columns:
+            for _, row in df.iterrows():
+                ticker_key = str(row.get("ticker", "") or row.get("name", "")).strip().upper()
+                market_key = str(row.get("market", "") or "").strip().lower()
+                price_val = float(row["close"] or 0)
+                if ticker_key:
+                    price_map[ticker_key] = price_val
+                    if market_key:
+                        price_map[f"{market_key}:{ticker_key}".upper()] = price_val
+
+        rows, total_cost, total_val = [], 0.0, 0.0
+        for ticker, pos in position_items:
+            market = str(pos.get("market", "") or "").strip().lower()
+            shares = float(pos.get("shares", pos.get("qty", 0)) or 0)
+            cost_p = float(pos.get("purchase_price", pos.get("cost_basis", pos.get("price", 0))) or 0)
+            cur_p  = price_map.get(f"{market}:{ticker}".upper()) or price_map.get(ticker.upper(), cost_p)
+            pos_cost = shares * cost_p
+            pos_val  = shares * cur_p
+            pnl      = pos_val - pos_cost
+            pnl_pct  = (pnl / pos_cost * 100) if pos_cost else 0
+            total_cost += pos_cost
+            total_val  += pos_val
+            rows.append(f"| {ticker} | {shares:.0f} | {cost_p:,.2f} | {cur_p:,.2f} | {pos_val:,.0f} | {pnl_pct:+.1f}% |")
+
+        if not rows:
+            return ""
+
+        total_pnl = total_val - total_cost
+        total_pct = (total_pnl / total_cost * 100) if total_cost else 0
+        grand_total = total_val + cash
+        lines = [
+            "## User's Actual Portfolio",
+            f"*{len(rows)} positions — data as of latest cache*",
+            "",
+            "| Ticker | Shares | Avg Cost | Current | Mkt Value | P&L% |",
+            "|--------|--------|----------|---------|-----------|------|",
+            *rows,
+            "",
+            f"**Total Invested:** {total_cost:,.0f} | "
+            f"**Market Value:** {total_val:,.0f} | "
+            f"**Unrealized P&L:** {total_pnl:+,.0f} ({total_pct:+.1f}%)",
+        ]
+        if cash > 0:
+            lines.append(f"**Cash:** {cash:,.0f} | **Total (incl. cash):** {grand_total:,.0f}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def ask_eisa_ai(messages, market_context: str, stock_count: int, language: str,
+                portfolio_context: str = "", file_context: str = "") -> str:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
@@ -470,7 +650,19 @@ def ask_eisa_ai(messages, market_context: str, stock_count: int, language: str) 
     except Exception:
         pass
 
-    macro_line = f"\nMacro context: {macro_ctx}" if macro_ctx else ""
+    macro_line     = f"\nMacro context: {macro_ctx}" if macro_ctx else ""
+    portfolio_line = f"\n\n{portfolio_context}" if portfolio_context else ""
+    file_line      = f"\n\nUploaded file context:\n{_clip_ai_context(file_context, limit=16000)}" if file_context else ""
+    portfolio_instruction = (
+        "\nThe user's ACTUAL portfolio is provided above — always refer to it when answering "
+        "portfolio-related questions. Use real position sizes and P&L in your analysis."
+        if portfolio_context else ""
+    )
+    file_instruction = (
+        "\nAn uploaded user file is provided above. Use it as the primary source for holdings, weights, "
+        "and portfolio structure whenever the user asks about that file."
+        if file_context else ""
+    )
     system_prompt = f"""You are Eisax, the official market intelligence assistant for EisaX.
 You are powered by DeepSeek internally, but you must never introduce yourself as DeepSeek.
 If asked who you are, reply that you are Eisax.
@@ -487,10 +679,11 @@ Use a strict structured format:
 3) Risks / Watchouts
 4) Monitoring Checklist (non-execution, what to track next)
 Keep the answer concise and data-first.
+{portfolio_instruction}{file_instruction}
 
 Market data (filtered, {stock_count} stocks):
 {market_context}
-{macro_line}
+{macro_line}{portfolio_line}{file_line}
 """
 
     payload = {
@@ -524,64 +717,186 @@ def _build_css(lang: str, dark: bool) -> str:
     hover_tx    = "4px" if lang == "en" else "-4px"
 
     if dark:
-        bg          = "#0f172a"
-        surface     = "#1e293b"
-        surface2    = "#334155"
-        text        = "#e2e8f0"
-        subtext     = "#94a3b8"
-        border_col  = "#334155"
-        header_bg   = "linear-gradient(135deg,#0f172a 0%,#1a1a4e 50%,#0f2a4a 100%)"
-        card_bg     = "rgba(30,41,59,0.85)"
-        tab_bg      = "rgba(30,41,59,0.9)"
-        grid_col    = "#1e293b"
-        app_bg      = "#0f172a"
-        glass_bg    = "rgba(30,41,59,0.6)"
-        glass_border = "rgba(100,116,139,0.2)"
-        shadow_soft = "rgba(0,0,0,0.3)"
-        accent_glow = "rgba(14,165,164,0.3)"
+        bg           = "#080e1a"
+        surface      = "#0f172a"
+        surface2     = "#1e293b"
+        text         = "#f1f5f9"
+        subtext      = "#94a3b8"
+        border_col   = "#1e293b"
+        header_bg    = "linear-gradient(135deg,#080e1a 0%,#0d1f3c 60%,#080e1a 100%)"
+        card_bg      = "rgba(15,23,42,0.8)"
+        tab_bg       = "rgba(15,23,42,0.95)"
+        grid_col     = "#1e293b"
+        app_bg       = "#080e1a"
+        glass_border = "rgba(56,189,248,0.12)"
+        shadow_soft  = "rgba(0,0,0,0.5)"
+        accent_glow  = "rgba(14,165,164,0.25)"
+        input_bg     = "#0f172a"
+        input_border = "#334155"
     else:
-        bg          = "#f0f2f5"
-        surface     = "white"
-        surface2    = "#f8fafc"
-        text        = "#0f172a"
-        subtext     = "#64748b"
-        border_col  = "#e2e8f0"
-        header_bg   = "linear-gradient(135deg,#ffffff 0%,#e0ecff 50%,#e8f0fe 100%)"
-        card_bg     = "rgba(255,255,255,0.85)"
-        tab_bg      = "rgba(255,255,255,0.9)"
-        grid_col    = "#f1f5f9"
-        app_bg      = "linear-gradient(135deg,#f5f7fa 0%,#e8ecf4 50%,#f0f2f5 100%)"
-        glass_bg    = "rgba(255,255,255,0.55)"
-        glass_border = "rgba(15,76,129,0.12)"
-        shadow_soft = "rgba(0,0,0,0.06)"
-        accent_glow = "rgba(15,76,129,0.15)"
+        bg           = "#f8fafc"
+        surface      = "#ffffff"
+        surface2     = "#f1f5f9"
+        text         = "#0f172a"
+        subtext      = "#475569"
+        border_col   = "#e2e8f0"
+        header_bg    = "linear-gradient(135deg,#ffffff 0%,#eff6ff 50%,#f0fdf4 100%)"
+        card_bg      = "rgba(255,255,255,0.9)"
+        tab_bg       = "rgba(255,255,255,0.95)"
+        grid_col     = "#f1f5f9"
+        app_bg       = "linear-gradient(160deg,#f8fafc 0%,#eff6ff 50%,#f0fdf4 100%)"
+        glass_border = "rgba(15,76,129,0.1)"
+        shadow_soft  = "rgba(15,23,42,0.08)"
+        accent_glow  = "rgba(14,165,164,0.15)"
+        input_bg     = "#ffffff"
+        input_border = "#cbd5e1"
 
-    return f"""
+    return f'''
     <style>
-        /* Google Fonts */
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Tajawal:wght@300;400;500;700&display=swap');
 
+        /* ── Base ── */
         .stApp {{
             background: {app_bg};
-            color: {text};
-            font-family: 'Inter', 'Segoe UI', sans-serif;
+            font-family: 'Inter','Tajawal','Segoe UI',sans-serif;
         }}
-        /* RTL scoped to content areas only — NOT .stApp root (breaks sidebar collapse) */
         .stMainBlockContainer, [data-testid="stSidebarContent"] {{
             direction: {direction};
         }}
-        .main {{ padding: 1rem; }}
 
-        /* ── Glassmorphism Header ──────────────────────────────────── */
+        /* ── ALL text inherits correctly ── */
+        .stApp, .stApp p, .stApp li, .stApp span, .stApp div,
+        .stMarkdown, .stMarkdown p, .stMarkdown li,
+        [data-testid="stMarkdownContainer"] p,
+        [data-testid="stMarkdownContainer"] li,
+        [data-testid="stMarkdownContainer"] span {{
+            color: {text};
+        }}
+
+        /* ── Headings ── */
+        .stApp h1,.stApp h2,.stApp h3,.stApp h4 {{
+            color: {text};
+            font-weight: 700;
+        }}
+
+        /* ── Captions & labels ── */
+        .stCaption, [data-testid="stCaptionContainer"] {{
+            color: {subtext} !important;
+        }}
+        label, .stLabel, [data-baseweb="label"],
+        .stTextInput label, .stSelectbox label,
+        .stNumberInput label, .stTextArea label,
+        .stSlider label, .stMultiSelect label {{
+            color: {subtext} !important;
+            font-size: .82rem !important;
+            font-weight: 500 !important;
+        }}
+
+        /* ── Input fields ── */
+        .stTextInput > div > div > input,
+        .stNumberInput > div > div > input,
+        .stTextArea > div > div > textarea {{
+            background: {input_bg} !important;
+            color: {text} !important;
+            border: 1px solid {input_border} !important;
+            border-radius: 10px !important;
+        }}
+        .stTextInput > div > div > input:focus,
+        .stNumberInput > div > div > input:focus,
+        .stTextArea > div > div > textarea:focus {{
+            border-color: #0ea5a4 !important;
+            box-shadow: 0 0 0 2px rgba(14,165,164,0.2) !important;
+        }}
+        .stTextInput > div > div > input::placeholder,
+        .stTextArea > div > div > textarea::placeholder {{
+            color: {subtext} !important;
+            opacity: 0.7;
+        }}
+
+        /* ── Select / Dropdown ── */
+        [data-baseweb="select"] > div,
+        [data-baseweb="select"] > div > div {{
+            background: {input_bg} !important;
+            color: {text} !important;
+            border-color: {input_border} !important;
+            border-radius: 10px !important;
+        }}
+        [data-baseweb="popover"] [role="option"] {{
+            background: {surface} !important;
+            color: {text} !important;
+        }}
+        [data-baseweb="popover"] [role="option"]:hover {{
+            background: {surface2} !important;
+        }}
+
+        /* ── Sidebar ── */
+        [data-testid="stSidebar"] {{
+            background: {surface} !important;
+            border-{border_side}: 2px solid {glass_border};
+        }}
+        [data-testid="stSidebar"] * {{ color: {text}; }}
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] .stCaption {{ color: {subtext} !important; }}
+        [data-testid="stSidebar"] input,
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {{
+            background: {surface2} !important;
+            color: {text} !important;
+            border-color: {input_border} !important;
+        }}
+
+        /* ── Metric (st.metric) ── */
+        [data-testid="stMetricValue"] {{ color: {text} !important; font-weight: 800; font-size: 1.6rem; }}
+        [data-testid="stMetricLabel"] {{ color: {subtext} !important; font-size: .8rem; font-weight: 500; }}
+        [data-testid="stMetricDelta"] {{ font-weight: 600; }}
+
+        /* ── Expanders ── */
+        .streamlit-expanderHeader,
+        [data-testid="stExpander"] summary {{
+            background: {surface} !important;
+            color: {text} !important;
+            border-radius: 12px;
+            border: 1px solid {glass_border};
+            padding: .6rem 1rem;
+        }}
+        [data-testid="stExpander"] {{
+            border: 1px solid {glass_border} !important;
+            border-radius: 12px !important;
+            background: {surface} !important;
+        }}
+        [data-testid="stExpander"] > div > div {{ background: {surface}; color: {text}; }}
+
+        /* ── Dataframe ── */
+        .stDataFrame {{ border-radius: 14px; overflow: hidden; border: 1px solid {glass_border}; }}
+        .stDataFrame [data-testid="stDataFrameResizable"] {{
+            background: {surface} !important;
+        }}
+        .stDataFrame th {{
+            background: {surface2} !important;
+            color: {text} !important;
+            font-weight: 600;
+        }}
+        .stDataFrame td {{ color: {text} !important; background: {surface} !important; }}
+
+        /* ── Alerts / Info boxes ── */
+        [data-testid="stAlert"] {{
+            border-radius: 12px;
+            border: 1px solid {glass_border};
+        }}
+        .stAlert [data-testid="stMarkdownContainer"] p {{ color: {text} !important; }}
+
+        /* ── Main header ── */
+        @keyframes gradientShift {{
+            0% {{ background-position: 0% 50%; }}
+            50% {{ background-position: 100% 50%; }}
+            100% {{ background-position: 0% 50%; }}
+        }}
         .main-header {{
             background: {header_bg};
-            backdrop-filter: blur(16px);
-            -webkit-backdrop-filter: blur(16px);
             border-radius: 24px;
-            padding: 2rem 1.5rem;
+            padding: 2.2rem 2rem;
             margin-bottom: 1.5rem;
             text-align: center;
-            box-shadow: 0 8px 32px {shadow_soft}, inset 0 1px 0 {glass_border};
+            box-shadow: 0 8px 40px {shadow_soft};
             border: 1px solid {glass_border};
             position: relative;
             overflow: hidden;
@@ -589,20 +904,28 @@ def _build_css(lang: str, dark: bool) -> str:
         .main-header::before {{
             content: '';
             position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 30% 30%, {accent_glow} 0%, transparent 60%);
+            inset: 0;
+            background: radial-gradient(ellipse at 20% 50%, {accent_glow} 0%, transparent 60%),
+                        radial-gradient(ellipse at 80% 20%, rgba(99,102,241,0.1) 0%, transparent 50%);
             pointer-events: none;
         }}
+        .main-header::after {{
+            content: '';
+            position: absolute;
+            bottom: 0; left: 10%; right: 10%;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, #0ea5a4, transparent);
+        }}
         .main-header h1 {{
-            color: #0f4c81;
-            font-size: 2.2rem;
+            font-size: 2.4rem;
             font-weight: 800;
-            margin-bottom: .4rem;
+            margin-bottom: .3rem;
             letter-spacing: -0.02em;
             position: relative;
+            background: linear-gradient(135deg, #38bdf8 0%, #0ea5a4 50%, #818cf8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }}
         .main-header p {{
             color: {subtext};
@@ -610,243 +933,267 @@ def _build_css(lang: str, dark: bool) -> str:
             position: relative;
         }}
 
-        /* ── Pulse indicator ──────────────────────────────────────── */
+        /* ── Pulse ── */
         @keyframes pulse-live {{
-            0%, 100% {{ opacity: 1; transform: scale(1); }}
-            50% {{ opacity: 0.5; transform: scale(1.3); }}
+            0%,100% {{ opacity:1; transform:scale(1); }}
+            50%      {{ opacity:.5; transform:scale(1.4); }}
         }}
         .live-dot {{
-            display: inline-block;
-            width: 8px; height: 8px;
-            background: #10b981;
-            border-radius: 50%;
-            margin-inline-end: 6px;
-            animation: pulse-live 2s ease-in-out infinite;
-            vertical-align: middle;
+            display:inline-block; width:8px; height:8px;
+            background:#10b981; border-radius:50%;
+            margin-inline-end:6px;
+            animation:pulse-live 2s ease-in-out infinite;
+            vertical-align:middle;
+            box-shadow: 0 0 8px #10b981;
         }}
 
-        /* ── Sidebar ──────────────────────────────────────────────── */
-        [data-testid="stSidebar"] {{
-            background: {surface} !important;
-            border-{border_side}: 1px solid {border_col};
-        }}
-
-        /* ── Metric card (glassmorphism) ──────────────────────────── */
-        @keyframes countUp {{
-            from {{ opacity: 0; transform: translateY(10px); }}
-            to   {{ opacity: 1; transform: translateY(0); }}
+        /* ── Metric card ── */
+        @keyframes fadeSlideUp {{
+            from {{ opacity:0; transform:translateY(16px); }}
+            to   {{ opacity:1; transform:translateY(0); }}
         }}
         .metric-card {{
             background: {card_bg};
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
             border-radius: 20px;
-            padding: 1.2rem 1rem;
+            padding: 1.3rem 1rem;
             text-align: center;
-            box-shadow: 0 4px 16px {shadow_soft};
-            transition: all .35s cubic-bezier(.4,0,.2,1);
+            box-shadow: 0 4px 24px {shadow_soft};
             border: 1px solid {glass_border};
-            animation: countUp 0.6s ease-out;
+            animation: fadeSlideUp 0.5s ease-out both;
+            transition: transform .3s cubic-bezier(.4,0,.2,1), box-shadow .3s ease;
+            position: relative;
+            overflow: hidden;
+        }}
+        .metric-card::before {{
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, #0f4c81, #0ea5a4);
         }}
         .metric-card:hover {{
-            transform: translateY(-5px) scale(1.02);
-            box-shadow: 0 12px 32px {shadow_soft}, 0 0 0 1px {accent_glow};
+            transform: translateY(-6px);
+            box-shadow: 0 16px 40px {shadow_soft};
         }}
         .metric-value {{
-            font-size: 1.9rem;
+            font-size: 2rem;
             font-weight: 800;
-            color: #0f4c81;
             letter-spacing: -0.03em;
+            background: linear-gradient(135deg, #38bdf8, #0ea5a4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
         }}
         .metric-label {{
-            font-size: .82rem;
+            font-size: .78rem;
             color: {subtext};
             margin-top: .3rem;
             font-weight: 500;
             text-transform: uppercase;
-            letter-spacing: 0.04em;
+            letter-spacing: .06em;
         }}
 
-        /* ── Sentiment Bar ────────────────────────────────────────── */
+        /* ── Sentiment bar ── */
         .sentiment-bar {{
             background: {card_bg};
             backdrop-filter: blur(12px);
             border-radius: 16px;
-            padding: 1rem 1.2rem;
+            padding: 1rem 1.4rem;
             margin-bottom: 1rem;
             border: 1px solid {glass_border};
-            box-shadow: 0 2px 12px {shadow_soft};
+            box-shadow: 0 2px 16px {shadow_soft};
         }}
         .sentiment-track {{
-            height: 10px;
+            height: 8px;
             border-radius: 8px;
-            background: linear-gradient(90deg, #ef4444 0%, #f59e0b 50%, #10b981 100%);
-            overflow: hidden;
+            background: linear-gradient(90deg,#ef4444 0%,#f59e0b 45%,#10b981 100%);
             position: relative;
-        }}
-        .sentiment-fill {{
-            height: 100%;
-            border-radius: 8px;
-            transition: width 1s ease-out;
+            overflow: visible;
         }}
 
-        /* ── Stock card ───────────────────────────────────────────── */
+        /* ── Stock card ── */
         .stock-card {{
             background: {card_bg};
             backdrop-filter: blur(8px);
             border-radius: 16px;
-            padding: 1.2rem;
-            margin: .6rem 0;
-            box-shadow: 0 2px 8px {shadow_soft};
-            border-{card_border}: 4px solid #0f4c81;
+            padding: 1.1rem 1.2rem;
+            margin: .5rem 0;
+            box-shadow: 0 2px 12px {shadow_soft};
+            border-{card_border}: 3px solid #0ea5a4;
             border-top: 1px solid {glass_border};
-            transition: all .35s cubic-bezier(.4,0,.2,1);
+            border-bottom: 1px solid {glass_border};
+            border-{border_side}: 1px solid {glass_border};
+            transition: transform .3s cubic-bezier(.4,0,.2,1), box-shadow .3s ease;
         }}
         .stock-card:hover {{
             transform: translateX({hover_tx});
-            box-shadow: 0 8px 24px {shadow_soft};
+            box-shadow: 0 8px 28px {shadow_soft};
         }}
+        .stock-card * {{ color: {text} !important; }}
 
-        /* ── Badges ───────────────────────────────────────────────── */
-        .badge-success {{ background:#d1fae5; color:#065f46; padding:.25rem .75rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
-        .badge-warning {{ background:#fed7aa; color:#92400e; padding:.25rem .75rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
-        .badge-danger  {{ background:#fee2e2; color:#991b1b; padding:.25rem .75rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
-        .badge-info    {{ background:#dbeafe; color:#1e40af; padding:.25rem .75rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
+        /* ── Badges ── */
+        .badge-success {{ background:rgba(16,185,129,.15); color:#10b981; border:1px solid rgba(16,185,129,.3); padding:.2rem .7rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
+        .badge-warning {{ background:rgba(245,158,11,.15); color:#f59e0b; border:1px solid rgba(245,158,11,.3); padding:.2rem .7rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
+        .badge-danger  {{ background:rgba(239,68,68,.15);  color:#ef4444; border:1px solid rgba(239,68,68,.3);  padding:.2rem .7rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
+        .badge-info    {{ background:rgba(56,189,248,.15); color:#38bdf8; border:1px solid rgba(56,189,248,.3); padding:.2rem .7rem; border-radius:20px; font-size:.75rem; font-weight:600; display:inline-block; }}
 
-        /* ── Tabs (glow on active) ────────────────────────────────── */
+        /* ── Tabs ── */
         .stTabs [data-baseweb="tab-list"] {{
-            gap:.5rem;
+            gap:.4rem;
             background: {tab_bg};
-            backdrop-filter: blur(10px);
+            backdrop-filter: blur(12px);
             border-radius: 16px;
-            padding: .5rem;
+            padding: .4rem;
             border: 1px solid {glass_border};
-            margin-bottom: 1rem;
+            margin-bottom: 1.2rem;
             flex-wrap: wrap;
-            box-shadow: 0 2px 8px {shadow_soft};
+            box-shadow: 0 4px 16px {shadow_soft};
         }}
         .stTabs [data-baseweb="tab"] {{
             border-radius: 12px;
-            padding: .5rem 1.2rem;
+            padding: .5rem 1.1rem;
             font-weight: 600;
-            color: {subtext};
-            white-space: nowrap;
-            transition: all .25s ease;
-            font-family: 'Inter', sans-serif;
+            font-size: .88rem;
+            color: {subtext} !important;
+            transition: all .2s ease;
+            border: 1px solid transparent;
         }}
         .stTabs [data-baseweb="tab"]:hover {{
-            background: {accent_glow};
+            background: {surface2};
+            color: {text} !important;
         }}
         .stTabs [aria-selected="true"] {{
-            background: linear-gradient(135deg, #0f4c81, #0ea5a4) !important;
+            background: linear-gradient(135deg,#0f4c81,#0ea5a4) !important;
             color: white !important;
-            box-shadow: 0 4px 16px {accent_glow};
+            box-shadow: 0 4px 16px rgba(14,165,164,0.35);
+            border-color: transparent !important;
         }}
 
-        /* ── Buttons ──────────────────────────────────────────────── */
+        /* ── Buttons ── */
         .stButton > button {{
-            background: linear-gradient(135deg, #0f4c81, #0ea5a4);
-            color: white;
+            background: linear-gradient(135deg,#0f4c81,#0ea5a4);
+            color: white !important;
             border: none;
             border-radius: 12px;
-            padding: .55rem 1.1rem;
+            padding: .55rem 1.2rem;
             font-weight: 600;
-            font-family: 'Inter', sans-serif;
+            font-family: 'Inter','Tajawal',sans-serif;
+            font-size: .9rem;
             transition: all .25s cubic-bezier(.4,0,.2,1);
-            box-shadow: 0 2px 8px rgba(15,76,129,0.2);
+            box-shadow: 0 2px 12px rgba(14,165,164,0.25);
         }}
         .stButton > button:hover {{
             transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(15,76,129,0.3);
+            box-shadow: 0 6px 24px rgba(14,165,164,0.4);
+        }}
+        .stButton > button[kind="secondary"] {{
+            background: {surface2} !important;
+            color: {text} !important;
+            box-shadow: none;
+            border: 1px solid {glass_border} !important;
         }}
 
-        /* ── AI chat bubble ───────────────────────────────────────── */
+        /* ── Chat bubbles ── */
         .chat-user {{
-            background: linear-gradient(135deg, #0f4c81, #0ea5a4);
-            color: white;
+            background: linear-gradient(135deg,#0f4c81,#0ea5a4);
+            color: white !important;
             border-radius: 20px 20px 4px 20px;
-            padding: .85rem 1.2rem;
+            padding: .9rem 1.2rem;
             margin: .5rem 0 .5rem auto;
             max-width: 75%;
-            text-align: {("right" if lang == "ar" else "left")};
-            box-shadow: 0 2px 8px rgba(15,76,129,0.2);
+            box-shadow: 0 4px 16px rgba(14,165,164,0.3);
+            font-size: .93rem;
+            line-height: 1.6;
         }}
         .chat-ai {{
             background: {card_bg};
             backdrop-filter: blur(8px);
-            color: {text};
+            color: {text} !important;
             border-radius: 20px 20px 20px 4px;
-            padding: .85rem 1.2rem;
+            padding: .9rem 1.2rem;
             margin: .5rem auto .5rem 0;
             max-width: 85%;
             border: 1px solid {glass_border};
-            box-shadow: 0 2px 8px {shadow_soft};
+            box-shadow: 0 4px 16px {shadow_soft};
+            font-size: .93rem;
+            line-height: 1.7;
         }}
+        .chat-ai * {{ color: {text} !important; }}
 
-        /* ── Cache pill ───────────────────────────────────────────── */
-        .cache-pill-fresh  {{ background:#d1fae5; color:#065f46; padding:.2rem .6rem; border-radius:20px; font-size:.7rem; }}
-        .cache-pill-stale  {{ background:#fee2e2; color:#991b1b; padding:.2rem .6rem; border-radius:20px; font-size:.7rem; }}
+        /* ── User badge card ── */
+        .user-badge-card {{
+            background: {surface2};
+            border-radius: 14px;
+            padding: .8rem 1rem;
+            border: 1px solid {glass_border};
+            margin-bottom: .5rem;
+            display: flex;
+            align-items: center;
+            gap: .75rem;
+        }}
+        .user-badge-avatar {{
+            width:38px; height:38px;
+            background: linear-gradient(135deg,#0f4c81,#0ea5a4);
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; color: white; font-size: .95rem; flex-shrink: 0;
+        }}
+        .user-badge-info {{ flex:1; min-width:0; }}
+        .user-badge-name {{ font-weight:600; color:{text}; font-size:.88rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+        .user-badge-email {{ font-size:.72rem; color:{subtext}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 
-        /* ── Positive / Negative ──────────────────────────────────── */
-        .positive {{ color:#10b981; font-weight:700; }}
-        .negative {{ color:#ef4444; font-weight:700; }}
+        /* ── Cache pills ── */
+        .cache-pill-fresh {{ background:rgba(16,185,129,.15); color:#10b981; padding:.2rem .6rem; border-radius:20px; font-size:.72rem; border:1px solid rgba(16,185,129,.3); }}
+        .cache-pill-stale {{ background:rgba(239,68,68,.15); color:#ef4444; padding:.2rem .6rem; border-radius:20px; font-size:.72rem; border:1px solid rgba(239,68,68,.3); }}
 
-        /* ── Premium divider ──────────────────────────────────────── */
+        /* ── Positive / Negative ── */
+        .positive {{ color:#10b981 !important; font-weight:700; }}
+        .negative {{ color:#ef4444 !important; font-weight:700; }}
+
+        /* ── Divider ── */
         hr {{ margin:1.2rem 0; border:none; height:1px; background:linear-gradient(to right,transparent,{border_col},transparent); }}
 
-        /* ── Footer ───────────────────────────────────────────────── */
+        /* ── Footer ── */
         .eisax-footer {{
             background: {card_bg};
             backdrop-filter: blur(12px);
             border-radius: 16px;
             padding: .8rem 1.5rem;
             margin-top: 1.5rem;
+            border-top: 2px solid {glass_border};
             border: 1px solid {glass_border};
-            box-shadow: 0 -2px 12px {shadow_soft};
+            box-shadow: 0 -2px 16px {shadow_soft};
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
             gap: .5rem;
         }}
-        .eisax-footer span {{
-            font-size: .8rem;
-            color: {subtext};
-            font-weight: 500;
-        }}
+        .eisax-footer span {{ font-size:.8rem; color:{subtext}; font-weight:500; }}
         .eisax-footer .brand {{
-            font-weight: 700;
-            background: linear-gradient(135deg, #0f4c81, #0ea5a4);
+            font-weight:800;
+            background: linear-gradient(135deg,#38bdf8,#0ea5a4);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }}
 
-        /* ── Search box ───────────────────────────────────────────── */
-        .stock-search {{
-            background: {card_bg};
-            border-radius: 12px;
-            padding: .4rem .8rem;
-            border: 1px solid {glass_border};
-            margin-bottom: .8rem;
-        }}
+        /* ── Scrollbar ── */
+        ::-webkit-scrollbar {{ width:5px; height:5px; }}
+        ::-webkit-scrollbar-track {{ background:{surface}; border-radius:10px; }}
+        ::-webkit-scrollbar-thumb {{ background:linear-gradient(135deg,#0f4c81,#0ea5a4); border-radius:10px; }}
 
-        /* ── Dataframe ────────────────────────────────────────────── */
-        .stDataFrame {{ border-radius: 16px; overflow: hidden; }}
-
-        /* ── Scrollbar ────────────────────────────────────────────── */
-        ::-webkit-scrollbar {{ width: 6px; height: 6px; }}
-        ::-webkit-scrollbar-track {{ background: {surface2}; border-radius: 10px; }}
-        ::-webkit-scrollbar-thumb {{ background: linear-gradient(135deg, #0f4c81, #0ea5a4); border-radius: 10px; }}
-
-        /* ── Responsive ───────────────────────────────────────────── */
+        /* ── Responsive ── */
         @media (max-width:768px) {{
-            .main-header h1 {{ font-size: 1.5rem; }}
-            .metric-value    {{ font-size: 1.3rem; }}
-            .eisax-footer {{ flex-direction: column; text-align: center; }}
+            .main-header h1 {{ font-size:1.6rem; }}
+            .metric-value {{ font-size:1.4rem; }}
+            .eisax-footer {{ flex-direction:column; text-align:center; }}
+            .chat-user,.chat-ai {{ max-width:95%; }}
         }}
     </style>
-    """
+    '''
 
 st.markdown(
     _build_css(st.session_state.language, st.session_state.dark_mode),
@@ -932,18 +1279,21 @@ df, cache_status = load_data_cached()
 _, fetcher_obj, qe = _get_pipeline()
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
-def style_chart(fig, height=400):
+def style_chart(fig, height=400, show_legend=None):
     bg = "#1e293b" if st.session_state.dark_mode else "white"
     tc = "#94a3b8" if st.session_state.dark_mode else "#475569"
     gc = "#334155" if st.session_state.dark_mode else "#f1f5f9"
-    fig.update_layout(
+    layout_kwargs = dict(
         template="plotly_dark" if st.session_state.dark_mode else "plotly_white",
         plot_bgcolor=bg, paper_bgcolor=bg,
-        font=dict(family="Arial, sans-serif", size=12, color=tc),
+        font=dict(family="Inter, Tajawal, sans-serif", size=12, color=tc),
         title_font=dict(size=15, color="#0f4c81"),
         margin=dict(l=20, r=20, t=50, b=30),
         height=height,
     )
+    if show_legend is not None:
+        layout_kwargs["showlegend"] = show_legend
+    fig.update_layout(**layout_kwargs)
     fig.update_xaxes(showgrid=False, linecolor=gc)
     fig.update_yaxes(showgrid=True, gridcolor=gc, linecolor=gc)
     return fig
@@ -988,6 +1338,13 @@ def compute_opportunity_score(row: pd.Series) -> float:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
+    show_user_badge()
+    # Agent status indicator
+    agent_ok = _get_eisax_agent() is not None
+    _status_color = '#10b981' if agent_ok else '#f59e0b'
+    _status_text  = ('🟢 EisaX Agent متصل' if st.session_state.get('language','ar') == 'ar' else '🟢 EisaX Agent connected') if agent_ok else ('🟡 وضع احتياطي' if st.session_state.get('language','ar') == 'ar' else '🟡 Fallback mode')
+    st.sidebar.markdown(f'<div style="font-size:.75rem;color:{_status_color};margin-bottom:.5rem">{_status_text}</div>', unsafe_allow_html=True)
+    st.markdown("---")
     # Language + dark mode row
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
@@ -1048,6 +1405,8 @@ with st.sidebar:
     # Stats + cache health
     if not df.empty:
         st.metric(t("total_stocks"), len(df))
+        st.caption(("In cache — apply filters to narrow down" if st.session_state.language == "en"
+                    else f"في الكاش — بعد الفلاتر: {len(filtered_df) if 'filtered_df' in dir() else '…'}"))
 
     if cache_status and "_source" not in cache_status:
         st.markdown(f"**{t('cache_health')}**")
@@ -1115,7 +1474,7 @@ st.markdown(f"""
 <div class="sentiment-bar">
     <div style="display:flex;justify-content:space-between;margin-bottom:.5rem;">
         <span style="color:#10b981;font-weight:700;">📈 {up} ({up_pct:.0f}%)</span>
-        <span style="color:#64748b;font-weight:600;">{len(filtered_df)} {t('stocks_count')}</span>
+        <span style="color:#64748b;font-weight:600;">{len(filtered_df)} {t('stocks_count')} {"/ " + str(len(df)) + " total" if len(filtered_df) != len(df) else ""}</span>
         <span style="color:#ef4444;font-weight:700;">📉 {dn} ({dn/n*100:.0f}%)</span>
     </div>
     <div style="display:flex;border-radius:8px;overflow:hidden;height:10px;">
@@ -1128,7 +1487,8 @@ st.markdown(f"""
 
 cols = st.columns(5)
 with cols[0]:
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{len(filtered_df)}</div><div class="metric-label">{t("stocks_count")}</div></div>', unsafe_allow_html=True)
+    _fc_label = t("stocks_count") + (f" / {len(df)}" if len(filtered_df) != len(df) else "")
+    st.markdown(f'<div class="metric-card"><div class="metric-value">{len(filtered_df)}</div><div class="metric-label">{_fc_label}</div></div>', unsafe_allow_html=True)
 
 with cols[1]:
     st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:#10b981;">{up} ({up_pct:.0f}%)</div><div class="metric-label">📈 {t("advancers")}</div></div>', unsafe_allow_html=True)
@@ -1145,7 +1505,8 @@ with cols[4]:
     st.markdown(f'<div class="metric-card"><div class="metric-value" style="color:{cc};">{avg_ch:+.2f}%</div><div class="metric-label">{t("avg_change")}</div></div>', unsafe_allow_html=True)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+_is_admin = _current_user.get("role") == "admin"
+_tab_labels = [
     f"📋 {t('stocks_tab')}",
     f"🎯 {t('opportunities_tab')}",
     f"📈 {t('analysis_tab')}",
@@ -1156,7 +1517,13 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     f"🏭 {t('commodities_tab')}",
     f"💱 {t('forex_tab')}",
     f"🪙 {t('crypto_tab')}",
-])
+]
+if _is_admin:
+    _tab_labels.append("🛡️ Admin")
+
+_all_tabs = st.tabs(_tab_labels)
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = _all_tabs[:10]
+tab_admin = _all_tabs[10] if _is_admin else None
 
 # ═══════════════════════════════════════════════════════
 # TAB 1 — Stocks list
@@ -1207,7 +1574,7 @@ with tab1:
         if picked != "—" and picked not in st.session_state.watchlist:
             if st.button(t("add"), key="add_wl_tab1"):
                 st.session_state.watchlist.append(picked)
-                _wl_add(picked)
+                _wl_add(picked, str(_uid))
                 st.success(f"✅ {picked} → {t('watchlist_tab')}")
 
 # ═══════════════════════════════════════════════════════
@@ -1386,13 +1753,46 @@ with tab5:
         with st.expander("ℹ️ " + ("How to enter holdings" if st.session_state.language == "en" else "كيفية إدخال الأسهم")):
             st.markdown(f"**{t('format_example')}**\n```\n{t('example')}\nuae:FAB 500 18.00\nksa:2222.SR 300 30.00\n```")
 
-        holdings_text = st.text_area(t("holdings"),
-                                     value="uae:EMAAR 1000 14.50\nuae:FAB 500 18.00\nksa:2222.SR 300 30.00",
-                                     height=150)
+        # ── Saved portfolios (Phase J) ─────────────────────────────────────────
+        _saved = _ptf_load(_uid)
+        _default_holdings = "uae:EMAAR 1000 14.50\nuae:FAB 500 18.00\nksa:2222.SR 300 30.00"
+
+        if _saved:
+            _ptf_names = ["— " + ("new" if st.session_state.language == "en" else "جديد") + " —"] + [p["name"] for p in _saved]
+            _sel = st.selectbox(
+                "📂 " + ("Load saved portfolio" if st.session_state.language == "en" else "تحميل محفظة محفوظة"),
+                _ptf_names, key="ptf_load_sel"
+            )
+            if _sel != _ptf_names[0]:
+                _match = next((p for p in _saved if p["name"] == _sel), None)
+                if _match:
+                    _default_holdings = _match["holdings"]
+
+        holdings_text = st.text_area(t("holdings"), value=_default_holdings, height=150)
         target_text = st.text_input(
             "🎯 " + ("Target sector allocation (optional)" if st.session_state.language == "en" else "توزيع القطاعات المستهدف (اختياري)"),
             placeholder="Finance:40 Energy:30 Technology:20",
         )
+
+        # ── Save portfolio row ─────────────────────────────────────────────────
+        _sc1, _sc2, _sc3 = st.columns([3, 1, 1])
+        with _sc1:
+            _ptf_name_input = st.text_input(
+                "💾 " + ("Save as..." if st.session_state.language == "en" else "احفظ باسم..."),
+                placeholder="My Portfolio", label_visibility="collapsed",
+                key="ptf_name_input"
+            )
+        with _sc2:
+            if st.button("💾 " + ("Save" if st.session_state.language == "en" else "حفظ"), use_container_width=True):
+                _name = _ptf_name_input.strip() or "محفظتي"
+                if _ptf_save(_uid, _name, holdings_text):
+                    st.success(f"✅ {'Saved' if st.session_state.language == 'en' else 'تم الحفظ'}: {_name}")
+                    st.rerun()
+        with _sc3:
+            if _saved and st.session_state.get("ptf_load_sel") and st.session_state.ptf_load_sel not in ["— جديد —", "— new —"]:
+                if st.button("🗑️ " + ("Delete" if st.session_state.language == "en" else "حذف"), use_container_width=True):
+                    _ptf_delete(_uid, st.session_state.ptf_load_sel)
+                    st.rerun()
 
         if st.button(f"🔍 {t('analyze')}", type="primary", use_container_width=True):
             p = Portfolio(qe)
@@ -1421,6 +1821,9 @@ with tab5:
                     except ImportError:
                         market_code = "uae"
                     ticker = raw
+                # Normalize: uppercase + strip whitespace
+                ticker = ticker.strip().upper()
+                market_code = market_code.strip().lower()
                 p.add(ticker, market=market_code, qty=qty, cost_basis=cost)
 
             for err in parse_errors:
@@ -1468,6 +1871,1271 @@ with tab5:
                 md_report = p.to_markdown(target_weights or None)
                 st.download_button(f"📥 {t('download')} Report", md_report.encode("utf-8"), "eisax_portfolio_report.md", "text/markdown")
 
+        # ══════════════════════════════════════════════════
+        # POSITIONS TRACKER + ANALYZE FROM POSITIONS
+        # ══════════════════════════════════════════════════
+        st.markdown("---")
+        st.markdown("#### 📌 " + ("Positions Tracker" if st.session_state.language == "en" else "متابعة الصفقات"))
+
+        try:
+            from core.portfolio_tracker import PortfolioTracker
+            _tracker  = PortfolioTracker()
+            _ptf_data = _tracker.get_portfolio(str(_uid))
+            _positions = _ptf_data.get("positions", [])
+
+            # bilingual helper — available throughout the whole tracker block
+            _ar = st.session_state.language == "ar"
+            def _bi(ar_txt, en_txt): return ar_txt if _ar else en_txt
+
+            # ── Add Position form ─────────────────────────────────────────────
+            _MARKET_OPTIONS = ["uae","ksa","egypt","qatar","bahrain","kuwait",
+                               "morocco","tunisia","america","commodities","crypto"]
+            with st.expander("➕ " + ("Add Position" if st.session_state.language == "en" else "إضافة صفقة"),
+                             expanded=not _positions):
+                pf1, pf2, pf3, pf4, pf5 = st.columns([2, 1.5, 1, 1, 1])
+                with pf1:
+                    _pt_ticker = st.text_input("Ticker", placeholder="EMAAR", key="pt_ticker").upper().strip()
+                with pf2:
+                    _pt_market = st.selectbox("Market", _MARKET_OPTIONS, key="pt_market")
+                with pf3:
+                    _pt_shares = st.number_input("Shares", min_value=0.01, value=100.0, step=1.0, key="pt_shares")
+                with pf4:
+                    _pt_price  = st.number_input("Buy Price", min_value=0.001, value=10.0, step=0.01, key="pt_price")
+                with pf5:
+                    _pt_date   = st.date_input("Date", key="pt_date")
+
+                if st.button("➕ " + ("Add" if st.session_state.language == "en" else "إضافة"), key="pt_add", type="primary"):
+                    if _pt_ticker:
+                        _tracker.add_position(str(_uid), _pt_ticker, _pt_shares, _pt_price,
+                                              date=str(_pt_date), market=_pt_market)
+                        st.success(f"✅ {_pt_ticker} ({_pt_market.upper()}) added")
+                        st.rerun()
+                    else:
+                        st.error("أدخل رمز السهم")
+
+            if not _positions:
+                st.info("لا توجد صفقات مسجّلة بعد — أضف أولى صفقاتك أعلاه" if st.session_state.language == "ar"
+                        else "No positions yet — add your first trade above.")
+            else:
+                # ── Build enriched position rows from parquet cache ───────────
+                _total_cost = 0.0
+                _total_val  = 0.0
+                _pos_rows   = []
+                _ptf_for_analysis = []  # (ticker, market, shares, cost)
+
+                for _pos in _positions:
+                    _tk   = _pos["ticker"]
+                    _mkt  = _pos.get("market", "uae")
+                    _sh   = _pos["shares"]
+                    _cost = _pos["purchase_price"]
+
+                    # look up current price in parquet
+                    _cur_price, _rsi_val = None, None
+                    if not df.empty and "name" in df.columns:
+                        _m = df[df["name"] == _tk]
+                        if not _m.empty:
+                            _cur_price = _m.iloc[0].get("close")
+                            _rsi_val   = _m.iloc[0].get("RSI")
+
+                    _cost_total = _sh * _cost
+                    _total_cost += _cost_total
+                    if _cur_price:
+                        _val   = _sh * float(_cur_price)
+                        _pnl   = _val - _cost_total
+                        _pnl_p = (_pnl / _cost_total * 100) if _cost_total else 0
+                        _total_val += _val
+                    else:
+                        _val, _pnl, _pnl_p = None, None, None
+
+                    _ptf_for_analysis.append({"ticker": _tk, "market": _mkt,
+                                              "shares": _sh, "cost": _cost,
+                                              "cur_price": _cur_price, "rsi": _rsi_val,
+                                              "val": _val, "pnl": _pnl, "pnl_pct": _pnl_p})
+                    _pos_rows.append({
+                        "Ticker":     _tk,
+                        "Market":     _mkt.upper(),
+                        "Shares":     _sh,
+                        "Buy":        round(_cost, 3),
+                        "Current":    round(float(_cur_price), 3) if _cur_price else "—",
+                        "Cost Basis": f"{_cost_total:,.2f}",
+                        "P&L":        f"{_pnl:+,.2f} ({_pnl_p:+.1f}%)" if _pnl is not None else "—",
+                        "RSI":        round(float(_rsi_val), 1) if _rsi_val else "—",
+                        "Date":       _pos.get("purchase_date", "—"),
+                    })
+
+                # ── Cash field ────────────────────────────────────────────────
+                _cash_val = float(_ptf_data.get("cash", 0.0))
+                _cash_c1, _cash_c2 = st.columns([3, 1])
+                with _cash_c1:
+                    _new_cash = st.number_input(
+                        "💵 " + ("Cash available (in portfolio currency)" if st.session_state.language == "en"
+                                 else "السيولة النقدية المتاحة (بعملة المحفظة)"),
+                        min_value=0.0, value=_cash_val, step=1000.0, key="pt_cash_input", format="%.2f")
+                with _cash_c2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if st.button("💾 " + ("Save" if st.session_state.language == "en" else "حفظ"),
+                                 key="pt_cash_save", use_container_width=True):
+                        _tracker.set_cash(str(_uid), _new_cash)
+                        st.rerun()
+                _cash_val = _new_cash  # use latest value
+
+                # ── Summary Card ──────────────────────────────────────────────
+                _total_with_cash = (_total_val + _cash_val) if _total_val else _cash_val
+                _cash_pct  = (_cash_val / _total_with_cash * 100) if _total_with_cash else 0
+                _unreal_gain = _total_val - _total_cost if _total_val else None
+                _unreal_pct  = (_unreal_gain / _total_cost * 100) if (_unreal_gain is not None and _total_cost) else None
+
+                _winners = sorted([p for p in _ptf_for_analysis if p["pnl_pct"] is not None],
+                                  key=lambda x: x["pnl_pct"], reverse=True)
+                _top_w   = _winners[0]  if _winners else None
+                _top_l   = _winners[-1] if len(_winners) > 1 else None
+
+                sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+                with sc1:
+                    st.metric("💰 " + ("Invested" if st.session_state.language == "en" else "مستثمر"),
+                              f"{_total_cost:,.0f}")
+                with sc2:
+                    _val_str = f"{_total_val:,.0f}" if _total_val else "—"
+                    st.metric("📊 " + ("Market Value" if st.session_state.language == "en" else "قيمة السوق"),
+                              _val_str)
+                with sc3:
+                    if _unreal_gain is not None:
+                        _gc = "#10b981" if _unreal_gain >= 0 else "#ef4444"
+                        st.markdown(f"<div><strong>{'P&L' if st.session_state.language == 'en' else 'ربح/خسارة'}</strong>"
+                                    f"<br><span style='color:{_gc};font-size:1.15rem;font-weight:700'>"
+                                    f"{_unreal_gain:+,.0f} ({_unreal_pct:+.1f}%)</span></div>",
+                                    unsafe_allow_html=True)
+                    else:
+                        st.metric("P&L", "—")
+                with sc4:
+                    _cash_c = "#10b981" if _cash_pct < 20 else "#f59e0b" if _cash_pct < 40 else "#ef4444"
+                    st.markdown(f"<div><strong>💵 {'Cash' if st.session_state.language == 'en' else 'سيولة'}</strong>"
+                                f"<br><span style='color:{_cash_c};font-size:1.15rem;font-weight:700'>"
+                                f"{_cash_val:,.0f} ({_cash_pct:.0f}%)</span></div>",
+                                unsafe_allow_html=True)
+                with sc5:
+                    _wl_txt = ""
+                    if _top_w:
+                        _wl_txt += f"🏆 {_top_w['ticker']} {_top_w['pnl_pct']:+.1f}%"
+                    if _top_l:
+                        _wl_txt += f"\n🔻 {_top_l['ticker']} {_top_l['pnl_pct']:+.1f}%"
+                    st.markdown(f"<div><strong>{'Leaders' if st.session_state.language == 'en' else 'الأبرز'}</strong>"
+                                f"<br><pre style='font-size:.8rem;margin:0'>{_wl_txt or '—'}</pre></div>",
+                                unsafe_allow_html=True)
+
+                # ── Positions table ───────────────────────────────────────────
+                st.dataframe(pd.DataFrame(_pos_rows), use_container_width=True, hide_index=True)
+
+                # Remove position
+                _rmc1, _rmc2 = st.columns([3, 1])
+                with _rmc1:
+                    _rm_ticker = st.selectbox("🗑️ " + ("Remove position" if st.session_state.language == "en" else "حذف صفقة"),
+                                             ["—"] + [p["ticker"] for p in _positions], key="pt_rm")
+                with _rmc2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    if _rm_ticker != "—" and st.button("حذف", key="pt_rm_btn", type="secondary"):
+                        _tracker.remove_position(str(_uid), _rm_ticker)
+                        st.rerun()
+
+                # ══════════════════════════════════════════════════════════════
+                # ANALYZE FROM POSITIONS
+                # ══════════════════════════════════════════════════════════════
+                st.markdown("---")
+                if st.button("🔍 " + ("Analyze Portfolio" if st.session_state.language == "en" else "تحليل المحفظة من الصفقات"),
+                             type="primary", use_container_width=True, key="pt_analyze"):
+                    st.session_state["pt_show_analysis"] = True
+
+                if st.session_state.get("pt_show_analysis") and qe is not None:
+                    with st.spinner("جاري التحليل..." if st.session_state.language == "ar" else "Analyzing..."):
+                        try:
+                            from portfolio import Portfolio as _Ptf
+                            _p = _Ptf(qe)
+                            for _pa in _ptf_for_analysis:
+                                _p.add(_pa["ticker"], market=_pa["market"],
+                                       qty=_pa["shares"], cost_basis=_pa["cost"])
+                            _smry = _p.summary()
+                        except Exception as _ae:
+                            st.error(f"Analysis error: {_ae}")
+                            _smry = None
+
+                    if _smry:
+                        _pos_df2 = _smry.get("positions", pd.DataFrame())
+
+                        # ── KPI row ───────────────────────────────────────────
+                        ak1, ak2, ak3, ak4 = st.columns(4)
+                        with ak1:
+                            st.metric("💰 " + t("total_value"),
+                                      f"{_smry['total_value']:,.0f}" if _smry['total_value'] else "—")
+                        with ak2:
+                            _ap = _smry.get("total_pnl")
+                            _ac = "green" if _ap and _ap > 0 else "red"
+                            st.markdown(f"<div><strong>📊 Unrealized P&L</strong><br>"
+                                        f"<span style='color:{_ac}'>{_ap:+,.0f}</span></div>"
+                                        if _ap is not None else "<div>P&L: —</div>", unsafe_allow_html=True)
+                        with ak3:
+                            _risk = _smry.get("risk_score", 50)
+                            _rc  = "#ef4444" if _risk > 70 else "#f59e0b" if _risk > 40 else "#10b981"
+                            _rl  = (t("high_risk") if _risk > 70 else t("medium_risk") if _risk > 40 else t("low_risk"))
+                            st.markdown(f"<div><strong>⚠️ Risk</strong><br>"
+                                        f"<span style='color:{_rc}'>{_rl} ({_risk}/100)</span></div>",
+                                        unsafe_allow_html=True)
+                        with ak4:
+                            st.metric("🌍 Diversification", _smry.get("diversification","—"))
+
+                        # ── Allocation charts ─────────────────────────────────
+                        _ch1, _ch2, _ch3 = st.columns(3)
+                        with _ch1:
+                            _sw = _smry.get("sector_weights", {})
+                            if _sw:
+                                _fig_s = px.pie(values=list(_sw.values()), names=list(_sw.keys()),
+                                                title=_bi("توزيع القطاعات","Sector Allocation"),
+                                                color_discrete_sequence=PIE_COLORS, hole=0.4)
+                                style_chart(_fig_s, height=260)
+                                _fig_s.update_layout(margin=dict(l=0,r=0,t=30,b=0),
+                                                     paper_bgcolor="rgba(0,0,0,0)",
+                                                     plot_bgcolor="rgba(0,0,0,0)")
+                                st.plotly_chart(_fig_s, use_container_width=True, key="ptf_sector_pie")
+                        with _ch2:
+                            _mw = _smry.get("market_weights", {})
+                            if _mw:
+                                _fig_m = px.pie(values=list(_mw.values()), names=list(_mw.keys()),
+                                                title=_bi("توزيع الأسواق","Market Allocation"),
+                                                color_discrete_sequence=PIE_COLORS, hole=0.4)
+                                style_chart(_fig_m, height=260)
+                                _fig_m.update_layout(margin=dict(l=0,r=0,t=30,b=0),
+                                                     paper_bgcolor="rgba(0,0,0,0)",
+                                                     plot_bgcolor="rgba(0,0,0,0)")
+                                st.plotly_chart(_fig_m, use_container_width=True, key="ptf_market_pie")
+                        with _ch3:
+                            # Asset class breakdown: Invested vs Cash
+                            if _total_with_cash > 0:
+                                _alloc_names = [_bi("مستثمر","Invested"), _bi("سيولة","Cash")]
+                                _alloc_vals  = [_total_val or 0, _cash_val]
+                                _fig_ac = px.pie(values=_alloc_vals, names=_alloc_names,
+                                                 title=_bi("المحفظة الكلية","Total Allocation"),
+                                                 color_discrete_sequence=["#0ea5a4","#f59e0b"], hole=0.4)
+                                style_chart(_fig_ac, height=260)
+                                _fig_ac.update_layout(margin=dict(l=0,r=0,t=30,b=0),
+                                                      paper_bgcolor="rgba(0,0,0,0)",
+                                                      plot_bgcolor="rgba(0,0,0,0)")
+                                st.plotly_chart(_fig_ac, use_container_width=True, key="ptf_cash_pie")
+
+                        # ── Per-position recommendations ──────────────────────
+                        st.markdown("##### 💡 " + ("Position Recommendations" if st.session_state.language == "en"
+                                                   else "توصيات لكل صفقة"))
+
+                        def _position_action(row, weight_pct):
+                            reasons, action = [], _bi("⏸️ احتفظ", "⏸️ Hold")
+                            rsi   = row.get("RSI")
+                            pnl_p = row.get("pnl_pct")
+
+                            if weight_pct and weight_pct > 35:
+                                action = _bi("⚠️ خفّف", "⚠️ Reduce")
+                                reasons.append(_bi(f"تركّز {weight_pct:.0f}% من المحفظة",
+                                                   f"Concentration {weight_pct:.0f}% of portfolio"))
+                            if rsi and rsi > 70:
+                                action = _bi("🔴 جنّي أرباح", "🔴 Take Profits")
+                                reasons.append(_bi(f"RSI في ذروة الشراء ({rsi:.0f})", f"RSI overbought ({rsi:.0f})"))
+                            elif rsi and rsi < 30:
+                                action = _bi("🟢 زيادة", "🟢 Add")
+                                reasons.append(_bi(f"RSI في ذروة البيع ({rsi:.0f})", f"RSI oversold ({rsi:.0f})"))
+                            if pnl_p and pnl_p > 50 and "احتفظ" in action or "Hold" in action:
+                                action = _bi("💛 إعادة توازن", "💛 Rebalance")
+                                reasons.append(_bi(f"ربح كبير {pnl_p:+.0f}% — فكر في تثبيت الأرباح",
+                                                   f"Large gain {pnl_p:+.0f}% — consider locking in"))
+                            if pnl_p and pnl_p < -20:
+                                if _bi("احتفظ","Hold") in action:
+                                    action = _bi("📋 راجع", "📋 Review")
+                                reasons.append(_bi(f"خسارة {pnl_p:.0f}% — راجع مسوّغ الدخول",
+                                                   f"Down {pnl_p:.0f}% — review thesis"))
+                            if not reasons:
+                                p2, s50, s200 = row.get("price"), row.get("SMA50"), row.get("SMA200")
+                                if p2 and s50 and s200 and p2 > s50 > s200:
+                                    reasons.append(_bi("اتجاه صاعد (السعر > SMA50 > SMA200)",
+                                                       "Uptrend (price > SMA50 > SMA200)"))
+                                else:
+                                    reasons.append(_bi("ضمن المعدل الطبيعي", "Within normal parameters"))
+                            return action, " | ".join(reasons)
+
+                        _total_v_smry = _smry.get("total_value") or 1
+                        _rec_rows = []
+                        _portfolio_actions = []
+                        if not _pos_df2.empty:
+                            for _, _row in _pos_df2.iterrows():
+                                _w = round((_row.get("value") or 0) / _total_v_smry * 100, 1)
+                                _act, _why = _position_action(_row, _w)
+                                _portfolio_actions.append(_act)
+                                _rec_rows.append({
+                                    _bi("السهم","Ticker"):   _row["ticker"],
+                                    _bi("السوق","Market"):   _row.get("market","—").upper(),
+                                    _bi("الوزن","Weight"):   f"{_w:.1f}%",
+                                    "P&L":                   f"{_row['pnl_pct']:+.1f}%" if _row.get("pnl_pct") is not None else "—",
+                                    "RSI":                   f"{_row['RSI']:.0f}" if _row.get("RSI") is not None else "—",
+                                    _bi("القرار","Action"):  _act,
+                                    _bi("السبب","Reason"):   _why,
+                                })
+                        if _rec_rows:
+                            st.dataframe(pd.DataFrame(_rec_rows), use_container_width=True, hide_index=True)
+
+                        # ── Portfolio-level risks ─────────────────────────────
+                        st.markdown("##### 🚨 " + _bi("أبرز المخاطر", "Top Risks"))
+                        _risks = []
+                        _risk_reasons = []
+                        _sw2 = _smry.get("sector_weights", {})
+                        _mw2 = _smry.get("market_weights", {})
+                        for _sec, _wt in _sw2.items():
+                            if _wt > 50:
+                                _risks.append(_bi(f"🔴 **تركّز قطاعي**: {_sec} = {_wt:.0f}% من المحفظة",
+                                                  f"🔴 **Sector concentration**: {_sec} = {_wt:.0f}% of portfolio"))
+                                _risk_reasons.append(_bi(f"تركّز مفرط في قطاع {_sec}", f"Over-exposed to {_sec} sector"))
+                        for _mkt, _wt in _mw2.items():
+                            if _wt > 60:
+                                _risks.append(_bi(f"🔴 **تركّز سوقي**: {_mkt.upper()} = {_wt:.0f}%",
+                                                  f"🔴 **Market concentration**: {_mkt.upper()} = {_wt:.0f}%"))
+                                _risk_reasons.append(_bi(f"تركّز مفرط في سوق {_mkt.upper()}", f"Over-exposed to {_mkt.upper()} market"))
+                        _avg_rsi = _smry.get("avg_rsi")
+                        if _avg_rsi and _avg_rsi > 65:
+                            _risks.append(_bi(f"🟡 **المحفظة في ذروة الشراء**: متوسط RSI = {_avg_rsi:.0f}",
+                                             f"🟡 **Portfolio overbought**: avg RSI = {_avg_rsi:.0f}"))
+                            _risk_reasons.append(_bi("ذروة شراء في المحفظة", "Portfolio overbought"))
+                        if _smry.get("n_positions", 0) < 3:
+                            _risks.append(_bi("🟡 **تنويع ضعيف**: عدد المراكز أقل من 3",
+                                             "🟡 **Low diversification**: fewer than 3 positions"))
+                            _risk_reasons.append(_bi("عدد مراكز قليل جداً", "Too few positions"))
+                        if not _risks:
+                            _risks.append(_bi("🟢 لا مخاطر رئيسية مكتشفة", "🟢 No major risk flags detected"))
+                        for _r in _risks:
+                            st.markdown(_r)
+
+                        # ══════════════════════════════════════════════════════
+                        # PORTFOLIO FINAL DECISION BOX
+                        # ══════════════════════════════════════════════════════
+                        # Determine overall decision
+                        _risk_sc = _smry.get("risk_score", 50)
+                        _n_pos   = _smry.get("n_positions", 0)
+                        _reduce_count   = sum(1 for a in _portfolio_actions if "Reduce" in a or "خفّف" in a)
+                        _rebalance_count = sum(1 for a in _portfolio_actions if "Rebalance" in a or "توازن" in a)
+                        _review_count   = sum(1 for a in _portfolio_actions if "Review" in a or "راجع" in a)
+
+                        if _risk_sc > 70 or _reduce_count >= 2:
+                            _final_decision = _bi("تخفيف المراكز", "Reduce Exposure")
+                            _decision_color = "#ef4444"
+                            _decision_icon  = "🔴"
+                            _confidence     = min(95, 60 + _risk_sc // 5)
+                        elif _rebalance_count >= 1 or _risk_reasons:
+                            _final_decision = _bi("إعادة التوازن", "Rebalance")
+                            _decision_color = "#f59e0b"
+                            _decision_icon  = "💛"
+                            _confidence     = 75
+                        elif _review_count >= 1:
+                            _final_decision = _bi("مراجعة المراكز", "Review Positions")
+                            _decision_color = "#f59e0b"
+                            _decision_icon  = "📋"
+                            _confidence     = 70
+                        else:
+                            _final_decision = _bi("احتفظ بالمحفظة", "Hold Portfolio")
+                            _decision_color = "#10b981"
+                            _decision_icon  = "✅"
+                            _confidence     = 80
+
+                        _decision_reason = " — ".join(_risk_reasons) if _risk_reasons else _bi("المحفظة متوازنة", "Portfolio within parameters")
+
+                        st.markdown(f"""
+<div style="background:{'#1e293b' if st.session_state.dark_mode else '#f8fafc'};
+            border:2px solid {_decision_color};border-radius:12px;
+            padding:1.2rem 1.5rem;margin-top:1.2rem;">
+  <div style="font-size:1rem;color:#94a3b8;margin-bottom:.4rem;">
+    {_bi('قرار المحفظة', 'Portfolio Decision')}
+  </div>
+  <div style="font-size:2rem;font-weight:800;color:{_decision_color};">
+    {_decision_icon} {_final_decision}
+  </div>
+  <div style="margin-top:.5rem;font-size:.95rem;">
+    <span style="background:{_decision_color}22;color:{_decision_color};
+                 border-radius:20px;padding:.2rem .8rem;font-weight:600;">
+      {_bi('درجة الثقة','Confidence')}: {_confidence}%
+    </span>
+  </div>
+  <div style="margin-top:.6rem;color:{'#cbd5e1' if st.session_state.dark_mode else '#475569'};font-size:.9rem;">
+    {_bi('السبب','Reason')}: {_decision_reason}
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+                        # ══════════════════════════════════════════════════════
+                        # EXECUTABLE ACTION PLAN
+                        # ══════════════════════════════════════════════════════
+                        st.markdown("##### ⚡ " + _bi("خطة التنفيذ", "Execution Plan"))
+                        _TARGET_WEIGHT = 20.0   # max single-position target %
+                        _exec_actions  = []
+
+                        if not _pos_df2.empty:
+                            for _, _row in _pos_df2.iterrows():
+                                _tk2  = _row["ticker"]
+                                _w2   = round((_row.get("value") or 0) / _total_v_smry * 100, 1)
+                                _rsi2 = _row.get("RSI")
+                                _p2   = _row.get("price")
+                                _sh2  = _row.get("qty")
+
+                                # Over-concentrated: sell down to TARGET
+                                if _w2 > _TARGET_WEIGHT + 5 and _p2 and _sh2:
+                                    _target_val   = _total_v_smry * _TARGET_WEIGHT / 100
+                                    _current_val  = (_row.get("value") or 0)
+                                    _sell_val     = _current_val - _target_val
+                                    _sell_shares  = int(_sell_val / float(_p2))
+                                    if _sell_shares > 0:
+                                        _exec_actions.append({
+                                            "icon": "🔴",
+                                            "action": _bi(f"بيع {_sell_shares:,} سهم من {_tk2}",
+                                                         f"Sell {_sell_shares:,} shares of {_tk2}"),
+                                            "detail": _bi(f"تخفيض من {_w2:.0f}% → {_TARGET_WEIGHT:.0f}% ({_sell_val:,.0f} بيع)",
+                                                         f"Reduce from {_w2:.0f}% → {_TARGET_WEIGHT:.0f}% (sell {_sell_val:,.0f})"),
+                                        })
+
+                                # RSI overbought: suggest partial profit
+                                elif _rsi2 and float(_rsi2) > 70 and _p2 and _sh2:
+                                    _sell_shares = max(1, int(float(_sh2) * 0.25))
+                                    _exec_actions.append({
+                                        "icon": "🟡",
+                                        "action": _bi(f"بيع 25% من {_tk2} ({_sell_shares:,} سهم)",
+                                                     f"Sell 25% of {_tk2} ({_sell_shares:,} shares)"),
+                                        "detail": _bi(f"RSI = {float(_rsi2):.0f} — جني أرباح جزئي",
+                                                     f"RSI = {float(_rsi2):.0f} — partial profit taking"),
+                                    })
+
+                                # RSI oversold: suggest adding
+                                elif _rsi2 and float(_rsi2) < 30:
+                                    _exec_actions.append({
+                                        "icon": "🟢",
+                                        "action": _bi(f"زيادة في {_tk2}",
+                                                     f"Add to {_tk2}"),
+                                        "detail": _bi(f"RSI = {float(_rsi2):.0f} — فرصة دخول",
+                                                     f"RSI = {float(_rsi2):.0f} — oversold entry opportunity"),
+                                    })
+
+                        # Cash deployment signal
+                        if _cash_val > 0:
+                            _under_sectors = [s for s, w in _sw2.items() if w < 10]
+                            if _cash_pct > 30:
+                                _exec_actions.append({
+                                    "icon": "💵",
+                                    "action": _bi(f"نشر السيولة ({_cash_val:,.0f})",
+                                                 f"Deploy cash ({_cash_val:,.0f})"),
+                                    "detail": _bi(f"السيولة {_cash_pct:.0f}% من المحفظة — قطاعات مقترحة: {', '.join(_under_sectors[:3]) or 'Diversify'}",
+                                                 f"Cash is {_cash_pct:.0f}% of portfolio — suggested sectors: {', '.join(_under_sectors[:3]) or 'Diversify'}"),
+                                })
+                            else:
+                                _exec_actions.append({
+                                    "icon": "✅",
+                                    "action": _bi("الاحتفاظ بالسيولة", "Keep cash reserve"),
+                                    "detail": _bi(f"{_cash_pct:.0f}% سيولة — مستوى مناسب للطوارئ",
+                                                 f"{_cash_pct:.0f}% cash — adequate buffer"),
+                                })
+
+                        # Diversification signal
+                        _sw2_markets = _smry.get("market_weights", {})
+                        if len(_sw2_markets) < 2:
+                            _exec_actions.append({
+                                "icon": "🌍",
+                                "action": _bi("إضافة تنويع جغرافي", "Add geographic diversification"),
+                                "detail": _bi("المحفظة في سوق واحد فقط — أضف UAE أو KSA أو Egypt",
+                                             "Portfolio in single market — consider UAE / KSA / Egypt"),
+                            })
+
+                        if not _exec_actions:
+                            _exec_actions.append({
+                                "icon": "✅",
+                                "action": _bi("لا إجراء مطلوب", "No action required"),
+                                "detail": _bi("المحفظة متوازنة — راقب RSI أسبوعياً",
+                                             "Portfolio is balanced — monitor RSI weekly"),
+                            })
+
+                        _dm = st.session_state.dark_mode
+                        for _ea in _exec_actions:
+                            st.markdown(
+                                f"<div style='display:flex;gap:.8rem;align-items:flex-start;"
+                                f"background:{'#1e293b' if _dm else '#f1f5f9'};"
+                                f"border-radius:8px;padding:.7rem 1rem;margin-bottom:.5rem'>"
+                                f"<span style='font-size:1.3rem'>{_ea['icon']}</span>"
+                                f"<div><div style='font-weight:700;font-size:.95rem'>{_ea['action']}</div>"
+                                f"<div style='color:#94a3b8;font-size:.83rem;margin-top:.15rem'>{_ea['detail']}</div>"
+                                f"</div></div>",
+                                unsafe_allow_html=True
+                            )
+
+                        # ══════════════════════════════════════════════════════
+                        # BENCHMARK COMPARISON
+                        # ══════════════════════════════════════════════════════
+                        st.markdown("##### 📊 " + _bi("مقارنة بالمرجع", "Benchmark Comparison"))
+                        try:
+                            import yfinance as _yf
+                            # Determine oldest position date for period
+                            _dates = [p.get("purchase_date","") for p in _positions if p.get("purchase_date")]
+                            _oldest = min(_dates) if _dates else "2024-01-01"
+                            # Determine benchmark: america-heavy → SPY, else use ^TASI
+                            _america_pct = _smry.get("market_weights",{}).get("america",
+                                            _smry.get("market_weights",{}).get("AMERICA", 0))
+                            _bench_ticker = "SPY" if _america_pct > 40 else "^TASI"
+                            _bench_label  = "S&P 500 (SPY)" if _bench_ticker == "SPY" else "Tadawul (^TASI)"
+
+                            with st.spinner(_bi(f"جلب بيانات {_bench_label}…", f"Fetching {_bench_label}…")):
+                                _bdf = _yf.download(_bench_ticker, start=_oldest, progress=False, auto_adjust=True)
+
+                            if not _bdf.empty:
+                                _b_start = float(_bdf["Close"].iloc[0])
+                                _b_end   = float(_bdf["Close"].iloc[-1])
+                                _bench_ret = (_b_end / _b_start - 1) * 100
+
+                                # Portfolio return (cost-weighted)
+                                _ptf_ret = _unreal_pct if _unreal_pct is not None else 0.0
+                                _alpha   = _ptf_ret - _bench_ret
+
+                                bc1, bc2, bc3 = st.columns(3)
+                                with bc1:
+                                    _pc = "#10b981" if _ptf_ret >= 0 else "#ef4444"
+                                    st.markdown(f"<div style='text-align:center'>"
+                                                f"<div style='color:#94a3b8;font-size:.8rem'>"
+                                                f"{_bi('عائد محفظتك','Your Return')}</div>"
+                                                f"<div style='color:{_pc};font-size:1.6rem;font-weight:800'>"
+                                                f"{_ptf_ret:+.1f}%</div></div>", unsafe_allow_html=True)
+                                with bc2:
+                                    _bc = "#10b981" if _bench_ret >= 0 else "#ef4444"
+                                    st.markdown(f"<div style='text-align:center'>"
+                                                f"<div style='color:#94a3b8;font-size:.8rem'>{_bench_label}</div>"
+                                                f"<div style='color:{_bc};font-size:1.6rem;font-weight:800'>"
+                                                f"{_bench_ret:+.1f}%</div></div>", unsafe_allow_html=True)
+                                with bc3:
+                                    _ac = "#10b981" if _alpha >= 0 else "#ef4444"
+                                    _alabel = _bi("ألفا (تفوقك)", "Alpha (vs Benchmark)")
+                                    st.markdown(f"<div style='text-align:center'>"
+                                                f"<div style='color:#94a3b8;font-size:.8rem'>{_alabel}</div>"
+                                                f"<div style='color:{_ac};font-size:1.6rem;font-weight:800'>"
+                                                f"{_alpha:+.1f}%</div></div>", unsafe_allow_html=True)
+                                st.caption(f"📅 {_bi('الفترة من','Period from')} {_oldest} {_bi('حتى اليوم','to today')} | Benchmark: {_bench_label}")
+                            else:
+                                st.caption(_bi("⚠️ لم تتوفر بيانات المرجع", "⚠️ Benchmark data unavailable"))
+                        except Exception as _be:
+                            st.caption(_bi(f"⚠️ المرجع غير متاح: {_be}", f"⚠️ Benchmark unavailable: {_be}"))
+
+                        # ── Download report — passes all context ─────────────
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        try:
+                            # Build final_decision dict for report
+                            _rpt_decision = {
+                                "icon":       _decision_icon,
+                                "decision":   _final_decision,
+                                "confidence": _confidence,
+                                "reasons":    _risk_reasons if _risk_reasons else ["Portfolio within parameters"],
+                            }
+                            # Build English-only exec plan for report
+                            _rpt_exec = []
+                            for _ea in _exec_actions:
+                                _rpt_exec.append({
+                                    "icon":   _ea["icon"],
+                                    "action": _ea["action"],
+                                    "detail": _ea["detail"],
+                                })
+                            # Benchmark dict (collected earlier if available)
+                            _rpt_bench = None
+                            if locals().get("_bench_ret") is not None and locals().get("_ptf_ret") is not None:
+                                _rpt_bench = {
+                                    "name":        locals().get("_bench_label","Benchmark"),
+                                    "ptf_ret":     locals().get("_ptf_ret", 0),
+                                    "bench_ret":   locals().get("_bench_ret", 0),
+                                    "alpha":       locals().get("_alpha", 0),
+                                    "period_start": min([p.get("purchase_date","") for p in _positions if p.get("purchase_date")], default="—"),
+                                }
+                            _md_r = _p.to_markdown(
+                                cash=_cash_val,
+                                final_decision=_rpt_decision,
+                                execution_plan=_rpt_exec,
+                                benchmark=_rpt_bench,
+                            )
+                            st.download_button("📥 " + _bi("تحميل التقرير","Download Report"),
+                                               _md_r.encode(), "eisax_portfolio_report.md", "text/markdown")
+                        except Exception as _rpt_err:
+                            st.caption(f"Report generation error: {_rpt_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F1 — MACRO SIMULATION
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("🌍 " + _bi("محاكاة الاقتصاد الكلي", "Macro Simulation")):
+                            try:
+                                from core.macro_elasticities import MACRO_VAR_DEFAULTS, MACRO_VAR_RANGES, MACRO_VAR_LABELS
+                                from core.macro_simulator import MacroScenario, simulate_portfolio as _sim_ptf
+
+                                st.caption(_bi(
+                                    "حرّك المتغيرات الاقتصادية وشاهد تأثيرها على محفظتك",
+                                    "Adjust macro variables to see their impact on your portfolio"
+                                ))
+                                _mc1, _mc2 = st.columns(2)
+                                _lang = st.session_state.language
+                                with _mc1:
+                                    _gdp   = st.slider(MACRO_VAR_LABELS["gdp_growth"][0 if _lang=="ar" else 1],
+                                                       *MACRO_VAR_RANGES["gdp_growth"],
+                                                       value=MACRO_VAR_DEFAULTS["gdp_growth"], key="mc_gdp")
+                                    _infl  = st.slider(MACRO_VAR_LABELS["inflation"][0 if _lang=="ar" else 1],
+                                                       *MACRO_VAR_RANGES["inflation"],
+                                                       value=MACRO_VAR_DEFAULTS["inflation"], key="mc_infl")
+                                    _rate  = st.slider(MACRO_VAR_LABELS["fed_rate"][0 if _lang=="ar" else 1],
+                                                       *MACRO_VAR_RANGES["fed_rate"],
+                                                       value=MACRO_VAR_DEFAULTS["fed_rate"], key="mc_rate")
+                                with _mc2:
+                                    _oil   = st.slider(MACRO_VAR_LABELS["oil_brent"][0 if _lang=="ar" else 1],
+                                                       *MACRO_VAR_RANGES["oil_brent"],
+                                                       value=MACRO_VAR_DEFAULTS["oil_brent"], key="mc_oil")
+                                    _dxy   = st.slider(MACRO_VAR_LABELS["usd_index"][0 if _lang=="ar" else 1],
+                                                       *MACRO_VAR_RANGES["usd_index"],
+                                                       value=MACRO_VAR_DEFAULTS["usd_index"], key="mc_dxy")
+
+                                if st.button("▶️ " + _bi("تشغيل المحاكاة", "Run Simulation"), key="run_macro_sim"):
+                                    _scen = MacroScenario(gdp_growth=_gdp, inflation=_infl,
+                                                          fed_rate=_rate, oil_brent=_oil, usd_index=_dxy)
+                                    _msim = _sim_ptf(_pos_df2, _smry["total_value"], _scen)
+
+                                    _ic1, _ic2, _ic3 = st.columns(3)
+                                    _ic_col = "#10b981" if _msim["total_impact_pct"] >= 0 else "#ef4444"
+                                    with _ic1:
+                                        st.metric(_bi("التأثير الكلي %", "Total Impact %"),
+                                                  f"{_msim['total_impact_pct']:+.2f}%")
+                                    with _ic2:
+                                        st.metric(_bi("تغيير القيمة", "Value Change"),
+                                                  f"{_msim['total_impact_value']:+,.0f}")
+                                    with _ic3:
+                                        st.metric(_bi("القيمة الجديدة", "New Value"),
+                                                  f"{_msim['new_portfolio_value']:,.0f}")
+
+                                    _sec_imp = _msim["sector_impacts"]
+                                    _fig_macro = px.bar(
+                                        x=list(_sec_imp.keys()),
+                                        y=[v * 100 for v in _sec_imp.values() if abs(v) > 0.001],
+                                        labels={"x": _bi("القطاع","Sector"), "y": _bi("التأثير %","Impact %")},
+                                        title=_bi("تأثير الاقتصاد الكلي على القطاعات","Macro Impact by Sector"),
+                                        color=[v for v in _sec_imp.values() if abs(v) > 0.001],
+                                        color_continuous_scale=["#ef4444","#94a3b8","#10b981"],
+                                    )
+                                    _sec_keys = [k for k, v in _sec_imp.items() if abs(v) > 0.001]
+                                    _sec_vals = [v * 100 for k, v in _sec_imp.items() if abs(v) > 0.001]
+                                    _fig_macro = px.bar(
+                                        x=_sec_keys, y=_sec_vals,
+                                        labels={"x": _bi("القطاع","Sector"), "y": _bi("التأثير %","Impact %")},
+                                        title=_bi("تأثير الاقتصاد الكلي على القطاعات","Macro Impact by Sector"),
+                                        color=_sec_vals,
+                                        color_continuous_scale=["#ef4444","#94a3b8","#10b981"],
+                                    )
+                                    style_chart(_fig_macro, height=280)
+                                    st.plotly_chart(_fig_macro, use_container_width=True, key="macro_sector_chart")
+
+                                    if not _msim["position_impacts"].empty:
+                                        st.dataframe(_msim["position_impacts"], use_container_width=True)
+                            except Exception as _f1_err:
+                                st.warning(f"Macro simulation error: {_f1_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F2 — BUDGET PLANNER
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("💰 " + _bi("مخطط الميزانية", "Budget Planner")):
+                            try:
+                                from core.budget_engine import compute_budget_allocation
+
+                                st.caption(_bi(
+                                    "أدخل ميزانيتك وأوزان القطاعات المستهدفة لمعرفة الأسهم التي يجب شراؤها أو بيعها",
+                                    "Enter your budget and target sector weights to get exact buy/sell quantities"
+                                ))
+                                _bg1, _bg2 = st.columns(2)
+                                with _bg1:
+                                    _budget = st.number_input(
+                                        _bi("الميزانية الإضافية", "Additional Budget"),
+                                        min_value=0.0, value=0.0, step=1000.0,
+                                        format="%.0f", key="budget_amount"
+                                    )
+                                with _bg2:
+                                    _budget_note = st.caption(_bi(
+                                        "يمكن أن تكون صفراً لإعادة التوازن فقط",
+                                        "Can be 0 for rebalance-only"
+                                    ))
+
+                                st.markdown(_bi("**أوزان القطاعات المستهدفة % (المجموع = 100)**",
+                                                "**Target Sector Weights % (sum = 100)**"))
+                                _sw_existing = _smry.get("sector_weights", {})
+                                _bg_sectors = {}
+                                _bg_cols = st.columns(3)
+                                _all_sectors = list(_sw_existing.keys()) or ["Finance", "Energy", "Real Estate"]
+                                for _i, _sec in enumerate(_all_sectors):
+                                    with _bg_cols[_i % 3]:
+                                        _bg_sectors[_sec] = st.number_input(
+                                            _sec, min_value=0.0, max_value=100.0,
+                                            value=round(_sw_existing.get(_sec, 0), 1),
+                                            step=1.0, key=f"bg_sec_{_sec}"
+                                        )
+
+                                if st.button("💰 " + _bi("احسب خطة الميزانية", "Compute Budget Plan"), key="run_budget"):
+                                    _bplan = compute_budget_allocation(
+                                        total_budget=_budget,
+                                        target_sector_weights=_bg_sectors,
+                                        positions_df=_pos_df2,
+                                        total_value=_smry["total_value"],
+                                    )
+                                    _bm1, _bm2, _bm3, _bm4 = st.columns(4)
+                                    with _bm1:
+                                        st.metric(_bi("إجمالي الشراء", "Total Buy"), f"{_bplan['total_buy_cost']:,.0f}")
+                                    with _bm2:
+                                        st.metric(_bi("إجمالي البيع", "Total Sell"), f"{_bplan['total_sell_proceeds']:,.0f}")
+                                    with _bm3:
+                                        st.metric(_bi("صافي النقد المطلوب", "Net Cash Needed"), f"{_bplan['net_cash_required']:,.0f}")
+                                    with _bm4:
+                                        _fc = "✅" if _bplan["feasible"] else "❌"
+                                        st.metric(_bi("النقد المتبقي", "Remaining Cash"),
+                                                  f"{_fc} {_bplan['remaining_cash']:,.0f}")
+
+                                    if _bplan["warnings"]:
+                                        for _w in _bplan["warnings"]:
+                                            st.warning(_w)
+
+                                    if not _bplan["allocations"].empty:
+                                        _display_cols = ["Ticker", "Sector", "Action", "Shares to Buy",
+                                                         "Shares to Sell", "Est. Cost", "Target Weight %"]
+                                        _dcols = [c for c in _display_cols if c in _bplan["allocations"].columns]
+                                        st.dataframe(_bplan["allocations"][_dcols], use_container_width=True)
+                            except Exception as _f2_err:
+                                st.warning(f"Budget planner error: {_f2_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F3 — FORWARD SCENARIO BUILDER
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("🔭 " + _bi("سيناريو مستقبلي", "Forward Scenario")):
+                            try:
+                                from core.macro_elasticities import MACRO_VAR_DEFAULTS as _fwd_defaults, MACRO_VAR_RANGES as _fwd_ranges, MACRO_VAR_LABELS as _fwd_labels
+                                from core.macro_simulator import MacroScenario as _FwdScen
+                                from core.scenario_builder import build_forward_scenario
+
+                                st.caption(_bi(
+                                    "اضبط افتراضاتك الاقتصادية وشاهد توقعات محفظتك على 3 و 6 و 12 شهراً",
+                                    "Set your macro assumptions and see 3/6/12 month portfolio projections"
+                                ))
+                                _fl = st.session_state.language
+                                _fwd_c1, _fwd_c2 = st.columns(2)
+                                with _fwd_c1:
+                                    _fgdp  = st.slider(_fwd_labels["gdp_growth"][0 if _fl=="ar" else 1],
+                                                       *_fwd_ranges["gdp_growth"],
+                                                       value=_fwd_defaults["gdp_growth"], key="fwd_gdp")
+                                    _finfl = st.slider(_fwd_labels["inflation"][0 if _fl=="ar" else 1],
+                                                       *_fwd_ranges["inflation"],
+                                                       value=_fwd_defaults["inflation"], key="fwd_infl")
+                                    _frate = st.slider(_fwd_labels["fed_rate"][0 if _fl=="ar" else 1],
+                                                       *_fwd_ranges["fed_rate"],
+                                                       value=_fwd_defaults["fed_rate"], key="fwd_rate")
+                                with _fwd_c2:
+                                    _foil  = st.slider(_fwd_labels["oil_brent"][0 if _fl=="ar" else 1],
+                                                       *_fwd_ranges["oil_brent"],
+                                                       value=_fwd_defaults["oil_brent"], key="fwd_oil")
+                                    _fdxy  = st.slider(_fwd_labels["usd_index"][0 if _fl=="ar" else 1],
+                                                       *_fwd_ranges["usd_index"],
+                                                       value=_fwd_defaults["usd_index"], key="fwd_dxy")
+
+                                if st.button("🔭 " + _bi("احسب التوقعات", "Project Forward"), key="run_fwd_scenario"):
+                                    with st.spinner(_bi("جاري الحساب…", "Computing projections…")):
+                                        _fscen = _FwdScen(gdp_growth=_fgdp, inflation=_finfl,
+                                                          fed_rate=_frate, oil_brent=_foil, usd_index=_fdxy)
+                                        _fwd = build_forward_scenario(
+                                            _pos_df2, _smry["total_value"], _fscen
+                                        )
+
+                                    st.caption(f"📌 {_bi('السيناريو','Scenario')}: {_fwd['scenario_label']}")
+
+                                    _fhm1, _fhm2, _fhm3 = st.columns(3)
+                                    for _col, _h in zip([_fhm1, _fhm2, _fhm3], [3, 6, 12]):
+                                        _hdata = _fwd["horizons"].get(_h, {})
+                                        _pv    = _hdata.get("projected_value", _smry["total_value"])
+                                        _pc    = _hdata.get("pct_change", 0.0)
+                                        _hcol  = "#10b981" if _pc >= 0 else "#ef4444"
+                                        with _col:
+                                            st.markdown(
+                                                f"<div style='text-align:center'>"
+                                                f"<div style='color:#94a3b8;font-size:.8rem'>{_h}M</div>"
+                                                f"<div style='font-size:1.2rem;font-weight:700'>{_pv:,.0f}</div>"
+                                                f"<div style='color:{_hcol}'>{_pc:+.1f}%</div>"
+                                                f"</div>", unsafe_allow_html=True
+                                            )
+
+                                    # Line chart of projections
+                                    _tv = _smry["total_value"]
+                                    _fwd_chart_data = {
+                                        _bi("الأفق (شهور)","Horizon (months)"): [0, 3, 6, 12],
+                                        _bi("القيمة المتوقعة","Projected Value"): [
+                                            _tv,
+                                            _fwd["horizons"].get(3, {}).get("projected_value", _tv),
+                                            _fwd["horizons"].get(6, {}).get("projected_value", _tv),
+                                            _fwd["horizons"].get(12, {}).get("projected_value", _tv),
+                                        ]
+                                    }
+                                    _fig_fwd = px.line(
+                                        _fwd_chart_data,
+                                        x=_bi("الأفق (شهور)","Horizon (months)"),
+                                        y=_bi("القيمة المتوقعة","Projected Value"),
+                                        markers=True,
+                                        title=_bi("مسار المحفظة المتوقع","Projected Portfolio Path"),
+                                    )
+                                    style_chart(_fig_fwd, height=260)
+                                    st.plotly_chart(_fig_fwd, use_container_width=True, key="fwd_line_chart")
+
+                                    _proj_df = _fwd["horizons"].get(12, {}).get("position_projections", pd.DataFrame())
+                                    if not _proj_df.empty:
+                                        _show_cols = ["Ticker","Name","Sector","Current Value",
+                                                      "Adjusted Return %","Proj 3m","Proj 6m","Proj 12m"]
+                                        _show_cols = [c for c in _show_cols if c in _proj_df.columns]
+                                        st.dataframe(_proj_df[_show_cols], use_container_width=True)
+                            except Exception as _f3_err:
+                                st.warning(f"Forward scenario error: {_f3_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F4 — MONTE CARLO / VAR
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("🎲 " + _bi("مونت كارلو / قيمة المخاطرة", "Monte Carlo / VaR")):
+                            try:
+                                from core.monte_carlo import run_portfolio_monte_carlo
+                                import numpy as np
+
+                                st.caption(_bi(
+                                    "محاكاة آلاف المسارات لتقدير أقصى خسارة محتملة (VaR) وتوزيع النتائج",
+                                    "Simulate thousands of paths to estimate maximum probable loss (VaR) and outcome distribution"
+                                ))
+                                _mc_c1, _mc_c2, _mc_c3 = st.columns(3)
+                                with _mc_c1:
+                                    _n_sim = st.selectbox(_bi("عدد المحاكاة","Simulations"),
+                                                          [1000, 2000, 5000, 10000], index=2, key="mc_nsim")
+                                with _mc_c2:
+                                    _h_days = st.selectbox(_bi("الأفق الزمني","Horizon"),
+                                                           [63, 126, 252], index=2,
+                                                           format_func=lambda x: f"{x}d ({x//21}m)",
+                                                           key="mc_horizon")
+                                with _mc_c3:
+                                    _loss_thr = st.slider(_bi("عتبة الخسارة %","Loss Threshold %"),
+                                                          5, 50, 10, key="mc_loss_thr") / 100
+
+                                if st.button("🎲 " + _bi("تشغيل المحاكاة", "Run Monte Carlo"), key="run_mc"):
+                                    with st.spinner(_bi("جاري المحاكاة…", "Running simulation…")):
+                                        _mc_res = run_portfolio_monte_carlo(
+                                            _pos_df2, _smry["total_value"],
+                                            n_simulations=_n_sim,
+                                            horizon_days=_h_days,
+                                            loss_threshold_pct=_loss_thr,
+                                        )
+
+                                    _mv1, _mv2, _mv3, _mv4 = st.columns(4)
+                                    with _mv1:
+                                        st.metric("VaR 95%", f"{_mc_res['var'].get(0.95, 0):+.1f}%")
+                                    with _mv2:
+                                        st.metric("VaR 99%", f"{_mc_res['var'].get(0.99, 0):+.1f}%")
+                                    with _mv3:
+                                        st.metric("CVaR 95%", f"{_mc_res['cvar'].get(0.95, 0):+.1f}%")
+                                    with _mv4:
+                                        st.metric(
+                                            _bi(f"احتمال خسارة > {int(_loss_thr*100)}%",
+                                                f"P(loss > {int(_loss_thr*100)}%)"),
+                                            f"{_mc_res['prob_loss_gt_threshold']:.1f}%"
+                                        )
+
+                                    _mo1, _mo2, _mo3 = st.columns(3)
+                                    with _mo1:
+                                        st.metric(_bi("أفضل حالة (P90)","Best (P90)"),
+                                                  f"{_mc_res['best_outcome']:,.0f}")
+                                    with _mo2:
+                                        st.metric(_bi("المتوسط (P50)","Median (P50)"),
+                                                  f"{_mc_res['median_outcome']:,.0f}")
+                                    with _mo3:
+                                        st.metric(_bi("أسوأ حالة (P10)","Worst (P10)"),
+                                                  f"{_mc_res['worst_outcome']:,.0f}")
+
+                                    # Paths chart
+                                    _paths = _mc_res.get("paths_sample")
+                                    if _paths is not None and _paths.shape[0] > 1:
+                                        _path_df = pd.DataFrame(_paths,
+                                                                 columns=[f"sim_{i}" for i in range(_paths.shape[1])])
+                                        _fig_mc = px.line(_path_df, title=_bi("مسارات المحاكاة","Simulation Paths"),
+                                                          color_discrete_sequence=["rgba(14,165,164,0.08)"] * _paths.shape[1])
+                                        # Overlay P10/P50/P90
+                                        _tv0 = _smry["total_value"]
+                                        _mc_ts = list(range(_paths.shape[0]))
+                                        for _pct_lbl, _pct_val, _col in [
+                                            ("P90", 90, "#10b981"), ("P50", 50, "#f59e0b"), ("P10", 10, "#ef4444")
+                                        ]:
+                                            _pct_line = np.percentile(_paths, _pct_val, axis=1)
+                                            _fig_mc.add_scatter(x=_mc_ts, y=_pct_line,
+                                                                mode="lines", name=_pct_lbl,
+                                                                line=dict(color=_col, width=2))
+                                        style_chart(_fig_mc, height=300)
+                                        st.plotly_chart(_fig_mc, use_container_width=True, key="mc_paths_chart")
+
+                                    # Histogram of terminal values
+                                    _term = _mc_res.get("terminal_distribution")
+                                    if _term is not None:
+                                        _fig_hist = px.histogram(
+                                            x=_term, nbins=60,
+                                            title=_bi("توزيع القيمة النهائية","Terminal Value Distribution"),
+                                            labels={"x": _bi("القيمة","Value"), "y": _bi("التكرار","Count")},
+                                            color_discrete_sequence=["#0ea5a4"],
+                                        )
+                                        _var95_val = _mc_res["var"].get(0.95, 0) / 100
+                                        _var95_abs = _smry["total_value"] * (1 + _var95_val)
+                                        _fig_hist.add_vline(x=_var95_abs, line_color="#ef4444",
+                                                            line_dash="dash",
+                                                            annotation_text="VaR 95%",
+                                                            annotation_position="top right")
+                                        style_chart(_fig_hist, height=260)
+                                        st.plotly_chart(_fig_hist, use_container_width=True, key="mc_hist_chart")
+                            except Exception as _f4_err:
+                                st.warning(f"Monte Carlo error: {_f4_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F5 — MARKET REGIME COMPARISON
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("🌐 " + _bi("مقارنة أنظمة السوق", "Market Regime Comparison")):
+                            try:
+                                from core.market_regimes import compare_regimes
+
+                                st.caption(_bi(
+                                    "قارن أداء محفظتك في ظل أربعة أنظمة سوق مختلفة",
+                                    "Compare your portfolio performance under 4 market regimes"
+                                ))
+                                _rg_horizon = st.selectbox(
+                                    _bi("الأفق الزمني", "Horizon"),
+                                    [6, 12], index=1,
+                                    format_func=lambda x: f"{x} " + _bi("شهراً","months"),
+                                    key="regime_horizon"
+                                )
+
+                                if st.button("🌐 " + _bi("مقارنة الأنظمة", "Compare Regimes"), key="run_regimes"):
+                                    with st.spinner(_bi("جاري الحساب…", "Analyzing regimes…")):
+                                        _rg = compare_regimes(
+                                            _pos_df2, _smry["total_value"],
+                                            horizon_months=_rg_horizon,
+                                        )
+
+                                    _rg_names, _rg_vals, _rg_rets = [], [], []
+                                    for _rname, _rdata in _rg["regimes"].items():
+                                        _lbl = _rdata["label_ar"] if st.session_state.language == "ar" else _rdata["label_en"]
+                                        _rg_names.append(_lbl)
+                                        _rg_vals.append(_rdata["projected_value"])
+                                        _rg_rets.append(_rdata["expected_return_pct"])
+
+                                    _tv_base = _smry["total_value"]
+                                    _fig_rg = px.bar(
+                                        x=_rg_names, y=_rg_vals,
+                                        color=_rg_rets,
+                                        color_continuous_scale=["#ef4444","#94a3b8","#10b981"],
+                                        labels={
+                                            "x": _bi("نظام السوق","Market Regime"),
+                                            "y": _bi("القيمة المتوقعة","Projected Value"),
+                                        },
+                                        title=_bi(
+                                            f"المحفظة في أفق {_rg_horizon} شهراً",
+                                            f"Portfolio at {_rg_horizon}-Month Horizon"
+                                        ),
+                                        text=[f"{r:+.1f}%" for r in _rg_rets],
+                                    )
+                                    _fig_rg.add_hline(y=_tv_base, line_dash="dot",
+                                                      line_color="#94a3b8",
+                                                      annotation_text=_bi("القيمة الحالية","Current Value"))
+                                    style_chart(_fig_rg, height=320)
+                                    st.plotly_chart(_fig_rg, use_container_width=True, key="regime_bar_chart")
+
+                                    # Summary table
+                                    _rg_rows = []
+                                    for _rname, _rdata in _rg["regimes"].items():
+                                        _lbl = _rdata["label_ar"] if st.session_state.language == "ar" else _rdata["label_en"]
+                                        _rg_rows.append({
+                                            _bi("النظام","Regime"):           _lbl,
+                                            _bi("العائد %","Return %"):       f"{_rdata['expected_return_pct']:+.1f}%",
+                                            _bi("القيمة المتوقعة","Proj Value"): f"{_rdata['projected_value']:,.0f}",
+                                            "GDP %":                          _rdata["macro_profile"]["gdp_growth"],
+                                            _bi("التضخم %","Inflation %"):    _rdata["macro_profile"]["inflation"],
+                                            _bi("الفائدة %","Rate %"):        _rdata["macro_profile"]["fed_rate"],
+                                            _bi("النفط $","Oil $"):           _rdata["macro_profile"]["oil_brent"],
+                                        })
+                                    st.dataframe(pd.DataFrame(_rg_rows), use_container_width=True, hide_index=True)
+
+                                    _best_lbl  = _rg["regimes"][_rg["best_regime"]]["label_en"]
+                                    _worst_lbl = _rg["regimes"][_rg["worst_regime"]]["label_en"]
+                                    st.caption(
+                                        f"✅ {_bi('الأفضل','Best')}: {_best_lbl}  |  "
+                                        f"⚠️ {_bi('الأسوأ','Worst')}: {_worst_lbl}  |  "
+                                        f"{_bi('الفارق','Spread')}: {_rg['regime_spread_pct']:+.1f}%"
+                                    )
+                            except Exception as _f5_err:
+                                st.warning(f"Market regimes error: {_f5_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F6 — SHARIAH COMPLIANCE SCREENING
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("🕌 " + _bi("الفحص الشرعي", "Shariah Compliance Screening")):
+                            try:
+                                from core.shariah_screener import screen_portfolio
+
+                                st.caption(_bi(
+                                    "فحص حيازاتك حسب معايير AAOIFI: نسبة الدين، النشاط التجاري، الإيراد الحرام",
+                                    "Screen your holdings against AAOIFI rules: debt ratio, business activity, haram income"
+                                ))
+                                if st.button("🕌 " + _bi("افحص المحفظة", "Screen Portfolio"), key="run_shariah"):
+                                    with st.spinner(_bi("جاري الفحص…", "Screening holdings…")):
+                                        _sh = screen_portfolio(_pos_df2)
+
+                                    _sh1, _sh2, _sh3, _sh4 = st.columns(4)
+                                    with _sh1:
+                                        _crc = "#10b981" if _sh["compliance_rate_pct"] >= 95 else "#f59e0b" if _sh["compliance_rate_pct"] >= 70 else "#ef4444"
+                                        st.markdown(
+                                            f"<div style='text-align:center'>"
+                                            f"<div style='color:#94a3b8;font-size:.8rem'>{_bi('نسبة الامتثال','Compliance Rate')}</div>"
+                                            f"<div style='color:{_crc};font-size:1.6rem;font-weight:800'>{_sh['compliance_rate_pct']:.1f}%</div>"
+                                            f"</div>", unsafe_allow_html=True
+                                        )
+                                    with _sh2:
+                                        st.metric(_bi("✅ حلال", "✅ Halal"), _sh["halal_count"])
+                                    with _sh3:
+                                        st.metric(_bi("❌ حرام", "❌ Haram"), _sh["haram_count"])
+                                    with _sh4:
+                                        st.metric(_bi("❓ غير محدد", "❓ Unknown"), _sh["unknown_count"])
+
+                                    st.markdown(f"**{_sh['summary']}**")
+
+                                    if _sh["purification_estimate"] > 0:
+                                        st.info(_bi(
+                                            f"💰 تقدير التطهير المالي: {_sh['purification_estimate']:,.0f} (تبرع بهذا المبلغ)",
+                                            f"💰 Purification estimate: {_sh['purification_estimate']:,.0f} (donate this amount)"
+                                        ))
+
+                                    if not _sh["results"].empty:
+                                        st.dataframe(_sh["results"], use_container_width=True, hide_index=True)
+
+                                    _vc1, _vc2, _vc3 = st.columns(3)
+                                    _total = _sh["halal_count"] + _sh["haram_count"] + _sh["unknown_count"]
+                                    if _total > 0:
+                                        _pie_data = {
+                                            "Verdict": [_bi("حلال","Halal"), _bi("حرام","Haram"), _bi("غير محدد","Unknown")],
+                                            "Value":   [_sh["total_halal_value"], _sh["total_haram_value"], _sh["total_unknown_value"]],
+                                        }
+                                        _fig_sh = px.pie(
+                                            _pie_data, values="Value", names="Verdict",
+                                            color="Verdict",
+                                            color_discrete_map={
+                                                _bi("حلال","Halal"): "#10b981",
+                                                _bi("حرام","Haram"): "#ef4444",
+                                                _bi("غير محدد","Unknown"): "#94a3b8",
+                                            },
+                                            title=_bi("توزيع المحفظة حسب الامتثال","Portfolio Breakdown by Compliance"),
+                                            hole=0.4,
+                                        )
+                                        style_chart(_fig_sh, height=260)
+                                        st.plotly_chart(_fig_sh, use_container_width=True, key="shariah_pie")
+                            except Exception as _f6_err:
+                                st.warning(f"Shariah screener error: {_f6_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F7 — PORTFOLIO OPTIMIZATION (EFFICIENT FRONTIER)
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("📊 " + _bi("تحسين المحفظة", "Portfolio Optimization")):
+                            try:
+                                from core.portfolio_optimizer import optimize_portfolio, efficient_frontier
+
+                                st.caption(_bi(
+                                    "اعثر على الأوزان المثالية لمحفظتك (Markowitz): أقصى نسبة شارب، أقل تذبذب",
+                                    "Find optimal portfolio weights (Markowitz): max Sharpe ratio or min variance"
+                                ))
+                                _po_c1, _po_c2, _po_c3 = st.columns(3)
+                                with _po_c1:
+                                    _po_obj = st.selectbox(
+                                        _bi("الهدف","Objective"),
+                                        ["max_sharpe", "min_variance"],
+                                        format_func=lambda x: {
+                                            "max_sharpe":   _bi("أقصى نسبة شارب","Max Sharpe"),
+                                            "min_variance": _bi("أقل تذبذب","Min Variance"),
+                                        }.get(x, x),
+                                        key="po_obj",
+                                    )
+                                with _po_c2:
+                                    _po_rf = st.slider(_bi("سعر الفائدة الخالي %","Risk-Free Rate %"),
+                                                       0.0, 8.0, 4.0, 0.5, key="po_rf") / 100
+                                with _po_c3:
+                                    _po_maxw = st.slider(_bi("الحد الأقصى للوزن %","Max Weight %"),
+                                                         10, 100, 40, 5, key="po_maxw") / 100
+
+                                if st.button("📊 " + _bi("حسّن المحفظة", "Optimize Portfolio"), key="run_optimize"):
+                                    with st.spinner(_bi("جاري التحسين…", "Optimizing…")):
+                                        _po = optimize_portfolio(
+                                            _pos_df2, objective=_po_obj,
+                                            risk_free_rate=_po_rf, max_weight=_po_maxw,
+                                        )
+
+                                    if _po.get("error"):
+                                        st.warning(_po["error"])
+                                    else:
+                                        _ps1, _ps2, _ps3 = st.columns(3)
+                                        with _ps1:
+                                            st.markdown(_bi("**الحالي**","**Current**"))
+                                            st.metric(_bi("العائد %","Return %"), f"{_po['current_stats']['return']:+.2f}%")
+                                            st.metric(_bi("التذبذب %","Volatility %"), f"{_po['current_stats']['volatility']:.2f}%")
+                                            st.metric("Sharpe", f"{_po['current_stats']['sharpe']:.3f}")
+                                        with _ps2:
+                                            st.markdown(_bi("**المثالي**","**Optimal**"))
+                                            st.metric(_bi("العائد %","Return %"), f"{_po['optimal_stats']['return']:+.2f}%")
+                                            st.metric(_bi("التذبذب %","Volatility %"), f"{_po['optimal_stats']['volatility']:.2f}%")
+                                            st.metric("Sharpe", f"{_po['optimal_stats']['sharpe']:.3f}")
+                                        with _ps3:
+                                            st.markdown(_bi("**التحسن**","**Improvement**"))
+                                            _imp = _po["improvement"]
+                                            _rc = "#10b981" if _imp["return_lift"] >= 0 else "#ef4444"
+                                            _sc = "#10b981" if _imp["sharpe_lift"] >= 0 else "#ef4444"
+                                            st.metric(_bi("زيادة العائد","Return Lift"), f"{_imp['return_lift']:+.2f}%")
+                                            st.metric(_bi("تغيير التذبذب","Vol Change"), f"{_imp['vol_change']:+.2f}%")
+                                            st.metric("Sharpe Δ", f"{_imp['sharpe_lift']:+.3f}")
+
+                                        if not _po["rebalance_actions"].empty:
+                                            st.markdown(_bi("**إجراءات إعادة التوازن**","**Rebalance Actions**"))
+                                            st.dataframe(_po["rebalance_actions"], use_container_width=True, hide_index=True)
+
+                                    # Efficient frontier chart
+                                    with st.spinner(_bi("بناء الحدود الكفؤة…","Building efficient frontier…")):
+                                        _ef = efficient_frontier(
+                                            _pos_df2, n_points=20,
+                                            risk_free_rate=_po_rf, max_weight=_po_maxw,
+                                        )
+                                    if not _ef.get("error") and not _ef["frontier"].empty:
+                                        _fig_ef = px.scatter(
+                                            _ef["frontier"], x="volatility_pct", y="return_pct",
+                                            color="sharpe", color_continuous_scale="Viridis",
+                                            title=_bi("الحدود الكفؤة","Efficient Frontier"),
+                                            labels={
+                                                "volatility_pct": _bi("التذبذب %","Volatility %"),
+                                                "return_pct":     _bi("العائد %","Return %"),
+                                            },
+                                        )
+                                        _ms = _ef["max_sharpe_point"]
+                                        _mv = _ef["min_variance_point"]
+                                        _cur = _ef["current_point"]
+                                        _fig_ef.add_scatter(x=[_ms["volatility"]], y=[_ms["return"]],
+                                                            mode="markers+text",
+                                                            marker=dict(size=18, color="#10b981", symbol="star"),
+                                                            text=["Max Sharpe"], textposition="top center",
+                                                            name="Max Sharpe")
+                                        _fig_ef.add_scatter(x=[_mv["volatility"]], y=[_mv["return"]],
+                                                            mode="markers+text",
+                                                            marker=dict(size=18, color="#0ea5a4", symbol="diamond"),
+                                                            text=["Min Var"], textposition="top center",
+                                                            name="Min Variance")
+                                        _fig_ef.add_scatter(x=[_cur["volatility"]], y=[_cur["return"]],
+                                                            mode="markers+text",
+                                                            marker=dict(size=18, color="#ef4444", symbol="x"),
+                                                            text=[_bi("الحالي","Current")], textposition="bottom center",
+                                                            name=_bi("الحالي","Current"))
+                                        style_chart(_fig_ef, height=320)
+                                        st.plotly_chart(_fig_ef, use_container_width=True, key="ef_chart")
+                            except Exception as _f7_err:
+                                st.warning(f"Portfolio optimizer error: {_f7_err}")
+
+                        # ══════════════════════════════════════════════════════
+                        # F8 — DIVIDEND INCOME PROJECTION
+                        # ══════════════════════════════════════════════════════
+                        with st.expander("💸 " + _bi("توقع دخل الأرباح الموزعة", "Dividend Income Projection")):
+                            try:
+                                from core.dividend_engine import project_portfolio_income
+
+                                st.caption(_bi(
+                                    "توقع الدخل السنوي من الأرباح الموزعة، العائد على التكلفة، واستدامة التوزيعات",
+                                    "Project annual dividend income, yield-on-cost, and payout sustainability"
+                                ))
+                                _di_c1, _di_c2 = st.columns(2)
+                                with _di_c1:
+                                    _di_contrib = st.number_input(
+                                        _bi("إضافة سنوية","Annual Contribution"),
+                                        min_value=0.0, value=0.0, step=1000.0,
+                                        format="%.0f", key="di_contrib",
+                                    )
+                                with _di_c2:
+                                    _di_growth = st.slider(_bi("افتراض نمو التوزيعات %","Dividend Growth %"),
+                                                           -5.0, 15.0, 0.0, 0.5, key="di_growth")
+
+                                if st.button("💸 " + _bi("احسب الدخل المتوقع", "Project Income"), key="run_dividend"):
+                                    with st.spinner(_bi("جاري جلب بيانات التوزيعات…","Fetching dividend data…")):
+                                        _di = project_portfolio_income(
+                                            _pos_df2,
+                                            annual_contribution=_di_contrib,
+                                            growth_assumption_pct=_di_growth,
+                                        )
+
+                                    _dm1, _dm2, _dm3, _dm4 = st.columns(4)
+                                    with _dm1:
+                                        st.metric(_bi("الدخل السنوي","Annual Income"),
+                                                  f"{_di['total_annual_income']:,.0f}")
+                                    with _dm2:
+                                        st.metric(_bi("المتوسط الشهري","Monthly Avg"),
+                                                  f"{_di['monthly_average_income']:,.0f}")
+                                    with _dm3:
+                                        st.metric(_bi("عائد المحفظة %","Portfolio Yield %"),
+                                                  f"{_di['portfolio_yield_pct']:.2f}%")
+                                    with _dm4:
+                                        _yoc = _di["yield_on_cost_pct"]
+                                        st.metric(_bi("العائد على التكلفة %","Yield on Cost %"),
+                                                  f"{_yoc:.2f}%" if _yoc is not None else "—")
+
+                                    _dm5, _dm6, _dm7 = st.columns(3)
+                                    with _dm5:
+                                        _wp = _di["weighted_payout_ratio"]
+                                        st.metric(_bi("نسبة التوزيع %","Payout Ratio %"),
+                                                  f"{_wp:.1f}%" if _wp is not None else "—")
+                                    with _dm6:
+                                        _wg = _di["weighted_growth_rate"]
+                                        st.metric(_bi("نمو التوزيعات %","Growth Rate %"),
+                                                  f"{_wg:+.2f}%" if _wg is not None else "—")
+                                    with _dm7:
+                                        _ss = _di["sustainability_score"]
+                                        _sc = "#10b981" if _ss >= 70 else "#f59e0b" if _ss >= 40 else "#ef4444"
+                                        st.markdown(
+                                            f"<div style='text-align:center'>"
+                                            f"<div style='color:#94a3b8;font-size:.8rem'>{_bi('استدامة','Sustainability')}</div>"
+                                            f"<div style='color:{_sc};font-size:1.4rem;font-weight:800'>{_ss}/100</div>"
+                                            f"</div>", unsafe_allow_html=True
+                                        )
+
+                                    if _di["warnings"]:
+                                        with st.expander(_bi("⚠️ تحذيرات","⚠️ Warnings")):
+                                            for _w in _di["warnings"]:
+                                                st.caption(_w)
+
+                                    if not _di["positions"].empty:
+                                        st.markdown(_bi("**حيازات تدفع توزيعات**","**Dividend-Paying Holdings**"))
+                                        st.dataframe(_di["positions"], use_container_width=True, hide_index=True)
+
+                                    # Monthly calendar chart
+                                    if not _di["monthly_calendar"].empty:
+                                        _fig_cal = px.bar(
+                                            _di["monthly_calendar"], x="Month", y="Expected Income",
+                                            title=_bi("التقويم الشهري للأرباح","Monthly Income Calendar"),
+                                            color="Expected Income",
+                                            color_continuous_scale="Tealgrn",
+                                        )
+                                        style_chart(_fig_cal, height=260)
+                                        st.plotly_chart(_fig_cal, use_container_width=True, key="dividend_calendar")
+
+                                    # 5-year projection
+                                    if not _di["projection_5y"].empty:
+                                        st.markdown(_bi("**توقع 5 سنوات**","**5-Year Projection**"))
+                                        st.dataframe(_di["projection_5y"], use_container_width=True, hide_index=True)
+                                        _fig_proj = px.line(
+                                            _di["projection_5y"], x="Year", y="Annual Income",
+                                            markers=True,
+                                            title=_bi("نمو الدخل السنوي","Annual Income Growth"),
+                                        )
+                                        style_chart(_fig_proj, height=240)
+                                        st.plotly_chart(_fig_proj, use_container_width=True, key="dividend_proj")
+                            except Exception as _f8_err:
+                                st.warning(f"Dividend engine error: {_f8_err}")
+
+                elif st.session_state.get("pt_show_analysis") and qe is None:
+                    st.warning("Pipeline unavailable — analysis requires live data connection.")
+
+        except Exception as _te:
+            st.warning(f"Positions tracker unavailable: {_te}")
+
 # ═══════════════════════════════════════════════════════
 # TAB 6 — Watchlist
 # ═══════════════════════════════════════════════════════
@@ -1483,7 +3151,7 @@ with tab6:
             ticker_clean = new_ticker.strip().upper()
             if ticker_clean and ticker_clean not in st.session_state.watchlist:
                 st.session_state.watchlist.append(ticker_clean)
-                _wl_add(ticker_clean)
+                _wl_add(ticker_clean, str(_uid))
                 st.rerun()
 
     if not st.session_state.watchlist:
@@ -1517,12 +3185,15 @@ with tab6:
                                    "threshold":{"line":{"color":"red","width":2},"thickness":.75,"value":RSI_OVERBOUGHT}},
                             title={"text":"RSI"},
                         ))
-                        fig_gauge.update_layout(height=120, margin=dict(l=10,r=10,t=30,b=10), paper_bgcolor="rgba(0,0,0,0)")
+                        style_chart(fig_gauge, height=120)
+                        fig_gauge.update_layout(margin=dict(l=10,r=10,t=30,b=10),
+                                                paper_bgcolor="rgba(0,0,0,0)",
+                                                plot_bgcolor="rgba(0,0,0,0)")
                         st.plotly_chart(fig_gauge, use_container_width=True, key=f"gauge_{ticker}")
                 with rc3:
                     if st.button(f"🗑️", key=f"rm_{ticker}"):
                         st.session_state.watchlist.remove(ticker)
-                        _wl_remove(ticker)
+                        _wl_remove(ticker, str(_uid))
                         st.rerun()
                 st.markdown("---")
 
@@ -1533,12 +3204,64 @@ with tab7:
     st.markdown(f"### 🤖 {t('ai_title')}")
     st.caption(t("ai_desc"))
 
-    # Render chat history
+    # ── File upload (CSV / Excel portfolio analysis) ──────────────────────────
+    with st.expander("📎 " + ("رفع ملف محفظة (CSV / Excel)" if st.session_state.language == "ar" else "Upload Portfolio File (CSV / Excel)"), expanded=False):
+        uploaded_file = st.file_uploader(
+            "portfolio-file-upload", type=["csv", "xlsx", "xls"],
+            label_visibility="collapsed", key="ai_file_upload"
+        )
+        if uploaded_file:
+            try:
+                if uploaded_file.name.endswith(".csv"):
+                    _uf_df = pd.read_csv(uploaded_file)
+                else:
+                    _uf_df = pd.read_excel(uploaded_file)
+                st.dataframe(_uf_df.head(10), use_container_width=True, hide_index=True)
+                st.session_state["ai_file_block"] = _uf_df.to_markdown(index=False)
+                st.success("✅ " + ("تم تحميل الملف — أرسل سؤالك الآن" if st.session_state.language == "ar" else "File loaded — send your question now"))
+            except Exception as _fe:
+                st.error(f"❌ {_fe}")
+        elif "ai_file_block" in st.session_state:
+            st.caption("📄 " + ("ملف محمّل مسبقاً — /clear لمسحه" if st.session_state.language == "ar" else "File already loaded — /clear to remove"))
+
+    # Empty state — show suggested prompts when no chat history
+    if not st.session_state.ai_history:
+        lang = st.session_state.language
+        suggestions = [
+            ('حلّل محفظتي الحالية وأعطني توصيات', 'Analyze my current portfolio and give recommendations'),
+            ('ما هي أفضل الفرص في السوق السعودي الآن؟', 'What are the best opportunities in Saudi market now?'),
+            ('قيّم المخاطر في محفظتي', 'Assess the risks in my portfolio'),
+            ('ابني محفظة متوازنة برأس مال 100,000 دولار', 'Build a balanced portfolio with $100,000 capital'),
+        ]
+        st.markdown('---')
+        _bi_local = lambda ar, en: ar if lang == 'ar' else en
+        st.caption(_bi_local('💡 جرّب أحد هذه الأسئلة:', '💡 Try one of these:'))
+        _sc1, _sc2 = st.columns(2)
+        for i, (ar_s, en_s) in enumerate(suggestions):
+            _col = _sc1 if i % 2 == 0 else _sc2
+            with _col:
+                label = ar_s if lang == 'ar' else en_s
+                if st.button(label, key=f'sugg_{i}', use_container_width=True):
+                    st.session_state['ai_prefill'] = label
+                    st.rerun()
+        st.markdown('---')
+
+    # ── Chat history ──────────────────────────────────────────────────────────
     for msg in st.session_state.ai_history:
         role_cls = "chat-user" if msg["role"] == "user" else "chat-ai"
         st.markdown(f'<div class="{role_cls}">{msg["content"]}</div>', unsafe_allow_html=True)
+        # Show download button if message carries a PDF attachment
+        if msg.get("pdf_path") and Path(msg["pdf_path"]).exists():
+            with open(msg["pdf_path"], "rb") as _pf:
+                st.download_button(
+                    label="📥 " + ("تحميل التقرير PDF" if st.session_state.language == "ar" else "Download PDF Report"),
+                    data=_pf.read(),
+                    file_name=msg.get("pdf_filename", "report.pdf"),
+                    mime="application/pdf",
+                    key=f"dl_{msg['pdf_path']}",
+                )
 
-    # Input row
+    # ── Input row ─────────────────────────────────────────────────────────────
     ci1, ci2 = st.columns([5, 1])
     with ci1:
         user_query = st.text_input(
@@ -1552,35 +3275,65 @@ with tab7:
     with col_b:
         if st.button(f"🗑️ {t('ai_clear')}", use_container_width=True):
             st.session_state.ai_history = []
+            st.session_state.pop("ai_file_block", None)
             st.rerun()
+
+    # Handle suggested prompt prefill
+    if st.session_state.get('ai_prefill'):
+        user_query = st.session_state.pop('ai_prefill')
+        send_clicked = True
 
     if send_clicked and user_query.strip():
         st.session_state.ai_history.append({"role": "user", "content": user_query})
         messages = [{"role": m["role"], "content": m["content"]} for m in st.session_state.ai_history]
-        market_context, selected_count = build_ai_market_context(
-            filtered_df,
-            user_query,
-            max_rows=18,
-        )
+        portfolio_ctx = _build_portfolio_ai_context(_uid, filtered_df)
+        file_block    = st.session_state.get("ai_file_block", "")
 
         with st.spinner(t("ai_thinking")):
-            try:
-                ai_reply = ask_eisa_ai(
-                    messages=messages,
-                    market_context=market_context,
-                    stock_count=selected_count,
-                    language=st.session_state.language,
-                )
-            except requests.exceptions.Timeout:
-                ai_reply = "⏱️ Request timed out. Please try again." if st.session_state.language == "en" else "⏱️ انتهى وقت الانتظار. يرجى المحاولة مرة أخرى."
-            except requests.exceptions.HTTPError:
-                ai_reply = "❌ AI service error. Please try again in a moment." if st.session_state.language == "en" else "❌ حدث خطأ في خدمة الذكاء الاصطناعي. حاول مرة أخرى بعد قليل."
-            except Exception as e:
-                ai_reply = f"❌ Error: {str(e)}"
+            ai_reply  = ""
+            dl_info   = None
+            market_context, selected_count = build_ai_market_context(
+                filtered_df, user_query, max_rows=18,
+            )
+            prefer_agent = _should_use_agent_for_ai(user_query, file_block=file_block)
 
-        note = f"_Context used: {selected_count} relevant rows from {len(filtered_df)} filtered stocks._"
-        ai_reply = f"{ai_reply}\n\n{note}"
-        st.session_state.ai_history.append({"role": "assistant", "content": ai_reply})
+            if prefer_agent:
+                ai_reply, new_sid, dl_info = _agent_chat(
+                    uid=_uid,
+                    message=user_query,
+                    session_id=st.session_state.ai_session_id,
+                    portfolio_ctx=portfolio_ctx,
+                    file_block=file_block,
+                )
+                if new_sid:
+                    st.session_state.ai_session_id = new_sid
+                if file_block and ai_reply:
+                    st.session_state.pop("ai_file_block", None)
+
+            if not ai_reply:
+                try:
+                    ai_reply = ask_eisa_ai(
+                        messages=messages,
+                        market_context=market_context,
+                        stock_count=selected_count,
+                        language=st.session_state.language,
+                        portfolio_context=portfolio_ctx,
+                        file_context=file_block,
+                    )
+                    ai_reply += f"\n\n_Context: {selected_count} stocks (live dashboard mode)_"
+                    if file_block:
+                        st.session_state.pop("ai_file_block", None)
+                except requests.exceptions.Timeout:
+                    ai_reply = "⏱️ انتهى وقت الانتظار. يرجى المحاولة مرة أخرى." if st.session_state.language == "ar" else "⏱️ Request timed out. Please try again."
+                except Exception as _e:
+                    ai_reply = f"❌ Error: {_e}"
+
+        # Store message + optional PDF reference in history
+        history_entry = {"role": "assistant", "content": ai_reply}
+        if dl_info:
+            history_entry["pdf_path"]     = str(dl_info["path"])
+            history_entry["pdf_filename"] = dl_info["filename"]
+        st.session_state.ai_history.append(history_entry)
         st.rerun()
 
 # ═══════════════════════════════════════════════════════
@@ -1810,6 +3563,83 @@ with tab10:
         if ts_crypto:
             st.caption(f"🕐 {t('last_update')}: {ts_crypto}")
 
+
+# ═══════════════════════════════════════════════════════
+# TAB ADMIN — User Management (admin only)
+# ═══════════════════════════════════════════════════════
+if _is_admin and tab_admin is not None:
+    with tab_admin:
+        from core.user_db import list_users as _lu, create_user as _cu, update_user as _uu, delete_user as _du
+        from core.auth import hash_password as _hp, generate_temp_password as _gtp
+
+        st.markdown("### 🛡️ إدارة المستخدمين / User Management")
+
+        # ── Current users table ───────────────────────────────────────────────
+        _users = _lu()
+        if _users:
+            _u_df = pd.DataFrame(_users)[["id","name","email","role","is_active","must_change_pw","last_login"]]
+            _u_df.columns = ["ID","Name","Email","Role","Active","Must Change PW","Last Login"]
+            _u_df["Active"] = _u_df["Active"].map({1:"✅",0:"❌"})
+            _u_df["Must Change PW"] = _u_df["Must Change PW"].map({1:"⚠️ Yes",0:"No"})
+            st.dataframe(_u_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No users yet.")
+
+        st.markdown("---")
+
+        # ── Create new user ───────────────────────────────────────────────────
+        with st.expander("➕ إضافة مستخدم جديد / Add New User", expanded=False):
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                _new_name  = st.text_input("الاسم / Name", key="adm_name")
+                _new_email = st.text_input("البريد الإلكتروني / Email", key="adm_email")
+            with ac2:
+                _new_role  = st.selectbox("الدور / Role", ["user","admin"], key="adm_role")
+                _new_pw    = st.text_input("كلمة المرور / Password (leave blank = auto)", key="adm_pw")
+
+            if st.button("إنشاء / Create", type="primary", key="adm_create"):
+                if not _new_name or not _new_email:
+                    st.error("الاسم والبريد الإلكتروني مطلوبان")
+                else:
+                    _pw_final = _new_pw.strip() if _new_pw.strip() else _gtp()
+                    try:
+                        _cu(_new_email.strip(), _new_name.strip(), _hp(_pw_final),
+                            role=_new_role, must_change_pw=not bool(_new_pw.strip()))
+                        st.success(f"✅ تم إنشاء الحساب | كلمة المرور: `{_pw_final}`")
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"❌ {_e}")
+
+        # ── Manage existing user ──────────────────────────────────────────────
+        with st.expander("⚙️ تعديل مستخدم / Manage User", expanded=False):
+            _sel_user = st.selectbox(
+                "اختر مستخدم / Select User",
+                [f"{u['id']} — {u['email']}" for u in _users],
+                key="adm_sel_user"
+            )
+            if _sel_user:
+                _sel_id = int(_sel_user.split(" — ")[0])
+                _sel_obj = next((u for u in _users if u["id"] == _sel_id), None)
+                if _sel_obj:
+                    mc1, mc2, mc3 = st.columns(3)
+                    with mc1:
+                        _active_label = "✅ Active" if _sel_obj["is_active"] else "❌ Inactive"
+                        if st.button(f"Toggle Active ({_active_label})", key="adm_toggle_active"):
+                            _uu(_sel_id, is_active=0 if _sel_obj["is_active"] else 1)
+                            st.rerun()
+                    with mc2:
+                        if st.button("🔑 Reset Password", key="adm_reset_pw"):
+                            _tmp = _gtp()
+                            _uu(_sel_id, password_hash=_hp(_tmp), must_change_pw=1)
+                            st.success(f"كلمة المرور الجديدة: `{_tmp}`")
+                    with mc3:
+                        if _sel_id != _current_user["id"]:
+                            if st.button("🗑️ Delete User", key="adm_del"):
+                                _du(_sel_id)
+                                st.success("تم الحذف")
+                                st.rerun()
+                        else:
+                            st.caption("(لا يمكن حذف حسابك الحالي)")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""

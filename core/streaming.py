@@ -1,11 +1,11 @@
 """
 core/streaming.py
 ─────────────────
-Streaming token generators for DeepSeek and Gemini.
+Streaming token generators for DeepSeek.
 
 Usage
 ─────
-    from core.streaming import stream_deepseek, stream_gemini
+    from core.streaming import stream_deepseek
 
     async for chunk in stream_deepseek(messages, system_prompt):
         yield chunk   # {"type": "token"|"status"|"done"|"error", "text": "..."}
@@ -45,7 +45,7 @@ def error(text: str) -> dict:
 async def stream_deepseek(
     messages: list,
     *,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     max_tokens: int = 4500,
     temperature: float = 0.3,
     timeout: int = 90,
@@ -108,60 +108,3 @@ async def stream_deepseek(
         yield error(str(e))
 
 
-# ── Gemini Streaming ──────────────────────────────────────────────────────────
-
-async def stream_gemini(
-    contents: str,
-    *,
-    model: str = "gemini-2.0-flash",
-    max_tokens: int = 2048,
-    temperature: float = 0.7,
-):
-    """
-    Async generator — streams Gemini tokens.
-    Falls back to non-streaming if SDK doesn't support streaming.
-    """
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        yield error("GEMINI_API_KEY not set")
-        return
-
-    try:
-        from google import genai
-        from google.genai import types as _gtypes
-
-        client = genai.Client(api_key=api_key)
-        cfg = _gtypes.GenerateContentConfig(
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
-
-        # Use async streaming if available
-        try:
-            async for chunk in await client.aio.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                config=cfg,
-            ):
-                text = (chunk.text or "").strip()
-                if text:
-                    yield token(text)
-            yield done()
-
-        except AttributeError:
-            # SDK version without async streaming — fall back to sync
-            resp = client.models.generate_content(
-                model=model,
-                contents=contents,
-                config=cfg,
-            )
-            full = (resp.text or "").strip()
-            # Emit in small chunks to simulate streaming
-            chunk_size = 8
-            for i in range(0, len(full), chunk_size):
-                yield token(full[i:i + chunk_size])
-            yield done()
-
-    except Exception as e:
-        logger.error("[Streaming] Gemini error: %s", e)
-        yield error(str(e))

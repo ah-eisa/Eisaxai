@@ -17,6 +17,8 @@ from core.ticker_resolver import (
     has_arabic_stock_context,
     COMBINED_LOCAL_PATTERN,
 )
+from core.services.ticker_validator import TickerValidator as _TickerValidator
+_ticker_validator = _TickerValidator()
 
 # Initialize resolver once at module level
 _resolver = TickerResolver()
@@ -27,13 +29,16 @@ _resolver = TickerResolver()
 # Updated TICKER_RE to include local market patterns
 TICKER_RE = re.compile(
     r'(?:'
-    r'\b[A-Za-z]{1,6}(?:-USD)?\b'               # US tickers: AAPL, BTC-USD
-    r'|\b\d{4}\.SR\b'                             # Saudi: 2222.SR
-    r'|\b[A-Za-z]{2,6}\.CA\b'                     # Egypt: COMI.CA
-    r'|\b[A-Za-z]{2,15}\.(?:AE|DU)\b'             # UAE: FAB.AE, ADNOCDIST.AE, ALPHADHABI.AE
-    r'|\b[A-Za-z]{2,15}\.KW\b'                    # Kuwait: KFH.KW, BOUBYAN.KW
-    r'|\b[A-Za-z]{2,12}\.QA\b'                    # Qatar: QNBK.QA, IQCD.QA
-    r'|\^[A-Za-z]{3,10}\b'                        # Indices: ^TASI, ^EGX30
+    r'\b\d{4}\.SR\b'                             # Saudi: 2222.SR (before generic)
+    r'|\b[A-Za-z]{2,6}\.CA\b'                    # Egypt: COMI.CA
+    r'|\b[A-Za-z]{2,15}\.(?:AE|DU)\b'            # UAE: FAB.AE, ADNOCDIST.AE
+    r'|\b[A-Za-z]{2,15}\.KW\b'                   # Kuwait: KFH.KW, BOUBYAN.KW
+    r'|\b[A-Za-z]{2,12}\.QA\b'                   # Qatar: QNBK.QA, IQCD.QA
+    r'|\b[A-Za-z]{2,10}\.BH\b'                   # Bahrain: SEEF.BH, ALBH.BH
+    r'|\b[A-Za-z]{2,10}\.MA\b'                   # Morocco: HPS.MA, MNG.MA
+    r'|\b[A-Za-z]{2,10}\.TN\b'                   # Tunisia: TJARI.TN, AB.TN
+    r'|\b[A-Za-z]{1,6}(?:-USD)?\b'               # US/bare tickers: AAPL, BTC-USD (last — most generic)
+    r'|\^[A-Za-z]{3,10}\b'                       # Indices: ^TASI, ^EGX30
     r')'
 )
 
@@ -177,6 +182,9 @@ class IntentClassifier:
                 if result and result not in out:
                     out.append(result)
         
+        # ── Step 2b: Reject blocked/test tickers before dedup ────────
+        out = [t for t in out if _ticker_validator.is_valid(t)]
+
         # ── Step 3: Deduplicate preserving order ──────────────────
         seen = set()
         uniq = []

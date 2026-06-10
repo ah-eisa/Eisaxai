@@ -1,0 +1,17 @@
+[Unit]
+Description=EisaX Market Data Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/investwise
+ExecStart=/home/ubuntu/investwise/venv/bin/python /home/ubuntu/investwise/pipeline.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/ubuntu/investwise/pipeline.log
+StandardError=append:/home/ubuntu/investwise/pipeline.log
+
+[Install]
+WantedBy=multi-user.target

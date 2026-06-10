@@ -3,7 +3,7 @@ LLM Fallback Chain
 ==================
 Handles quota exhaustion by intelligently routing through multiple LLM providers.
 
-Priority: Kimi → DeepSeek → Cache/Fallback
+Priority: DeepSeek → Cache/Fallback
 
 This module ensures the system never gets blocked by a single provider's quota.
 """
@@ -21,12 +21,12 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ═══════════════════════════════════════════════════════════════════════════
 
-KIMI_API_KEY = os.getenv("MOONSHOT_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL     = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4.1-nano")
 
 # Fallback priority order
-FALLBACK_CHAIN = ["kimi", "deepseek", "gemini", "cache"]
+FALLBACK_CHAIN = ["deepseek", "openai", "cache"]
 
 # Circuit breaker thresholds
 CIRCUIT_BREAKER_THRESHOLD = 5  # errors before switching
@@ -84,102 +84,6 @@ class CircuitBreaker:
         return False
 
 
-class KimiClient:
-    """Kimi (Moonshot) LLM client with quota awareness."""
-
-    def __init__(self):
-        self.api_key = KIMI_API_KEY
-        self.circuit_breaker = CircuitBreaker()
-        self.base_url = "https://api.moonshot.cn/v1"
-        self.model = "kimi-k2.5"
-
-    def is_available(self) -> bool:
-        """Check if Kimi is configured and healthy."""
-        return bool(self.api_key) and self.circuit_breaker.is_available()
-
-    def generate(self, prompt: str, system: str = "", **kwargs) -> LLMResponse:
-        """Generate response using Kimi API."""
-        if not self.is_available():
-            return LLMResponse(
-                content="",
-                provider="kimi",
-                success=False,
-                error="Circuit breaker open or API key missing",
-                cached=False
-            )
-
-        try:
-            import httpx
-            import json
-
-            start = time.time()
-
-            client = httpx.Client(timeout=30.0)
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-
-            messages = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
-
-            payload = {
-                "model": self.model,
-                "messages": messages,
-                "temperature": kwargs.get("temperature", 0.7),
-                "max_tokens": kwargs.get("max_tokens", 1000)
-            }
-
-            response = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=payload
-            )
-
-            latency = (time.time() - start) * 1000
-
-            if response.status_code == 200:
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                self.circuit_breaker.record_success()
-
-                logger.info(f"Kimi response success ({latency:.0f}ms)")
-                return LLMResponse(
-                    content=content,
-                    provider="kimi",
-                    success=True,
-                    latency_ms=latency,
-                    cached=False
-                )
-            else:
-                error = f"HTTP {response.status_code}: {response.text}"
-                logger.warning(f"Kimi error: {error}")
-                self.circuit_breaker.record_failure()
-
-                return LLMResponse(
-                    content="",
-                    provider="kimi",
-                    success=False,
-                    error=error,
-                    latency_ms=latency
-                )
-
-        except Exception as e:
-            error = f"Kimi exception: {str(e)}"
-            logger.error(error)
-            self.circuit_breaker.record_failure()
-
-            return LLMResponse(
-                content="",
-                provider="kimi",
-                success=False,
-                error=error,
-                cached=False
-            )
-
-
 class DeepSeekClient:
     """DeepSeek LLM client as secondary fallback."""
 
@@ -187,7 +91,7 @@ class DeepSeekClient:
         self.api_key = DEEPSEEK_API_KEY
         self.circuit_breaker = CircuitBreaker()
         self.base_url = "https://api.deepseek.com/v1"
-        self.model = "deepseek-chat"
+        self.model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
     def is_available(self) -> bool:
         """Check if DeepSeek is configured and healthy."""
@@ -275,6 +179,53 @@ class DeepSeekClient:
             )
 
 
+class OpenAIClient:
+    """OpenAI fallback client (GPT-4.1-nano by default)."""
+
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY", "")
+        self.model   = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4.1-nano")
+        self.circuit_breaker = CircuitBreaker()
+
+    def is_available(self) -> bool:
+        return bool(self.api_key) and self.circuit_breaker.is_available()
+
+    def generate(self, prompt: str, system: str = "", **kwargs) -> LLMResponse:
+        if not self.is_available():
+            return LLMResponse(content="", provider="openai", success=False,
+                               error="Circuit breaker open or API key missing")
+        try:
+            import httpx
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            start = time.time()
+            r = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": kwargs.get("temperature", 0.7),
+                    "max_tokens": kwargs.get("max_tokens", 1000),
+                },
+                timeout=30.0,
+            )
+            latency = (time.time() - start) * 1000
+            if r.status_code == 200:
+                content = r.json()["choices"][0]["message"]["content"] or ""
+                self.circuit_breaker.record_success()
+                logger.info("OpenAI %s response success (%.0fms)", self.model, latency)
+                return LLMResponse(content=content, provider="openai", success=True, latency_ms=latency)
+            error = f"HTTP {r.status_code}: {r.text[:200]}"
+            self.circuit_breaker.record_failure()
+            return LLMResponse(content="", provider="openai", success=False, error=error, latency_ms=latency)
+        except Exception as e:
+            self.circuit_breaker.record_failure()
+            return LLMResponse(content="", provider="openai", success=False, error=str(e))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Response Cache
 # ═══════════════════════════════════════════════════════════════════════════
@@ -314,36 +265,34 @@ def _cache_response(prompt: str, response: str):
 # Main Fallback Chain
 # ═══════════════════════════════════════════════════════════════════════════
 
-_kimi_client = None
 _deepseek_client = None
-
-
-def get_kimi_client() -> KimiClient:
-    """Get or create Kimi client (singleton)."""
-    global _kimi_client
-    if _kimi_client is None:
-        _kimi_client = KimiClient()
-    return _kimi_client
+_openai_client   = None
 
 
 def get_deepseek_client() -> DeepSeekClient:
-    """Get or create DeepSeek client (singleton)."""
     global _deepseek_client
     if _deepseek_client is None:
         _deepseek_client = DeepSeekClient()
     return _deepseek_client
 
 
+def get_openai_client() -> OpenAIClient:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAIClient()
+    return _openai_client
+
+
 async def generate_with_fallback(
     prompt: str,
     system: str = "",
-    preferred_provider: str = "kimi",
+    preferred_provider: str = "deepseek",
     **kwargs
 ) -> LLMResponse:
     """
     Generate response with intelligent fallback chain.
 
-    Priority: Kimi → DeepSeek → Cache → Fallback
+    Priority: DeepSeek → Cache → Fallback
 
     Args:
         prompt: User prompt
@@ -367,35 +316,30 @@ async def generate_with_fallback(
             cached=True
         )
 
-    # 2. Try Kimi
-    kimi = get_kimi_client()
-    if preferred_provider == "kimi" and kimi.is_available():
-        result = kimi.generate(prompt, system, **kwargs)
-        if result.success:
-            _cache_response(prompt, result.content)
-            return result
-        logger.warning(f"Kimi failed: {result.error}, trying fallback")
-
-    # 3. Try DeepSeek
+    # 2. Try DeepSeek (primary)
     deepseek = get_deepseek_client()
     if deepseek.is_available():
         result = deepseek.generate(prompt, system, **kwargs)
         if result.success:
             _cache_response(prompt, result.content)
             return result
-        logger.warning(f"DeepSeek failed: {result.error}, trying fallback")
+        logger.warning(f"DeepSeek failed: {result.error} — trying OpenAI fallback")
 
-    # 4. Return cache as last resort
+    # 3. Try OpenAI GPT-4.1-nano (fallback)
+    openai_client = get_openai_client()
+    if openai_client.is_available():
+        result = openai_client.generate(prompt, system, **kwargs)
+        if result.success:
+            _cache_response(prompt, result.content)
+            return result
+        logger.warning(f"OpenAI failed: {result.error}")
+
+    # 4. Cache as last resort
     cached = _get_cached_response(prompt)
     if cached:
-        return LLMResponse(
-            content=cached,
-            provider="cache",
-            success=True,
-            cached=True
-        )
+        return LLMResponse(content=cached, provider="cache", success=True, cached=True)
 
-    # 5. Return generic fallback
+    # 5. Static fallback — never raises
     logger.error("All LLM providers failed, returning fallback response")
     return LLMResponse(
         content="I apologize, but I'm temporarily unable to process your request. Please try again in a moment.",
@@ -413,11 +357,11 @@ async def generate_with_fallback(
 def generate_with_fallback_sync(
     prompt: str,
     system: str = "",
-    preferred_provider: str = "kimi",
+    preferred_provider: str = "deepseek",
     **kwargs,
 ) -> LLMResponse:
     """
-    Synchronous fallback chain: Kimi → DeepSeek → Cache → Static.
+    Synchronous fallback chain: DeepSeek → Cache → Static.
 
     Identical logic to ``generate_with_fallback`` but fully synchronous,
     safe to call from any sync context (e.g. gunicorn worker threads,
@@ -426,7 +370,7 @@ def generate_with_fallback_sync(
     Args:
         prompt: Prompt / message content.
         system: Optional system prompt.
-        preferred_provider: First provider to attempt (default ``"kimi"``).
+        preferred_provider: First provider to attempt (default ``"deepseek"``).
         **kwargs: Extra args forwarded to client.generate() (temperature, max_tokens, …).
 
     Returns:
@@ -439,23 +383,23 @@ def generate_with_fallback_sync(
     if cached:
         return LLMResponse(content=cached, provider="cache", success=True, cached=True)
 
-    # 2. Kimi
-    kimi = get_kimi_client()
-    if kimi.is_available():
-        result = kimi.generate(prompt, system, **kwargs)
-        if result.success:
-            _cache_response(prompt, result.content)
-            return result
-        logger.warning("Kimi failed: %s — trying DeepSeek", result.error)
-
-    # 3. DeepSeek
+    # 2. DeepSeek (primary)
     deepseek = get_deepseek_client()
     if deepseek.is_available():
         result = deepseek.generate(prompt, system, **kwargs)
         if result.success:
             _cache_response(prompt, result.content)
             return result
-        logger.warning("DeepSeek failed: %s — trying cache", result.error)
+        logger.warning("DeepSeek failed: %s — trying OpenAI fallback", result.error)
+
+    # 3. OpenAI GPT-4.1-nano (fallback)
+    openai_client = get_openai_client()
+    if openai_client.is_available():
+        result = openai_client.generate(prompt, system, **kwargs)
+        if result.success:
+            _cache_response(prompt, result.content)
+            return result
+        logger.warning("OpenAI fallback failed: %s", result.error)
 
     # 4. Cache as last resort
     cached = _get_cached_response(prompt)
@@ -482,19 +426,27 @@ def generate_with_fallback_sync(
 
 def get_llm_health() -> Dict[str, Any]:
     """Get health status of all LLM providers."""
+    _ds = get_deepseek_client()
+    _oai = get_openai_client()
     return {
-        "kimi": {
-            "available": get_kimi_client().is_available(),
-            "failures": get_kimi_client().circuit_breaker.failures,
-            "configured": bool(KIMI_API_KEY)
-        },
         "deepseek": {
-            "available": get_deepseek_client().is_available(),
-            "failures": get_deepseek_client().circuit_breaker.failures,
-            "configured": bool(DEEPSEEK_API_KEY)
+            "available":  _ds.is_available(),
+            "failures":   _ds.circuit_breaker.failures,
+            "configured": bool(DEEPSEEK_API_KEY),
+        },
+        "openai": {
+            "available":  _oai.is_available(),
+            "failures":   _oai.circuit_breaker.failures,
+            "configured": bool(OPENAI_API_KEY),
+            "model":      OPENAI_MODEL,
+        },
+        "kimi": {
+            "available":  False,
+            "configured": False,
+            "failures":   0,
         },
         "cache": {
-            "entries": len(_response_cache),
-            "ttl_seconds": CACHE_TTL
-        }
+            "entries":     len(_response_cache),
+            "ttl_seconds": CACHE_TTL,
+        },
     }

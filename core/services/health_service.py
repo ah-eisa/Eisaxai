@@ -83,63 +83,9 @@ async def _check_database() -> ServiceResult:
         return _down(f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000)
 
 
-# ── Gemini ────────────────────────────────────────────────────────────────────
-
 async def _check_gemini() -> ServiceResult:
-    t0 = time.monotonic()
-    try:
-        primary_key = os.getenv("GEMINI_API_KEY", "")
-        backup_key = os.getenv("GEMINI_API_KEY_BACKUP", "")
-
-        candidates: list[tuple[str, str]] = []
-        if primary_key:
-            candidates.append(("primary", primary_key))
-        if backup_key and backup_key != primary_key:
-            candidates.append(("backup", backup_key))
-
-        if not candidates:
-            return _down("No Gemini API key configured", (time.monotonic() - t0) * 1000)
-
-        def _probe(api_key: str) -> str:
-            # Probe via DeepSeek (Gemini keys currently unavailable — 403)
-            import requests as _req_hs, os as _os_hs
-            _ds_key = _os_hs.getenv("DEEPSEEK_API_KEY", "")
-            if _ds_key:
-                _r = _req_hs.post(
-                    "https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat",
-                          "messages": [{"role": "user", "content": "hi"}],
-                          "max_tokens": 3},
-                    timeout=8,
-                )
-                if _r.status_code == 200:
-                    return "DeepSeek probe ok"
-                raise ValueError(f"DeepSeek HTTP {_r.status_code}")
-            # Fallback: try Gemini (may fail with 403 if key expired)
-            from google import genai
-            client = genai.Client(api_key=api_key)
-            resp = client.models.generate_content(model="gemini-2.0-flash", contents="hi")
-            text = resp.text
-            if not text:
-                raise ValueError("Empty response text")
-            return f"response length {len(text)} chars"
-
-        errors: list[str] = []
-        loop = asyncio.get_event_loop()
-        for label, api_key in candidates:
-            try:
-                detail = await loop.run_in_executor(None, _probe, api_key)
-                return _ok(f"{label} key ok ({detail})", (time.monotonic() - t0) * 1000)
-            except Exception as exc:
-                msg = f"{type(exc).__name__}: {exc}"
-                if len(msg) > 220:
-                    msg = msg[:217] + "..."
-                errors.append(f"{label}={msg}")
-
-        return _down("; ".join(errors), (time.monotonic() - t0) * 1000)
-    except Exception as exc:
-        return _down(f"{type(exc).__name__}: {exc}", (time.monotonic() - t0) * 1000)
+    """Gemini removed — returns ok (not applicable)."""
+    return _ok("not used (DeepSeek is primary LLM)", 0.0)
 
 
 # ── DeepSeek ─────────────────────────────────────────────────────────────────
@@ -309,42 +255,31 @@ def _aggregate_status(services: dict[str, ServiceResult]) -> tuple[str, str, lis
 
     Rules
     -----
-    - database down                          → "down"
-    - both LLMs (gemini, deepseek) down      → "down"
-    - deepseek down while gemini up          → "degraded"
-    - gemini down while deepseek up          → "ok" (optional dependency)
-    - disk/memory degraded                   → "degraded"
-    - everything ok                          → "ok"
+    - database down      → "down"
+    - deepseek down      → "degraded"
+    - disk/memory issues → "degraded"
+    - everything ok      → "ok"
     """
-    db_status = services["database"]["status"]
-    gemini_status = services["gemini"]["status"]
+    db_status       = services["database"]["status"]
     deepseek_status = services["deepseek"]["status"]
     optional_failures: list[str] = []
 
     if db_status == "down":
         return "down", "Critical failure: database is unreachable", optional_failures
 
-    if gemini_status == "down" and deepseek_status == "down":
-        return "down", "Critical failure: all LLM services are down", optional_failures
+    if deepseek_status == "down":
+        return "down", "Critical failure: DeepSeek LLM is down", optional_failures
 
     degraded_services = [
         name
         for name, result in services.items()
-        if result["status"] in ("degraded", "down")
+        if result["status"] in ("degraded", "down") and name not in ("gemini",)
     ]
-
-    if gemini_status in ("down", "degraded") and deepseek_status == "ok":
-        optional_failures.append("gemini")
-        degraded_services = [name for name in degraded_services if name != "gemini"]
 
     if degraded_services:
         count = len(degraded_services)
         names = ", ".join(degraded_services)
         return "degraded", f"{count} service(s) degraded: {names}", optional_failures
-
-    if optional_failures:
-        names = ", ".join(optional_failures)
-        return "ok", f"All core systems operational; optional issue(s): {names}", optional_failures
 
     return "ok", "All systems operational", optional_failures
 

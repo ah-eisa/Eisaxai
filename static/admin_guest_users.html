@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EisaX Demo Access Admin</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1118;
+      --panel: #111c27;
+      --panel-2: #162433;
+      --ink: #edf6ff;
+      --muted: #9db0c4;
+      --line: rgba(157, 176, 196, .22);
+      --accent: #49d3b4;
+      --warn: #f4c75d;
+      --danger: #ff766f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 15% 10%, rgba(73, 211, 180, .16), transparent 28rem),
+        linear-gradient(135deg, #071017, var(--bg) 48%, #101621);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 36px 0 48px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    h1 { margin: 0 0 8px; font-size: clamp(30px, 5vw, 54px); letter-spacing: -.05em; }
+    p { color: var(--muted); line-height: 1.55; margin: 0; }
+    .pill {
+      border: 1px solid rgba(73, 211, 180, .35);
+      color: var(--accent);
+      border-radius: 999px;
+      padding: 8px 12px;
+      white-space: nowrap;
+      background: rgba(73, 211, 180, .08);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1.35fr .75fr;
+      gap: 18px;
+    }
+    section {
+      border: 1px solid var(--line);
+      background: rgba(17, 28, 39, .86);
+      backdrop-filter: blur(16px);
+      border-radius: 22px;
+      box-shadow: 0 24px 80px rgba(0, 0, 0, .28);
+      overflow: hidden;
+    }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .02);
+    }
+    h2 { margin: 0; font-size: 17px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 13px 16px; text-align: left; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+    td { font-size: 14px; }
+    tr:hover td { background: rgba(255, 255, 255, .025); }
+    button, input, select {
+      font: inherit;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      color: var(--ink);
+    }
+    button {
+      cursor: pointer;
+      padding: 10px 13px;
+      font-weight: 750;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    button:hover { transform: translateY(-1px); border-color: rgba(73, 211, 180, .45); }
+    button.primary { background: linear-gradient(135deg, #22bfa0, #37a9e6); border-color: transparent; color: #061014; }
+    button.danger { border-color: rgba(255, 118, 111, .38); color: #ffd4d1; }
+    button.ghost { background: rgba(255, 255, 255, .04); }
+    button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+    form { padding: 18px 20px 20px; display: grid; gap: 14px; }
+    label { display: grid; gap: 7px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    input, select { width: 100%; padding: 11px 12px; outline: none; }
+    input:focus, select:focus { border-color: rgba(73, 211, 180, .55); box-shadow: 0 0 0 3px rgba(73, 211, 180, .12); }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+    .status { min-height: 22px; color: var(--muted); font-size: 13px; }
+    .ok { color: var(--accent); }
+    .bad { color: var(--danger); }
+    .tag { display: inline-flex; border-radius: 999px; padding: 4px 9px; font-size: 12px; font-weight: 800; }
+    .tag.admin { color: #d7e8ff; background: rgba(87, 154, 255, .14); }
+    .tag.guest { color: #c5fff0; background: rgba(73, 211, 180, .13); }
+    .tag.off { color: #ffd4d1; background: rgba(255, 118, 111, .12); }
+    .tiny { color: var(--muted); font-size: 12px; }
+    .empty { padding: 28px 20px; color: var(--muted); }
+    @media (max-width: 900px) {
+      header, .grid { display: block; }
+      .pill { display: inline-flex; margin-top: 16px; }
+      section { margin-bottom: 18px; }
+      .two { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; white-space: nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Demo Access Admin</h1>
+        <p>Create, revoke, and manage controlled EisaX guest users, authorities, and analysis quotas.</p>
+      </div>
+      <div class="pill">Admin only</div>
+    </header>
+
+    <div class="grid">
+      <section>
+        <div class="section-head">
+          <h2>Users and Quotas</h2>
+          <button class="ghost" id="refreshBtn" type="button">Refresh</button>
+        </div>
+        <div id="tableWrap" class="empty">Loading demo users...</div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2 id="formTitle">Create / Update Guest</h2>
+        </div>
+        <form id="userForm">
+          <label>
+            Username
+            <input id="username" name="username" autocomplete="off" placeholder="Test" required />
+          </label>
+          <div class="two">
+            <label>
+              Role / Authority
+              <select id="role" name="role">
+                <option value="guest">guest</option>
+              </select>
+            </label>
+            <label>
+              Active access
+              <select id="active" name="active">
+                <option value="true">Active</option>
+                <option value="false">Revoked</option>
+              </select>
+            </label>
+          </div>
+          <label>
+            Password
+            <input id="password" name="password" type="password" autocomplete="new-password" placeholder="Leave blank to keep/copy current demo password" />
+          </label>
+          <div class="two">
+            <label>
+              Analysis quota
+              <input id="analysisLimit" name="analysisLimit" type="number" min="0" max="10000" value="6" />
+            </label>
+            <label>
+              Analyses used
+              <input id="analysesUsed" name="analysesUsed" type="number" min="0" max="10000" value="0" />
+            </label>
+          </div>
+          <div class="two">
+            <label>
+              Portfolio quota
+              <input id="portfolioLimit" name="portfolioLimit" type="number" min="0" max="10000" value="0" />
+            </label>
+            <label>
+              Portfolios used
+              <input id="portfoliosUsed" name="portfoliosUsed" type="number" min="0" max="10000" value="0" />
+            </label>
+          </div>
+          <div class="actions">
+            <button class="primary" type="submit">Save Guest</button>
+            <button class="ghost" id="resetBtn" type="button">Reset Quota</button>
+            <button class="danger" id="deleteBtn" type="button">Delete Guest</button>
+          </div>
+          <div class="status" id="status"></div>
+          <p class="tiny">Admin accounts are visible for audit context but cannot be edited from this demo-user dashboard.</p>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    const state = { users: [] };
+    const $ = (id) => document.getElementById(id);
+    const status = $("status");
+
+    function setStatus(message, kind = "") {
+      status.className = `status ${kind}`;
+      status.textContent = message || "";
+    }
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...(options.headers || {}),
+        },
+      });
+      const text = await res.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
+      if (!res.ok) throw new Error(data.detail || data.error || `Request failed (${res.status})`);
+      return data;
+    }
+
+    function tag(user) {
+      if (!user.active) return `<span class="tag off">revoked</span>`;
+      return `<span class="tag ${user.role}">${user.role}</span>`;
+    }
+
+    function renderTable() {
+      if (!state.users.length) {
+        $("tableWrap").className = "empty";
+        $("tableWrap").textContent = "No users found.";
+        return;
+      }
+      $("tableWrap").className = "";
+      $("tableWrap").innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Authority</th>
+              <th>Analysis</th>
+              <th>Portfolio</th>
+              <th>Last used</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${state.users.map((user) => `
+              <tr>
+                <td><strong>${escapeHtml(user.username)}</strong></td>
+                <td>${tag(user)}</td>
+                <td>${user.analyses_used}/${user.analysis_limit} <span class="tiny">(${user.analyses_remaining} left)</span></td>
+                <td>${user.portfolios_used}/${user.portfolio_limit} <span class="tiny">(${user.portfolios_remaining} left)</span></td>
+                <td>${escapeHtml(user.last_used || "Never")}</td>
+                <td><button type="button" ${user.editable ? "" : "disabled"} data-user="${escapeHtml(user.username)}">Edit</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>`;
+      document.querySelectorAll("button[data-user]").forEach((btn) => {
+        btn.addEventListener("click", () => selectUser(btn.dataset.user));
+      });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    async function loadUsers() {
+      setStatus("");
+      const data = await api("/v1/admin/guest-users/data");
+      state.users = data.users || [];
+      renderTable();
+    }
+
+    function selectUser(username) {
+      const user = state.users.find((item) => item.username === username);
+      if (!user || !user.editable) return;
+      $("username").value = user.username;
+      $("role").value = "guest";
+      $("active").value = String(Boolean(user.active));
+      $("password").value = "";
+      $("analysisLimit").value = user.analysis_limit;
+      $("analysesUsed").value = user.analyses_used;
+      $("portfolioLimit").value = user.portfolio_limit;
+      $("portfoliosUsed").value = user.portfolios_used;
+      setStatus(`Editing ${user.username}`, "ok");
+    }
+
+    function payloadFromForm() {
+      return {
+        username: $("username").value.trim(),
+        role: "guest",
+        active: $("active").value === "true",
+        password: $("password").value || null,
+        copy_password_from: "alan.talib",
+        analysis_limit: Number($("analysisLimit").value || 0),
+        portfolio_limit: Number($("portfolioLimit").value || 0),
+        analyses_used: Number($("analysesUsed").value || 0),
+        portfolios_used: Number($("portfoliosUsed").value || 0),
+      };
+    }
+
+    $("userForm").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const data = await api("/v1/admin/guest-users", {
+          method: "POST",
+          body: JSON.stringify(payloadFromForm()),
+        });
+        setStatus(`Saved ${data.user.username}`, "ok");
+        $("password").value = "";
+        await loadUsers();
+      } catch (err) {
+        setStatus(err.message, "bad");
+      }
+    });
+
+    $("resetBtn").addEventListener("click", async () => {
+      const username = $("username").value.trim();
+      if (!username) return setStatus("Choose a guest user first.", "bad");
+      try {
+        await api(`/v1/admin/guest-users/${encodeURIComponent(username)}/reset`, { method: "POST" });
+        setStatus(`Quota reset for ${username}`, "ok");
+        await loadUsers();
+        selectUser(username);
+      } catch (err) {
+        setStatus(err.message, "bad");
+      }
+    });
+
+    $("deleteBtn").addEventListener("click", async () => {
+      const username = $("username").value.trim();
+      if (!username) return setStatus("Choose a guest user first.", "bad");
+      if (!confirm(`Delete guest access for ${username}?`)) return;
+      try {
+        await api(`/v1/admin/guest-users/${encodeURIComponent(username)}`, { method: "DELETE" });
+        setStatus(`Deleted ${username}`, "ok");
+        $("userForm").reset();
+        $("analysisLimit").value = 6;
+        $("portfolioLimit").value = 0;
+        await loadUsers();
+      } catch (err) {
+        setStatus(err.message, "bad");
+      }
+    });
+
+    $("refreshBtn").addEventListener("click", () => loadUsers().catch((err) => setStatus(err.message, "bad")));
+    loadUsers().catch((err) => {
+      $("tableWrap").className = "empty bad";
+      $("tableWrap").textContent = err.message;
+    });
+  </script>
+</body>
+</html>

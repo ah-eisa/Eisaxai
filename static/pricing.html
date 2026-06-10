@@ -207,6 +207,25 @@
       font-size: 12px;
     }
 
+    .token-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1 1 320px;
+      flex-wrap: wrap;
+    }
+
+    .token-entry input {
+      flex: 1 1 220px;
+      min-width: 180px;
+    }
+
+    .token-entry .mini-button {
+      width: auto;
+      flex: 0 0 auto;
+      padding-inline: 16px;
+    }
+
     .cards {
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -428,7 +447,7 @@
         </div>
 
         <p class="help" data-i18n="details_help">
-          This page reads the API token from localStorage.eisax_token. Enter the same user ID and email
+          This page reads the API token from sessionStorage.eisax_token. Enter the same user ID and email
           you want to bind to the Stripe customer record.
         </p>
 
@@ -437,6 +456,10 @@
             <span data-i18n="token_label">API token:</span>
             <strong id="tokenState">Checking...</strong>
           </div>
+          <form id="tokenForm" class="token-entry" autocomplete="off">
+            <input id="tokenInput" type="password" placeholder="Enter API token" />
+            <button class="mini-button" type="submit">Save Token</button>
+          </form>
           <button class="mini-button portal-link" id="portalButton" type="button" data-i18n="manage_billing">
             Manage Billing
           </button>
@@ -508,7 +531,7 @@
         arabic_toggle: "Arabic RTL",
         user_id: "User ID",
         email: "Email",
-        details_help: "This page reads the API token from localStorage.eisax_token. Enter the same user ID and email you want to bind to the Stripe customer record.",
+        details_help: "This page reads the API token from sessionStorage.eisax_token. Enter the same user ID and email you want to bind to the Stripe customer record.",
         token_label: "API token:",
         manage_billing: "Manage Billing",
         basic_name: "Basic",
@@ -541,7 +564,7 @@
         arabic_toggle: "العربية RTL",
         user_id: "معرّف المستخدم",
         email: "البريد الإلكتروني",
-        details_help: "تقرأ هذه الصفحة الرمز من localStorage.eisax_token. أدخل نفس معرّف المستخدم والبريد الإلكتروني المطلوب ربطهما بسجل عميل Stripe.",
+        details_help: "تقرأ هذه الصفحة الرمز من sessionStorage.eisax_token. أدخل نفس معرّف المستخدم والبريد الإلكتروني المطلوب ربطهما بسجل عميل Stripe.",
         token_label: "رمز API:",
         manage_billing: "إدارة الفوترة",
         basic_name: "Basic",
@@ -574,9 +597,19 @@
     const statusEl = document.getElementById("status");
     const rtlToggle = document.getElementById("rtlToggle");
     const portalButton = document.getElementById("portalButton");
+    const tokenForm = document.getElementById("tokenForm");
+    const tokenInput = document.getElementById("tokenInput");
 
     function getToken() {
-      return localStorage.getItem(TOKEN_KEY) || "";
+      return sessionStorage.getItem(TOKEN_KEY) || "";
+    }
+
+    function saveToken(token) {
+      if (token) {
+        sessionStorage.setItem(TOKEN_KEY, token);
+      } else {
+        sessionStorage.removeItem(TOKEN_KEY);
+      }
     }
 
     function setStatus(message, tone) {
@@ -604,8 +637,8 @@
     }
 
     function prefillFields() {
-      userIdInput.value = localStorage.getItem("eisax_user_id") || localStorage.getItem("user_id") || "";
-      emailInput.value = localStorage.getItem("eisax_email") || localStorage.getItem("email") || "";
+      userIdInput.value = sessionStorage.getItem("eisax_user_id") || "";
+      emailInput.value = sessionStorage.getItem("eisax_email") || "";
     }
 
     async function startCheckout(tier) {
@@ -613,7 +646,7 @@
       const userId = userIdInput.value.trim();
       const email = emailInput.value.trim();
       if (!token) {
-        setStatus("Missing localStorage.eisax_token", "error");
+        setStatus("Missing sessionStorage.eisax_token", "error");
         return;
       }
       if (!userId || !email) {
@@ -648,7 +681,7 @@
       const token = getToken();
       const userId = userIdInput.value.trim();
       if (!token) {
-        setStatus("Missing localStorage.eisax_token", "error");
+        setStatus("Missing sessionStorage.eisax_token", "error");
         return;
       }
       if (!userId) {
@@ -693,6 +726,13 @@
       button.addEventListener("click", () => startCheckout(button.dataset.tier));
     });
 
+    tokenForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      saveToken(tokenInput.value.trim());
+      tokenInput.value = "";
+      syncTokenState();
+      setStatus(getToken() ? "API token saved for this tab." : "API token cleared for this tab.", getToken() ? "ok" : "warn");
+    });
     portalButton.addEventListener("click", openPortal);
     rtlToggle.addEventListener("change", () => applyLanguage(rtlToggle.checked ? "ar" : "en"));
 

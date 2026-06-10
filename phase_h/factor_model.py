@@ -118,6 +118,10 @@ _LABEL_PATCH = {
         "ar": "تمثل التحميلات انكشافات متجددة لمدة 36 شهرا؛ وتعدل إحصاءات t بطريقة Newey-West عند توفرها.",
     },
     "months_suffix": {"en": "m", "ar": "شهر"},
+    "factor_insufficient_history": {
+        "en": "Insufficient overlapping factor history to compute the Carhart/FF decomposition for this asset. This module is hidden when factor loadings collapse to zero.",
+        "ar": "السجل غير كاف لاحتساب نموذج العوامل (Carhart / FF). يُخفى هذا القسم عندما تنخفض جميع التحميلات إلى الصفر.",
+    },
 }
 LABELS.update({k: v for k, v in _LABEL_PATCH.items() if k not in LABELS})
 
@@ -260,12 +264,45 @@ def compute_factor_decomposition(
         )
 
 
+def _factor_payload_is_empty(payload: Mapping[str, Any]) -> bool:
+    """Detect a degenerate factor payload — zero window, no loadings, or every
+    loading == 0. Surfacing a table of zeros pretends the regression ran.
+    """
+    if not payload:
+        return True
+    if int(payload.get("window_months") or 0) <= 0:
+        return True
+    loadings = payload.get("loadings") or {}
+    if not loadings:
+        return True
+    for _f, beta in loadings.items():
+        try:
+            if abs(float(beta)) > 1e-9:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
 def render_factor_decomposition_md(payload: FactorDecomp, language: str = "en") -> str:
     if not _feature_enabled() or not payload:
         return ""
     payload = _payload(payload)
     if not payload:
         return ""
+
+    # Suppress degenerate payloads — empty regression looks identical to real
+    # output if the renderer fills the table with zeros.
+    if _factor_payload_is_empty(payload):
+        heading = section_heading(3, "factor_decomposition_diagnostics", language)
+        warnings = payload.get("warnings") or []
+        note_line = ""
+        if warnings:
+            note_line = f" ({', '.join(str(w) for w in warnings if w)})"
+        return (
+            f"{heading}\n\n"
+            f"> ℹ️ {L('factor_insufficient_history', language)}{note_line}\n"
+        )
 
     heading = section_heading(3, "factor_decomposition_diagnostics", language)
     window = payload.get("window_months", _ROLLING_WINDOW)

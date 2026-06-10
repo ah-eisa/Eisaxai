@@ -12,8 +12,7 @@ Public API
     detect_arabic_ticker(message)        -> str | None
     detect_dfm_screen(message)           -> tuple[str, str] | None
         Returns (criterion, markdown_table) or None.
-    handle_file_analysis(message, financial_agent, gemini_client,
-                         gemini_model, gemini_api_key)
+    handle_file_analysis(message, financial_agent)
                                          -> tuple[str, str]
         Returns (reply_text, agent_label).
 """
@@ -325,8 +324,8 @@ def _call_portfolio_api(portfolio: dict, user_id: str = "anonymous") -> str | No
 def handle_file_analysis(
     message:         str,
     financial_agent: Any | None,
-    gemini_client:   Any | None,
-    gemini_model:    str = "gemini-2.0-flash",
+    gemini_client:   Any | None = None,
+    gemini_model:    str = "",
     gemini_api_key:  str = "",
     user_id:         str = "anonymous",
     session_id:      str = "default",
@@ -335,7 +334,7 @@ def handle_file_analysis(
     Route a [FILE ANALYSIS] message:
       1. Weight-based CSV  → /v1/upload-portfolio (full institutional analysis)
       2. Shares+cost CSV   → _handle_cio_analysis (P&L analysis)
-      3. Other files       → Gemini vision fallback
+      3. Other files       → DeepSeek fallback
 
     Returns (reply_text, agent_label)
     """
@@ -375,20 +374,30 @@ def handle_file_analysis(
         except Exception as exc:
             logger.error("[File→CIO] Failed: %s", exc)
 
-    # ── Route 3: Gemini fallback ──────────────────────────────────────────────
+    # ── Route 3: DeepSeek fallback ────────────────────────────────────────────
     if not reply:
         try:
-            from google import genai as _genai
-            gc   = _genai.Client(api_key=gemini_api_key)
-            resp = gc.models.generate_content(
-                model=gemini_model,
-                contents=(
-                    "You are EisaX financial analyst. Analyze this file content and provide "
-                    "detailed financial insights. If it contains portfolio/stock data, analyze "
-                    f"each position.\n\n{message[:12000]}"
-                ),
+            import httpx as _httpx
+            _ds_key = os.getenv("DEEPSEEK_API_KEY", "")
+            if not _ds_key:
+                raise ValueError("DEEPSEEK_API_KEY not set")
+            _r = _httpx.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "deepseek-v4-flash",
+                    "messages": [{"role": "user", "content": (
+                        "You are EisaX financial analyst. Analyze this file content and provide "
+                        "detailed financial insights. If it contains portfolio/stock data, analyze "
+                        f"each position.\n\n{message[:12000]}"
+                    )}],
+                    "max_tokens": 4096,
+                    "temperature": 0.5,
+                },
+                timeout=60.0,
             )
-            reply = resp.text.strip() if resp.text else "❌ فشل تحليل الملف"
+            _r.raise_for_status()
+            reply = (_r.json()["choices"][0]["message"]["content"] or "").strip() or "❌ فشل تحليل الملف"
         except Exception as exc:
             reply = f"❌ خطأ: {str(exc)}"
 

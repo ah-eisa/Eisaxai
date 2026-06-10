@@ -266,36 +266,7 @@ def _read_image_ocr(raw: bytes, filename: str) -> str:
     except Exception:
         pass
 
-    # Primary: Gemini Vision
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        from google import genai
-        from google.genai import types
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if api_key:
-            client = genai.Client(api_key=api_key)
-            ext = filename.rsplit(".", 1)[-1].lower()
-            mime_map = {
-                "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "png": "image/png", "webp": "image/webp",
-                "bmp": "image/bmp", "tiff": "image/tiff",
-            }
-            mime = mime_map.get(ext, "image/png")
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[
-                    types.Part.from_bytes(data=raw, mime_type=mime),
-                    ("Extract ALL text, numbers, and table data from this image. "
-                     "If it contains a portfolio or financial table, extract every "
-                     "row and column precisely. Return as plain text with | separators."),
-                ],
-            )
-            text = response.text.strip() if response.text else ""
-            if text:
-                return "[Img: " + filename + "]\n" + text
-    except Exception:
-        pass
+    # Primary: pytesseract OCR (Gemini Vision removed)
 
     # Fallback: pytesseract
     try:

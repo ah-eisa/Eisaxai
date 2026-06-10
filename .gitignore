@@ -60,3 +60,15 @@ str
 0.15
 Conviction
 *EisaX
+
+# ── repo-reconcile 2026-06-10: session/tooling junk — never commit ──
+CLAUDE.md
+.qwen/
+.phase_h_codex_logs/
+EISAX-AI/
+/MSFT
+/NVDA
+Project Handover Summary.txt
+trust_layer_*.json
+core/*·*
+deepcrawl/

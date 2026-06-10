@@ -63,26 +63,7 @@ except Exception as e:
     logger.warning("Memory manager unavailable: %s", e)
     MEMORY_ENABLED = False
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GEMINI Configuration — Primary & Backup Models for High Reliability
-# ═══════════════════════════════════════════════════════════════════════════
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-"""Main API key for Gemini LLM. Read from .env file."""
-
-GEMINI_API_KEY_BACKUP = os.getenv("GEMINI_API_KEY_BACKUP", "")
-"""Backup API key for fallback scenarios if primary fails."""
-
-# Primary model: Gemini 2.0 Flash — stable, fast, cost-efficient
-# (gemini-3.1-flash-lite-preview was retired; replaced with 2.0-flash)
-GEMINI_MODEL = "gemini-2.0-flash"
-
-# Backup: same model — single stable target reduces 403-retry latency
-GEMINI_MODEL_BACKUP = "gemini-2.0-flash"
-
-# ═══════════════════════════════════════════════════════════════════════════
-# GEMINI Configuration — Primary & Backup Models for High Reliability
-# ═══════════════════════════════════════════════════════════════════════════
+# DeepSeek is the sole LLM backend — Gemini removed.
 
 
 def _extract_verdict_from_reply(reply: str, ticker: str) -> dict:
@@ -171,17 +152,6 @@ def _save_analysis_to_memory(user_id: str, ticker: str, reply: str):
 class MultiAgentOrchestrator:
     def __init__(self, db_path: str = "investwise.db"):
         self.session_mgr = SessionManager(db_path)
-        self.gemini_client = None
-        self.gemini_client_backup = None
-        try:
-            from google import genai
-            self.gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-            logger.info("Gemini primary client initialized: %s", GEMINI_MODEL)
-            if GEMINI_API_KEY_BACKUP:
-                self.gemini_client_backup = genai.Client(api_key=GEMINI_API_KEY_BACKUP)
-                logger.info("Gemini backup client initialized: %s", GEMINI_MODEL_BACKUP)
-        except Exception as e:
-            logger.error("Gemini Client init failed: %s", e)
 
         # Full async I/O migration: shared AsyncClient for DFM and Bond handlers.
         self.httpx_client = httpx.AsyncClient()
@@ -308,103 +278,73 @@ class MultiAgentOrchestrator:
             return None
 
     def _gemini_generate(self, contents: str, *, label: str = "") -> str:
-        """
-        Generate LLM response with automatic fallback mechanism.
-        
-        High-reliability pattern:
-        1. Primary: gemini-2.0-flash
-        2. Backup: gemini-2.0-flash
-        3. Retry: Up to 2 attempts per model with exponential backoff
-        
-        Args:
-            contents (str): Prompt/message to send to LLM
-            label (str): Label for logging (e.g., "router", "admin"), optional
-            
-        Returns:
-            str: LLM response text
-            
-        Raises:
-            RuntimeError: If both primary and backup clients fail
-            
-        Example:
-            >>> response = orch._gemini_generate("Say hello", label="greeting")
-            >>> response
-            "Hello! How can I help you?"
-        """
-        # ── Generation config: high output limit for long portfolio/analysis replies ──
-        try:
-            from google.genai import types as _gtypes
-            _gen_cfg = _gtypes.GenerateContentConfig(max_output_tokens=8192, temperature=0.7)
-        except Exception:
-            _gen_cfg = None
+        """Generate LLM response: DeepSeek (primary) → OpenAI GPT-5-nano (fallback)."""
+        _lbl = f" [{label}]" if label else ""
+        _ds_model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
-        # ── ATTEMPT 1: Primary Model ──
-        # 403 = auth failure (bad/expired key) — no point retrying; skip immediately.
-        _gemini_403 = False
-        try:
-            resp = _retry(
-                lambda: self.gemini_client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    **( {"config": _gen_cfg} if _gen_cfg else {} )
-                ),
-                max_attempts=2, base_delay=0.3
-            )
-            return (resp.text or "").strip()
-        except Exception as e:
-            _err_str = str(e).lower()
-            if "403" in _err_str or "forbidden" in _err_str or "api_key_invalid" in _err_str:
-                _gemini_403 = True
-                logger.warning("[Gemini] Primary 403/auth — skipping backup, routing to DeepSeek")
-            else:
-                logger.warning("[Gemini] Primary (%s) failed%s: %s — attempting backup",
-                               GEMINI_MODEL, f" [{label}]" if label else "", e)
-
-        # ── ATTEMPT 2: Backup Model (skip if primary got 403 — same key/issue) ──
-        if self.gemini_client_backup and not _gemini_403:
+        # ── Primary: DeepSeek ──
+        ds_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if ds_key:
             try:
-                resp = _retry(
-                    lambda: self.gemini_client_backup.models.generate_content(
-                        model=GEMINI_MODEL_BACKUP,
-                        contents=contents,
-                        **( {"config": _gen_cfg} if _gen_cfg else {} )
-                    ),
-                    max_attempts=2, base_delay=0.3
-                )
-                logger.info("[Gemini] Backup (%s) succeeded%s",
-                            GEMINI_MODEL_BACKUP, f" [{label}]" if label else "")
-                return (resp.text or "").strip()
-            except Exception as e2:
-                logger.error("[Gemini] Backup (%s) also failed%s: %s — escalating to fallback chain",
-                             GEMINI_MODEL_BACKUP, f" [{label}]" if label else "", e2)
+                # 120s timeout — V4 models can take 30-60s on dense analytics prompts
+                with httpx.Client(timeout=120.0) as _hc:
+                    _r = _hc.post(
+                        "https://api.deepseek.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": _ds_model,
+                            "messages": [
+                                {"role": "system", "content": "You are EisaX, a professional financial analyst assistant."},
+                                {"role": "user", "content": contents},
+                            ],
+                            "max_tokens": 8192,
+                            "temperature": 0.7,
+                        },
+                    )
+                _r.raise_for_status()
+                _resp = _r.json()
+                if "choices" in _resp:
+                    _text = (_resp["choices"][0]["message"]["content"] or "").strip()
+                    if _text:
+                        logger.info("[LLM] DeepSeek succeeded%s", _lbl)
+                        return _text
+            except Exception as _ds_e:
+                logger.warning("[LLM] DeepSeek failed%s: %s — falling back to OpenAI", _lbl, _ds_e)
 
-        # ── ATTEMPT 3: DeepSeek → Cache → Static fallback chain ──
-        # Reached when both Gemini primary and backup are exhausted (e.g. 429 quota).
-        try:
-            from core.llm_fallback import generate_with_fallback_sync
-            fb_response = generate_with_fallback_sync(
-                contents,
-                system="You are a professional financial analyst assistant.",
-            )
-            if fb_response.success and fb_response.content:
-                logger.info(
-                    "[LLMFallback] fallback chain succeeded via provider=%s%s",
-                    fb_response.provider, f" [{label}]" if label else "",
-                )
-            else:
-                logger.warning(
-                    "[LLMFallback] all providers exhausted%s — returning static message",
-                    f" [{label}]" if label else "",
-                )
-            return fb_response.content.strip()
-        except Exception as e_chain:
-            logger.error("[LLMFallback] fallback chain raised unexpectedly%s: %s",
-                         f" [{label}]" if label else "", e_chain)
-            raise RuntimeError(f"All LLM providers exhausted [{label}]") from e_chain
+        # ── Fallback: OpenAI GPT-4.1-nano ──
+        oai_key = os.getenv("OPENAI_API_KEY", "")
+        oai_model = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4.1-nano")
+        if oai_key:
+            try:
+                with httpx.Client(timeout=60.0) as _hc:
+                    _r = _hc.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {oai_key}", "Content-Type": "application/json"},
+                        json={
+                            "model": oai_model,
+                            "messages": [
+                                {"role": "system", "content": "You are EisaX, a professional financial analyst assistant."},
+                                {"role": "user", "content": contents},
+                            ],
+                            "max_tokens": 8192,
+                            "temperature": 0.7,
+                        },
+                    )
+                _r.raise_for_status()
+                _resp = _r.json()
+                if "choices" in _resp:
+                    _text = (_resp["choices"][0]["message"]["content"] or "").strip()
+                    if _text:
+                        logger.info("[LLM] OpenAI %s succeeded%s", oai_model, _lbl)
+                        return _text
+            except Exception as _oai_e:
+                logger.error("[LLM] OpenAI %s failed%s: %s — all LLM providers exhausted",
+                             oai_model, _lbl, _oai_e)
+
+        raise RuntimeError(f"All LLM providers exhausted{_lbl}")
 
     def _maestro_route_generate(self, prompt: str) -> str:
-        """Primary router: DeepSeek maestro, then Gemini fallback."""
-        # Primary: DeepSeek (sync httpx; this function is sync by design)
+        """Primary router: DeepSeek maestro."""
         ds_key = os.getenv("DEEPSEEK_API_KEY", "")
         if ds_key:
             try:
@@ -413,7 +353,7 @@ class MultiAgentOrchestrator:
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "deepseek-chat",
+                            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
                             "messages": [
                                 {"role": "system", "content": "You are EisaX router maestro. Return strict JSON only."},
                                 {"role": "user", "content": prompt},
@@ -429,18 +369,9 @@ class MultiAgentOrchestrator:
                     if content:
                         return content
             except Exception as e:
-                logger.warning("[Router] DeepSeek failed: %s ? falling back to Gemini", e)
+                logger.warning("[Router] DeepSeek failed: %s — using GENERAL fallback", e)
 
-        # Fallback 2: Gemini
-        try:
-            raw = self._gemini_generate(prompt, label="router-gemini-fallback")
-            if raw:
-                return raw
-        except Exception as e:
-            logger.error("[Router] Gemini fallback failed: %s", e)
-
-        # All models failed — return safe fallback JSON instead of crashing
-        logger.error("[Router] All models failed (DeepSeek/Gemini) — using GENERAL fallback")
+        logger.error("[Router] DeepSeek unavailable — using GENERAL fallback")
         return '{"route":"GENERAL","handler":"GENERAL","instruction":"' + \
                prompt[:100].replace('"', '') + '","clarification_question":""}'
 
@@ -761,7 +692,7 @@ Ticker:"""
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "deepseek-chat",
+                            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
                             "messages": [
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": message}
@@ -778,7 +709,7 @@ Ticker:"""
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "deepseek-chat",
+                            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
                             "messages": [
                                 {"role": "system", "content": system_prompt},
                                 {"role": "user", "content": message}
@@ -904,7 +835,7 @@ Ticker:"""
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "deepseek-chat",
+                            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
                             "messages": [
                                 {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
                                 {"role": "user", "content": message}
@@ -921,7 +852,7 @@ Ticker:"""
                         "https://api.deepseek.com/v1/chat/completions",
                         headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                         json={
-                            "model": "deepseek-chat",
+                            "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
                             "messages": [
                                 {"role": "system", "content": system_prompt + ("\n\n" + live_data_block if live_data_block else "")},
                                 {"role": "user", "content": message}
@@ -1085,9 +1016,6 @@ Arabic examples: "فين سعر ابل"→stock_analysis/AAPL, "حلل NVDA"→s
                 reply, label = handle_file_analysis(
                     message,
                     financial_agent=self.financial_agent,
-                    gemini_client=self.gemini_client,
-                    gemini_model=GEMINI_MODEL,
-                    gemini_api_key=GEMINI_API_KEY,
                     user_id=user_id,
                     session_id=session_id,
                 )

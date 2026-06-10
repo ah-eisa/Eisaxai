@@ -1,9 +1,9 @@
 """
 core/ticker_index.py — Fast in-memory ticker lookup index.
 
-Loads the latest parquet file per market from market_cache/ once (lazy,
-thread-safe singleton).  Exposes quick_scan(query) for pre-routing asset
-queries before expensive LLM-based entity resolution.
+Loads the latest snapshot per market via the institutional Data Layer once
+(lazy, thread-safe singleton).  Exposes quick_scan(query) for pre-routing
+asset queries before expensive LLM-based entity resolution.
 
 Coverage: ~1 900 tickers across UAE, KSA, Egypt, Kuwait, Qatar, Bahrain,
 Morocco, Tunisia, US (top-500), commodities.
@@ -18,17 +18,15 @@ Ambiguity policy
 """
 from __future__ import annotations
 
-import glob
 import logging
-import os
 import re
 import threading
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+from core.data_layer import market_cache_adapter as _mca
 
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "market_cache")
+logger = logging.getLogger(__name__)
 
 # ── Exchange → (dot-suffix, market_code, currency) ──────────────────────────
 _EXCHANGE_MAP: dict[str, tuple[str, str, str]] = {
@@ -94,19 +92,9 @@ _INDEX_READY = False
 _INDEX_LOCK = threading.Lock()
 
 
-def _latest_parquet_files() -> list[str]:
-    """Return the single latest parquet file per market."""
-    markets: dict[str, str] = {}
-    for f in sorted(glob.glob(os.path.join(_CACHE_DIR, "*.parquet"))):
-        parts = os.path.basename(f).rsplit("_", 2)
-        market_key = parts[0]
-        markets[market_key] = f  # sorted ascending → last = latest timestamp
-    return list(markets.values())
-
-
 def _build_index() -> tuple[dict[str, TickerMatch], frozenset[str]]:
     try:
-        import pandas as pd
+        import pandas as pd  # noqa: F401 — used by the adapter snapshots
     except ImportError:
         logger.warning("[ticker_index] pandas not available — index disabled")
         return {}, frozenset()
@@ -116,15 +104,16 @@ def _build_index() -> tuple[dict[str, TickerMatch], frozenset[str]]:
     raw_rows: list[tuple[str, str, str, str, str, str, str]] = []
     # fields: raw_ticker, bare, exchange_part, suffix, market_code, currency, asset_type
 
-    files = _latest_parquet_files()
-    for fpath in files:
-        market_key = os.path.basename(fpath).rsplit("_", 2)[0]
+    for market_key in _mca.list_markets():
         asset_type = _MARKET_ASSET_TYPE.get(market_key, "equity")
-        try:
-            df = pd.read_parquet(fpath, columns=["ticker", "name"])
-        except Exception as exc:
-            logger.warning("[ticker_index] cannot read %s: %s", fpath, exc)
+        df = _mca.get_latest_snapshot(market_key)
+        if df is None or df.empty:
             continue
+        wanted_cols = [c for c in ("ticker", "name") if c in df.columns]
+        if "ticker" not in wanted_cols:
+            logger.warning("[ticker_index] snapshot for %s missing ticker column", market_key)
+            continue
+        df = df[wanted_cols]
 
         for _, row in df.iterrows():
             raw_ticker = str(row.get("ticker") or "").strip()
@@ -333,7 +322,7 @@ def index_size() -> int:
 
 
 def reload() -> None:
-    """Force a full index rebuild (e.g. after market_cache refresh)."""
+    """Force a full index rebuild (e.g. after a data-layer snapshot refresh)."""
     global _INDEX, _BARE_AMBIGUOUS, _INDEX_READY
     with _INDEX_LOCK:
         _INDEX_READY = False

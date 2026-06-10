@@ -21,7 +21,7 @@ jobs:
         run: |
           set +e
           SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-          HOST="ubuntu@141.145.153.23"
+          HOST="ubuntu@129.151.148.2"
 
           root_code="$(ssh $SSH_OPTS "$HOST" "curl -sk -o /dev/null -w '%{http_code}' https://ai.eisax.com/")"
           login_code="$(ssh $SSH_OPTS "$HOST" "curl -sk -o /dev/null -w '%{http_code}' -X POST https://ai.eisax.com/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"wrong@example.com\",\"password\":\"wrong\"}'")"

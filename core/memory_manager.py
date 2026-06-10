@@ -569,7 +569,7 @@ def extract_and_save_user_facts(user_id: str, message: str, reply: str):
             _r = _req_mem.post(
                 "https://api.deepseek.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {_ds_key}", "Content-Type": "application/json"},
-                json={"model": "deepseek-chat",
+                json={"model": "deepseek-v4-flash",
                       "messages": [{"role": "user", "content": _prompt}],
                       "max_tokens": 300, "temperature": 0.1},
                 timeout=10,

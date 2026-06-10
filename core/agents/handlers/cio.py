@@ -476,7 +476,7 @@ Be direct, numbers-first, institutional CIO tone. Max 750 words total."""
                 r = _req.post(
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
-                    json={"model": "deepseek-chat",
+                    json={"model": "deepseek-v4-flash",
                           "messages": [{"role": "user", "content": prompt}],
                           "max_tokens": 1200, "temperature": 0},
                     timeout=120

@@ -1,0 +1,13 @@
+{
+  "phase":"T+0 prod monitoring baseline",
+  "capture_ts":"2026-05-29T12:22:51+04:00",
+  "service_active_since":"Fri 2026-05-29 12:14:20 +04",
+  "master_pid":3255768,
+  "worker_pids":"3255773,3255777",
+  "worker_rss_kb":"178652,263260",
+  "scheduler_lock_owner_pid":"3255773",
+  "sched_started_count":1,
+  "sched_skipped_count":1,
+  "err_log_offset":42803,
+  "monitor_window_end_target":"2026-05-29T16:22:51+04:00"
+}

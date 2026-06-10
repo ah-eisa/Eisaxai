@@ -1,0 +1,18 @@
+.eisax-table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+.eisax-table th, .eisax-table td { border: 1px solid #ddd; padding: 12px 15px; text-align: left; }
+.eisax-table th { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; font-weight: 600; }
+.eisax-table tr:nth-child(even) { background: #f8f9fa; }
+.eisax-table tr:hover { background: #e3f2fd; }
+
+.eisax-chart {
+  background: #1e1e1e; color: #00ff88; font-family: 'Courier New', monospace;
+  padding: 20px; border-radius: 8px; white-space: pre; margin: 1em 0;
+  font-size: 11px; line-height: 1.2;
+}
+
+.score-bar { font-family: 'Courier New', monospace; font-size: 12px; letter-spacing: -1px; }
+.scorecard-title {
+  background: linear-gradient(135deg, #ff6b6b, #feca57); color: white;
+  padding: 15px; border-radius: 12px; margin: 20px 0; text-align: center;
+  font-weight: bold; font-size: 1.3em;
+}

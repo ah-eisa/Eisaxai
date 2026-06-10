@@ -1,0 +1,31 @@
+Implement Week 3 Interpretation Control Layer for EisaX with NO scope creep.
+
+Only edit these files:
+- core/services/interpretation_engine.py
+- core/services/phrase_builder.py
+- core/services/interpretation_guard.py
+- core/services/analytics_builder.py
+- core/services/report_lint.py
+- core/agents/finance.py
+- tests/test_week3_interpretation.py
+
+Requirements:
+1. interpretation_engine.py must provide deterministic classifiers exactly per task rules plus helpers to build locked labels.
+2. phrase_builder.py must build deterministic premium-tone phrases only from those labels, including timing, trend, yield, and a deterministic build_quick_insight(snapshot, interpretation_labels) that is never empty.
+3. interpretation_guard.py must detect stronger/weaker conflicting claims and replace or remove them with deterministic phrases while logging audit events.
+4. analytics_builder.py must inject a locked interpretation block into the prompt with exact labels and explicit MUST/MUST NOT instructions.
+5. finance.py must use deterministic quick insight in Quick View and apply interpretation guard where appropriate so vague empty insight cannot appear.
+6. report_lint.py must add interpretation lint checks for trend/support/yield/entry/volume language and integrate them into lint_report audit/errors/warnings.
+7. Add 40+ tests in tests/test_week3_interpretation.py covering classifiers, phrase builder, lint rules, interpretation guard, and quick insight non-empty.
+
+Constraints:
+- do not redesign report structure
+- do not change score formulas
+- do not touch data fetch stack
+- do not restart services
+- keep institutional tone
+
+After edits:
+- run py_compile on changed python files
+- run pytest only for tests/test_week3_interpretation.py
+- print a concise summary of files changed and test results

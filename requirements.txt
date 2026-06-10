@@ -1,0 +1,62 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+pydantic
+python-docx
+playwright
+alpaca-trade-api
+pandas
+numpy
+scipy
+empyrical-reloaded
+yfinance
+openpyxl
+pdfplumber
+python-pptx
+python-multipart
+openai
+
+# AI / LLM providers
+google-genai
+google-generativeai
+elevenlabs
+
+# PDF / document generation
+Markdown
+reportlab
+
+# Data & analytics
+matplotlib
+seaborn
+statsmodels
+scikit-learn
+pyportfolioopt
+cvxpy
+ta
+yahooquery
+pandas-datareader
+
+# Web / async
+aiohttp
+httpx
+beautifulsoup4
+
+# System / monitoring
+psutil
+gunicorn
+bcrypt
+
+# Vector DB / embeddings
+chromadb
+sentence-transformers
+
+# Misc utilities
+python-dateutil
+pytz
+xlsxwriter
+
+# Testing
+pytest
+pytest-asyncio
+

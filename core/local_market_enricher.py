@@ -135,22 +135,90 @@ def enrich_local_analysis(ticker: str) -> dict:
     market = get_market(ticker)
     result = {"ticker": ticker, "market": market, "is_local": True}
 
-    # 1. السعر الحالي
-    price_data = get_local_price(ticker)
-    if price_data:
-        result["price"]      = price_data.get("close")
-        result["change_pct"] = price_data.get("change_pct")
-        result["currency"]   = price_data.get("currency", "AED")
-        result["date"]       = price_data.get("date")
-        result["volume"]     = price_data.get("volume")
-        result["high"]       = price_data.get("high")
-        result["low"]        = price_data.get("low")
-    else:
-        result["price"]    = None
-        result["currency"] = "AED" if market == "AE" else ("SAR" if market == "SA" else "EGP")
+    # 0. TradingView cache — authoritative source for GCC/MENA equities.
+    # Pulls live price + fundamentals from the 15-min TV snapshot so the
+    # LLM narrative sees the same numbers as the peer table and scorecard.
+    _tv_row = None
+    _tv_snapshot_ts = None
+    try:
+        from core.data_layer import market_cache_adapter as _mca
+        _tv_market_map = {"AE": "uae", "SA": "ksa", "EG": "egypt",
+                          "KW": "kuwait", "QA": "qatar"}
+        _tv_mkt = _tv_market_map.get(market)
+        if _tv_mkt:
+            _df = _mca.get_latest_snapshot(_tv_mkt)
+            _tv_snapshot_ts = _mca.snapshot_timestamp(_tv_mkt)
+            if _df is not None and not _df.empty and "ticker" in _df.columns:
+                _bare = ticker.upper().split(".")[0]
+                _match = _df[
+                    _df["ticker"].astype(str).str.upper().str.endswith(":" + _bare)
+                    | (_df["ticker"].astype(str).str.upper() == ticker.upper())
+                ]
+                if not _match.empty:
+                    _tv_row = _match.iloc[0].to_dict()
+    except Exception as _tv_e:
+        logger.debug(f"[Enricher/TV] {ticker}: {_tv_e}")
 
-    # 2. Fundamentals من SQLite
-    fund = get_local_fundamentals(ticker)
+    # 1. السعر الحالي — TV authoritative, fallback to Investing.com/yfinance
+    if _tv_row:
+        try:
+            result["price"]      = float(_tv_row.get("close") or 0) or None
+            result["change_pct"] = float(_tv_row.get("change") or 0)
+            result["currency"]   = "AED" if market == "AE" else ("SAR" if market == "SA" else ("EGP" if market == "EG" else "AED"))
+            result["date"]       = (_tv_snapshot_ts or "")[:10]
+            result["high"]       = float(_tv_row.get("high") or 0) or None
+            result["low"]        = float(_tv_row.get("low") or 0) or None
+            result["volume"]     = int(_tv_row.get("volume") or 0) or None
+            result["price_source"] = "TradingView (authoritative for GCC)"
+            result["snapshot_ts"] = _tv_snapshot_ts
+        except Exception:
+            _tv_row = None  # fall through to fallback below
+    if not _tv_row:
+        price_data = get_local_price(ticker)
+        if price_data:
+            result["price"]      = price_data.get("close")
+            result["change_pct"] = price_data.get("change_pct")
+            result["currency"]   = price_data.get("currency", "AED")
+            result["date"]       = price_data.get("date")
+            result["volume"]     = price_data.get("volume")
+            result["high"]       = price_data.get("high")
+            result["low"]        = price_data.get("low")
+            result["price_source"] = "Investing.com/yfinance (fallback)"
+        else:
+            result["price"]    = None
+            result["currency"] = "AED" if market == "AE" else ("SAR" if market == "SA" else "EGP")
+            result["price_source"] = "unavailable"
+
+    # 2. Fundamentals — TV first (live snapshot), DB second (cached)
+    fund = {}
+    if _tv_row:
+        if _tv_row.get("market_cap_basic"):
+            fund["market_cap"] = float(_tv_row["market_cap_basic"])
+        if _tv_row.get("price_earnings_ttm"):
+            try:
+                _pe = float(_tv_row["price_earnings_ttm"])
+                import math as _m
+                if not (_m.isnan(_pe) or _m.isinf(_pe)):
+                    fund["pe_ratio"] = _pe
+            except Exception:
+                pass
+        if _tv_row.get("beta_1_year"):
+            try: fund["beta"] = float(_tv_row["beta_1_year"])
+            except Exception: pass
+        if _tv_row.get("dividend_yield_recent") is not None:
+            try: fund["dividend_yield"] = float(_tv_row["dividend_yield_recent"])
+            except Exception: pass
+        if _tv_row.get("total_revenue_ttm"):
+            try: fund["revenue"] = float(_tv_row["total_revenue_ttm"])
+            except Exception: pass
+        if _tv_row.get("earnings_per_share_diluted_ttm"):
+            try: fund["eps"] = float(_tv_row["earnings_per_share_diluted_ttm"])
+            except Exception: pass
+    # Fill gaps from DB (signals come from DB-only)
+    _db_fund = get_local_fundamentals(ticker)
+    for k, v in (_db_fund or {}).items():
+        if k not in fund or fund.get(k) is None:
+            fund[k] = v
     if fund:
         result["fundamentals"] = fund
 
@@ -240,7 +308,12 @@ def build_local_prompt_injection(ticker: str) -> str:
         if hist.get("high_52w") and hist.get("low_52w"):
             lines.append(f"- نطاق 52 أسبوع: {hist['low_52w']:,.2f} — {hist['high_52w']:,.2f} {currency}")
 
-    lines.append("\n*المصدر: EisaX Local Data Engine (Investing.com + yfinance)*")
+    _src_tag = data.get("price_source") or "EisaX Local Data Engine"
+    _snap_ts = data.get("snapshot_ts") or ""
+    if _snap_ts:
+        lines.append(f"\n*المصدر: {_src_tag} | snapshot: {_snap_ts}*")
+    else:
+        lines.append(f"\n*المصدر: {_src_tag}*")
     return "\n".join(lines)
 
 

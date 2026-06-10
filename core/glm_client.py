@@ -221,7 +221,7 @@ Do NOT add analysis or opinions - just format what's given into CIO-quality outp
                         "Content-Type": "application/json",
                     },
                     json={
-                        "model": "deepseek-chat",
+                        "model": "deepseek-v4-flash",
                         "messages": [{"role": "user", "content": prompt}],
                         "temperature": 0,
                         "max_tokens": 300,

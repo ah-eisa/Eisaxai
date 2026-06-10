@@ -35,20 +35,14 @@ def run(coro):
 def _make_orchestrator():
     """Create a MultiAgentOrchestrator with all external clients disabled."""
     with (
-        patch("core.orchestrator.GEMINI_API_KEY", "fake-key"),
-        patch("core.orchestrator.GEMINI_API_KEY_BACKUP", ""),
         patch("core.orchestrator.MOONSHOT_API_KEY", ""),
         patch("core.orchestrator.ADMIN_ENABLED", False),
         patch("core.orchestrator.MEMORY_ENABLED", False),
     ):
-        # Prevent actual google.genai import during __init__
-        with patch.dict("sys.modules", {"google": MagicMock(), "google.genai": MagicMock()}):
-            from core.orchestrator import MultiAgentOrchestrator
-            orch = MultiAgentOrchestrator(db_path=":memory:")
-            orch.gemini_client = None
-            orch.gemini_client_backup = None
-            orch.kimi_client = None
-            return orch
+        from core.orchestrator import MultiAgentOrchestrator
+        orch = MultiAgentOrchestrator(db_path=":memory:")
+        orch.kimi_client = None
+        return orch
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -157,15 +151,9 @@ class TestOrchestratorE2E:
         import sys
         # Ensure google.genai mock is in place
         mock_google = MagicMock()
-        with patch.dict(sys.modules, {
-            "google": mock_google,
-            "google.genai": mock_google.genai,
-        }):
-            from core.orchestrator import MultiAgentOrchestrator
-            self.orch = MultiAgentOrchestrator(db_path=str(tmp_path / "test.db"))
-            self.orch.gemini_client = None
-            self.orch.gemini_client_backup = None
-            self.orch.kimi_client = None
+        from core.orchestrator import MultiAgentOrchestrator
+        self.orch = MultiAgentOrchestrator(db_path=str(tmp_path / "test.db"))
+        self.orch.kimi_client = None
 
     # ── Greeting fast-path ────────────────────────────────────────────
     def test_greeting_returns_reply(self):
@@ -286,19 +274,11 @@ class TestOrchestratorE2E:
         assert "reply" in result
         assert result["reply"]
 
-    # ── LLM fallback chain: Gemini → fallback ─────────────────────────
-    def test_gemini_failure_falls_through_to_fallback(self):
-        """When Gemini fails, _gemini_generate should return fallback content, not raise."""
-        from core.orchestrator import MultiAgentOrchestrator
-
-        # Simulate Gemini primary + backup both failing,
-        # then fallback chain returning a static message.
+    # ── LLM fallback chain ────────────────────────────────────────────────
+    def test_llm_falls_through_to_fallback(self):
+        """When DeepSeek fails, _gemini_generate should return fallback content, not raise."""
         orch = self.orch
-        orch.gemini_client = None        # force attempt 1 to skip
-        orch.gemini_client_backup = None  # force attempt 2 to skip
 
-        # The fallback chain is called inside _gemini_generate (attempt 3).
-        # Mock generate_with_fallback_sync to return a static response.
         from core.llm_fallback import LLMResponse
         fake_response = LLMResponse(
             content="Service temporarily unavailable. Please try again.",
@@ -307,12 +287,11 @@ class TestOrchestratorE2E:
             error="All providers unavailable",
         )
 
-        # The function is imported inside _gemini_generate via
-        # "from core.llm_fallback import generate_with_fallback_sync"
-        # so we must patch it at the source module.
         with patch("core.llm_fallback.generate_with_fallback_sync",
                    return_value=fake_response):
-            result = orch._gemini_generate("Say hello", label="test")
+            with patch("httpx.Client") as _mock_hc:
+                _mock_hc.return_value.__enter__.return_value.post.side_effect = Exception("timeout")
+                result = orch._gemini_generate("Say hello", label="test")
 
         assert isinstance(result, str)
         assert len(result) > 5

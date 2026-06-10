@@ -1,0 +1,1 @@
+{"soak_start": "2026-05-28T22:45:48+04:00", "soak_end_target": "2026-05-29T22:45:48+04:00", "workers": 2, "service": "eisax-gunicorn-staging", "baseline_news_fires_24h": 81, "expected_news_fires_per_24h": 96, "expected_news_fires_max_double_fire": 192}

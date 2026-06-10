@@ -1,0 +1,46 @@
+version: "3.8"
+
+services:
+  eisax-api:
+    build: .
+    container_name: eisax-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist database and user data across restarts
+      - ./investwise.db:/app/investwise.db
+      - ./core/investwise.db:/app/core/investwise.db
+      - ./file_cache:/app/file_cache
+      - ./uploads:/app/uploads
+      - ./static:/app/static
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./data:/app/data
+      # Excel data files
+      - ./Final_Stocks_Report_All_Countries.xlsx:/app/Final_Stocks_Report_All_Countries.xlsx
+      - ./Regional_Stocks_Cleaned.xlsx:/app/Regional_Stocks_Cleaned.xlsx
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-H", "X-API-Key: ${SECURE_TOKEN}", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  eisax-learning:
+    build: .
+    container_name: eisax-learning
+    command: ["python", "run_learning_engine.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./investwise.db:/app/investwise.db
+      - ./core/investwise.db:/app/core/investwise.db
+      - ./logs:/app/logs
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      eisax-api:
+        condition: service_healthy

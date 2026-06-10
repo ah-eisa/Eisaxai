@@ -72,6 +72,33 @@
       flex-wrap: wrap;
     }
 
+    .token-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 0 0 18px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .token-entry input {
+      min-width: min(320px, 100%);
+      flex: 1 1 260px;
+      border: 1px solid var(--border);
+      background: rgba(8, 12, 20, 0.8);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 12px;
+    }
+
+    .token-entry-note {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
     .pill {
       display: inline-flex;
       align-items: center;
@@ -513,12 +540,18 @@
         <p>Usage telemetry across chats, sessions, profiles, and extracted ticker mentions.</p>
       </div>
       <div class="actions">
-        <div class="pill"><span class="dot"></span><span id="statusText">Waiting for token</span></div>
+        <div class="pill"><span class="dot"></span><span id="statusText">Waiting for sign-in</span></div>
         <div class="pill" id="refreshStamp">Not loaded yet</div>
         <button id="refreshBtn" type="button">Refresh</button>
-        <button id="tokenBtn" type="button">Change Token</button>
+        <button id="tokenBtn" type="button">Sign In</button>
       </div>
     </div>
+
+    <form id="tokenForm" class="token-entry" autocomplete="off" hidden>
+      <input id="tokenInput" type="password" placeholder="Enter admin password" />
+      <button type="submit">Sign In</button>
+      <span class="token-entry-note">4-hour session via HttpOnly cookie. No password stored in browser.</span>
+    </form>
 
     <div class="stats">
       <div class="card">
@@ -607,7 +640,7 @@
       </section>
     </div>
 
-    <div id="messageBox" class="empty">Provide an admin token to load analytics.</div>
+    <div id="messageBox" class="empty">Enter the admin password to start an admin session.</div>
 
     <div id="dashboard" hidden>
       <div class="grid">
@@ -653,7 +686,6 @@
     (() => {
       "use strict";
 
-      const TOKEN_KEY = "admin_analytics_token";
       const charts = {};
 
       const statusText = document.getElementById("statusText");
@@ -661,6 +693,8 @@
       const messageBox = document.getElementById("messageBox");
       const dashboard = document.getElementById("dashboard");
       const recentTableBody = document.getElementById("recentTableBody");
+      const tokenForm = document.getElementById("tokenForm");
+      const tokenInput = document.getElementById("tokenInput");
 
       const summaryEls = {
         totalUsers: document.getElementById("totalUsers"),
@@ -683,43 +717,43 @@
         }[ch]));
       }
 
-      function getTokenFromUrl() {
-        return new URLSearchParams(window.location.search).get("token") || "";
-      }
-
-      function setTokenInUrl(token) {
-        const url = new URL(window.location.href);
-        if (token) {
-          url.searchParams.set("token", token);
-        } else {
-          url.searchParams.delete("token");
-        }
-        window.history.replaceState({}, "", url.toString());
-      }
-
-      function getToken() {
-        return getTokenFromUrl() || localStorage.getItem(TOKEN_KEY) || "";
-      }
-
-      function saveToken(token) {
-        if (token) {
-          localStorage.setItem(TOKEN_KEY, token);
-          setTokenInUrl(token);
-        } else {
-          localStorage.removeItem(TOKEN_KEY);
-          setTokenInUrl("");
+      async function adminLogin(password) {
+        const response = await fetch("/admin/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password }),
+        });
+        if (!response.ok) {
+          throw new Error(response.status === 403 ? "Invalid admin password" : `HTTP ${response.status}`);
         }
       }
 
-      function promptForToken(forcePrompt) {
-        const existing = forcePrompt ? "" : getToken();
-        const token = window.prompt("Enter admin access token", existing);
-        if (token === null) {
-          return "";
+      async function adminLogout() {
+        await fetch("/admin/logout", { method: "POST", credentials: "same-origin" });
+        showLoginForm();
+      }
+
+      function showLoginForm(messageText, kind) {
+        const sentimentError = document.getElementById("sentimentError");
+        const sentimentBody = document.getElementById("sentimentBody");
+        const sentimentTimestamp = document.getElementById("sentimentTimestamp");
+        const prompt = messageText || "Enter admin password to sign in.";
+        tokenForm.hidden = false;
+        tokenInput.focus();
+        statusText.textContent = "Admin sign-in required";
+        dashboard.hidden = true;
+        if (sentimentBody) sentimentBody.hidden = true;
+        if (sentimentError) {
+          sentimentError.hidden = false;
+          sentimentError.textContent = prompt;
         }
-        const cleaned = token.trim();
-        saveToken(cleaned);
-        return cleaned;
+        if (sentimentTimestamp) sentimentTimestamp.textContent = "Sign in required";
+        setMessage(prompt, kind || "empty");
+      }
+
+      function hideLoginForm() {
+        tokenForm.hidden = true;
       }
 
       function setMessage(text, kind) {
@@ -856,14 +890,9 @@
       }
 
       async function loadData(forcePrompt) {
-        let token = getToken();
-        if (!token || forcePrompt) {
-          token = promptForToken(!!forcePrompt);
-        }
-        if (!token) {
-          statusText.textContent = "Token required";
-          dashboard.hidden = true;
-          setMessage("Provide an admin token to load analytics.", "empty");
+        if (forcePrompt) {
+          tokenInput.value = "";
+          showLoginForm();
           return;
         }
 
@@ -871,15 +900,13 @@
         setMessage("Loading dashboard data...", "empty");
 
         try {
-          const response = await fetch(`/admin/analytics/data?token=${encodeURIComponent(token)}`, {
+          const response = await fetch("/admin/analytics/data", {
             cache: "no-store",
+            credentials: "same-origin",
           });
 
-          if (response.status === 403) {
-            saveToken("");
-            statusText.textContent = "Unauthorized";
-            dashboard.hidden = true;
-            setMessage("Token rejected. Enter a valid admin token.", "error");
+          if (response.status === 401 || response.status === 403) {
+            showLoginForm("Session expired — sign in again", "error");
             return;
           }
 
@@ -895,6 +922,7 @@
           fillRecentTable(payload.recent_activity || []);
 
           dashboard.hidden = false;
+          hideLoginForm();
           statusText.textContent = "Live data loaded";
           refreshStamp.textContent = `Updated ${new Date().toLocaleString()}`;
           setMessage("Dashboard loaded successfully.", "empty");
@@ -907,6 +935,25 @@
 
       document.getElementById("refreshBtn").addEventListener("click", () => loadData(false));
       document.getElementById("tokenBtn").addEventListener("click", () => loadData(true));
+      tokenForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const password = tokenInput.value.trim();
+        if (!password) {
+          showLoginForm("Admin password required", "error");
+          return;
+        }
+        statusText.textContent = "Signing in";
+        try {
+          await adminLogin(password);
+          tokenInput.value = "";
+          hideLoginForm();
+          await loadData(false);
+          await loadSentiment();
+        } catch (error) {
+          statusText.textContent = "Sign-in failed";
+          showLoginForm(error.message || "Sign-in failed", "error");
+        }
+      });
 
       // ── G-9-D: Sentiment Card ─────────────────────────────────────────────
       const SENTIMENT_TICKERS = ["AAPL", "MSFT", "TSLA", "NVDA", "META"];
@@ -949,9 +996,6 @@
       }
 
       async function loadSentiment() {
-        const token = getToken();
-        if (!token) return;
-
         const tsEl    = document.getElementById("sentimentTimestamp");
         const errEl   = document.getElementById("sentimentError");
         const bodyEl  = document.getElementById("sentimentBody");
@@ -959,9 +1003,13 @@
         try {
           // 1 — Market overview
           const mktResp = await fetch("/v1/sentiment/market/overview?use_cache=true", {
-            headers: { "X-API-Key": token },
+            credentials: "same-origin",
             cache: "no-store",
           });
+          if (mktResp.status === 401 || mktResp.status === 403) {
+            showLoginForm("Session expired — sign in again", "error");
+            return;
+          }
           if (!mktResp.ok) throw new Error(`market overview: HTTP ${mktResp.status}`);
           const mkt = await mktResp.json();
 
@@ -977,9 +1025,14 @@
           // 2 — Batch tickers
           const batchResp = await fetch("/v1/sentiment/batch", {
             method: "POST",
-            headers: { "X-API-Key": token, "Content-Type": "application/json" },
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tickers: SENTIMENT_TICKERS, use_cache: true }),
           });
+          if (batchResp.status === 401 || batchResp.status === 403) {
+            showLoginForm("Session expired — sign in again", "error");
+            return;
+          }
           if (batchResp.ok) {
             const batch = await batchResp.json();
             const sorted = (batch.results || []).sort((a, b) => Math.abs(b.score ?? 0) - Math.abs(a.score ?? 0));
@@ -998,19 +1051,14 @@
       const sentRefreshBtn = document.getElementById("sentimentRefreshBtn");
       if (sentRefreshBtn) sentRefreshBtn.addEventListener("click", loadSentiment);
 
-      if (getTokenFromUrl()) {
-        saveToken(getTokenFromUrl());
-      }
-
       loadData(false);
       loadSentiment();
       window.setInterval(() => {
-        if (getToken()) {
-          loadData(false);
-        }
+        if (tokenForm.hidden) loadData(false);
       }, 60000);
-      // refresh sentiment every 5 minutes
-      window.setInterval(() => { if (getToken()) loadSentiment(); }, 300000);
+      window.setInterval(() => {
+        if (tokenForm.hidden) loadSentiment();
+      }, 300000);
     })();
   </script>
 </body>

@@ -581,8 +581,55 @@ async def v1_quick_snapshot(request: Request, q: str = ""):
 async def brain_status(request: Request, access_token: str = Header(None, alias="X-API-Key")):
     if access_token != SECURE_TOKEN:
         raise HTTPException(status_code=403, detail="Unauthorized")
-    from learning_engine import get_engine
-    return get_engine().status()
+    # Read state from DB + systemd, NOT the in-memory singleton.
+    # The actual engine runs in a separate process (eisax-learning.service),
+    # so this gunicorn worker's singleton is always idle and misleading.
+    import subprocess
+    from learning_engine import get_engine, CYCLE_INTERVALS
+    engine = get_engine()
+    # Service state
+    try:
+        svc_active = subprocess.run(
+            ["systemctl", "is-active", "eisax-learning.service"],
+            capture_output=True, text=True, timeout=3
+        ).stdout.strip() == "active"
+    except Exception:
+        svc_active = False
+    # Stats from DB (cross-process truth)
+    try:
+        conn = engine._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(was_correct),0), MAX(prediction_date) "
+            "FROM predictions WHERE evaluated=1"
+        ).fetchone()
+        total_eval = int(row[0] or 0)
+        correct    = int(row[1] or 0)
+        last_eval  = row[2]
+        lessons_n  = conn.execute(
+            "SELECT COUNT(*) FROM learning_log"
+        ).fetchone()[0] or 0
+        prices_n   = conn.execute(
+            "SELECT COUNT(*) FROM stock_knowledge"
+        ).fetchone()[0] or 0
+        conn.close()
+    except Exception as e:
+        logger.warning("brain_status DB query failed: %s", e)
+        total_eval = correct = lessons_n = prices_n = 0
+        last_eval = None
+    return {
+        "running": svc_active,
+        "stats": {
+            "predictions_evaluated": total_eval,
+            "predictions_correct":   correct,
+            "lessons_learned":       int(lessons_n),
+            "prices_updated":        int(prices_n),
+            "errors":                0,
+            "last_evaluation_at":    last_eval,
+        },
+        "last_run": {},
+        "next_run": {task: "scheduled" for task in CYCLE_INTERVALS},
+        "source": "db+systemd (cross-process truth)",
+    }
 
 @content_router.get("/v1/brain/wisdom")
 @limiter.limit("20/minute")
@@ -888,7 +935,7 @@ async def translate_to_arabic(request: Request, payload: TranslatePayload, acces
                     "https://api.deepseek.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
                     json={
-                        "model": "deepseek-chat",
+                        "model": "deepseek-v4-flash",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user",   "content": user_msg}
