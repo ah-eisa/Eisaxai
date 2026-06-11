@@ -292,9 +292,9 @@ def _call_portfolio_api(portfolio: dict, user_id: str = "anonymous") -> str | No
         from core.config import BASE_DIR as _BD
         load_dotenv(str(_BD / ".env"))
 
-        token = _os.environ.get("SECURE_TOKEN", "")
+        token = _os.environ.get("EISAX_INTERNAL_API_KEY", "").strip() or _os.environ.get("SECURE_TOKEN", "")
         if not token:
-            logger.warning("[FileCSV→API] No SECURE_TOKEN — cannot self-call")
+            logger.warning("[FileCSV→API] No EISAX_INTERNAL_API_KEY/SECURE_TOKEN — cannot self-call")
             return None
 
         # Build minimal CSV from portfolio dict

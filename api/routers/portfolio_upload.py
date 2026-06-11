@@ -21,12 +21,13 @@ import uuid
 from typing import Optional
 
 import pandas as pd
-from fastapi import APIRouter, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from core.config import ENV_FILE, EXPORTS_DIR, FILE_CACHE_DIR
+from core.dependencies.auth import require_auth
 
 logger = logging.getLogger("api_bridge")
 limiter = Limiter(key_func=get_remote_address)
@@ -161,12 +162,9 @@ async def upload_portfolio(
     request: Request,
     file: UploadFile = File(...),
     user_id: str = Form("admin"),
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token")
+    user: dict = Depends(require_auth),
 ):
     """Upload CSV/Excel portfolio file and analyze it"""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         contents = await file.read()
 

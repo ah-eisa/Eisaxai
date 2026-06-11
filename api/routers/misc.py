@@ -30,6 +30,7 @@ ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "")
 
 # ── Paths from config ─────────────────────────────────────────────────────────
 from core.config import APP_DB, BACKEND_LOG, STATIC_DIR
+from core.dependencies.auth import require_auth
 
 # ── JWT auth helpers ──────────────────────────────────────────────────────────
 import jwt as _jwt
@@ -320,11 +321,8 @@ async def user_usage(
 @limiter.limit("30/minute")
 async def redis_health(
     request: Request,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     from core.redis_store import redis_info
     return redis_info()
 
@@ -500,12 +498,9 @@ async def get_ticker_sentiment(
     request: Request,
     ticker: str,
     use_cache: bool = True,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """VADER sentiment analysis on recent news for a single ticker."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from core.sentiment import SentimentAnalyzer
         result = await asyncio.get_event_loop().run_in_executor(
@@ -572,12 +567,9 @@ async def get_sentiment_trend(
     request: Request,
     ticker: str,
     hours: int = 48,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """Historical sentiment trend (hourly buckets) from local DB."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from core.sentiment import SentimentAnalyzer
         result = await asyncio.get_event_loop().run_in_executor(
@@ -594,11 +586,8 @@ async def get_sentiment_trend(
 async def run_backtest(
     request: Request,
     body: BacktestRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
     try:
         from core.backtester import BacktestEngine, MACrossover, RSIStrategy, MACDStrategy
         strategies = {
@@ -631,11 +620,8 @@ async def run_backtest(
 async def stock_screener(
     request: Request,
     body: ScreenerRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
     try:
         from core.screener import StockScreener, ScreenerFilter, DEFAULT_UNIVERSE
         tickers = body.tickers if body.tickers else DEFAULT_UNIVERSE.get(body.universe, DEFAULT_UNIVERSE["us_large_cap"])
@@ -674,12 +660,9 @@ async def get_forex(
     request: Request,
     category: str = "all",   # all | arab | major | em
     use_cache: bool = True,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """Live FX rates — Arab pairs (AED/SAR/EGP/KWD/QAR/BHD) + major pairs."""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from core.forex import ForexFetcher
         pairs = await asyncio.get_event_loop().run_in_executor(
@@ -698,12 +681,9 @@ async def get_forex(
 async def get_forex_pair(
     request: Request,
     symbol: str,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """Single FX pair — e.g. /v1/forex/USDAED=X or /v1/forex/EURUSD"""
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     try:
         from core.forex import ForexFetcher
         sym = symbol.upper()

@@ -23,7 +23,7 @@ load_dotenv("/home/ubuntu/investwise/.env")
 BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 HEALTH_URL  = "http://localhost:8000/v1/health"
-TOKEN       = os.getenv("SECURE_TOKEN")
+TOKEN       = os.getenv("EISAX_INTERNAL_API_KEY", "").strip() or os.getenv("SECURE_TOKEN")
 
 INTERVAL_OK   = 300   # 5 minutes when all good
 INTERVAL_BAD  = 60    # 1 minute when down/degraded

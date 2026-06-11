@@ -32,6 +32,8 @@ logger = logging.getLogger("api_bridge")
 
 # ── Env-based globals (re-read from env — same source as api_bridge_v2) ─────
 SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
+# Phase 4: internal proxy calls prefer the dedicated service key
+INTERNAL_API_KEY = os.getenv("EISAX_INTERNAL_API_KEY", "").strip()
 _ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
 _STAGING_ADMIN_USERS = {
     item.strip().lower()
@@ -183,7 +185,7 @@ def _staging_client_id(request: Request) -> str:
 
 
 def _staging_proxy_headers() -> dict:
-    return {"X-API-Key": SECURE_TOKEN}
+    return {"X-API-Key": INTERNAL_API_KEY or SECURE_TOKEN}
 
 
 def _staging_clean_text(text: str) -> str:

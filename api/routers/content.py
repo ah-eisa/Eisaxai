@@ -22,7 +22,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from api.routes.auth import _require_jwt
-from core.dependencies.auth import require_auth
+from core.dependencies.auth import require_auth, resolve_auth
 from core.config import EXPORTS_DIR
 from core.export_engine import export as export_engine
 from core.news_aggregator import get_news as _get_aggregated_news
@@ -579,9 +579,7 @@ async def v1_quick_snapshot(request: Request, q: str = ""):
 
 @content_router.get("/v1/brain/status")
 @limiter.limit("30/minute")
-async def brain_status(request: Request, access_token: str = Header(None, alias="X-API-Key")):
-    if access_token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def brain_status(request: Request, user: dict = Depends(require_auth)):
     # Read state from DB + systemd, NOT the in-memory singleton.
     # The actual engine runs in a separate process (eisax-learning.service),
     # so this gunicorn worker's singleton is always idle and misleading.
@@ -634,9 +632,7 @@ async def brain_status(request: Request, access_token: str = Header(None, alias=
 
 @content_router.get("/v1/brain/wisdom")
 @limiter.limit("20/minute")
-async def brain_wisdom(request: Request, access_token: str = Header(None, alias="X-API-Key")):
-    if access_token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def brain_wisdom(request: Request, user: dict = Depends(require_auth)):
     from learning_engine import get_engine
     engine = get_engine()
     conn = engine._get_conn()
@@ -690,11 +686,13 @@ async def export_html_to_pdf(
     request: Request,
     payload: HtmlExportPayload,
     access_token: str = Header(None, alias="X-API-Key"),
+    authorization: str = Header(None, alias="Authorization"),
 ):
     from api_bridge_v2 import _create_download_token
-    token = access_token or payload.access_token
-    if token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    user = resolve_auth(
+        access_token or payload.access_token, None, authorization,
+        client=f"{getattr(request.client, 'host', '')} POST /v1/export/html",
+    )
     try:
         import time
         from core.playwright_pdf import html_to_pdf, inject_print_css
@@ -718,10 +716,8 @@ async def export_html_to_pdf(
 
 @content_router.get("/v1/dashboard/{ticker}")
 @limiter.limit("20/minute")
-async def dashboard(request: Request, ticker: str, access_token: str = Header(None, alias="X-API-Key")):
+async def dashboard(request: Request, ticker: str, user: dict = Depends(require_auth)):
     """Return all dashboard data for a ticker in one call — no LLM, runs concurrently."""
-    if access_token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     import asyncio, math
     from core.market_data import get_realtime_quote, get_full_stock_profile
     from core.data import get_prices
@@ -901,11 +897,17 @@ async def dashboard(request: Request, ticker: str, access_token: str = Header(No
 
 @content_router.post("/v1/translate-ar")
 @limiter.limit("20/minute")
-async def translate_to_arabic(request: Request, payload: TranslatePayload, access_token: str = Header(None, alias="X-API-Key")):
+async def translate_to_arabic(
+    request: Request,
+    payload: TranslatePayload,
+    access_token: str = Header(None, alias="X-API-Key"),
+    authorization: str = Header(None, alias="Authorization"),
+):
     """Translate an English investment report to Arabic. Primary: DeepSeek. Fallback: GLM."""
-    token = access_token or payload.access_token
-    if token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    user = resolve_auth(
+        access_token or payload.access_token, None, authorization,
+        client=f"{getattr(request.client, 'host', '')} POST /v1/translate-ar",
+    )
 
     system_prompt = (
         "أنت محلل مالي محترف. مهمتك ترجمة تقرير استثماري كامل من الإنجليزية إلى العربية الفصحى.\n"
@@ -980,11 +982,17 @@ async def translate_to_arabic(request: Request, payload: TranslatePayload, acces
 
 @content_router.post("/v1/export/html-pdf")
 @limiter.limit("5/minute")
-async def export_html_pdf(request: Request, payload: HtmlExportPayload, access_token: str = Header(None, alias="X-API-Key")):
+async def export_html_pdf(
+    request: Request,
+    payload: HtmlExportPayload,
+    access_token: str = Header(None, alias="X-API-Key"),
+    authorization: str = Header(None, alias="Authorization"),
+):
     from api_bridge_v2 import _create_download_token
-    token = access_token or payload.access_token
-    if token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    user = resolve_auth(
+        access_token or payload.access_token, None, authorization,
+        client=f"{getattr(request.client, 'host', '')} POST /v1/export/html-pdf",
+    )
     try:
         import time
         from core.playwright_pdf import html_to_pdf, inject_print_css

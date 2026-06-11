@@ -168,11 +168,6 @@ tts_service = TTSService()
 SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 _ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
 _STAGING_UPSTREAM_BASE = os.getenv("STAGING_UPSTREAM_BASE", "http://127.0.0.1:8000").rstrip("/")
-_STAGING_ADMIN_USERS = {
-    item.strip().lower()
-    for item in os.getenv("EISAX_ADMIN_USERS", "Admin,admin").split(",")
-    if item.strip()
-}
 _STAGING_LEADS_PATH = Path(
     os.getenv(
         "STAGING_LEADS_PATH",
@@ -188,74 +183,30 @@ _DOWNLOAD_TOKENS = {}
 os.makedirs(_FILE_CACHE_DIR, exist_ok=True)
 
 
-def _parse_guest_tokens() -> dict[str, str]:
-    """Map configured guest tokens to revocable usernames without exposing tokens."""
-    entries = []
-    if os.getenv("EISAX_GUEST_TOKEN"):
-        entries.append(f"guest:{os.getenv('EISAX_GUEST_TOKEN')}")
-    entries.extend(part.strip() for part in os.getenv("EISAX_GUEST_TOKENS", "").split(",") if part.strip())
-    tokens: dict[str, str] = {}
-    for idx, entry in enumerate(entries, start=1):
-        if ":" in entry:
-            username, token = entry.split(":", 1)
-        else:
-            username, token = f"guest_{idx}", entry
-        username = (username or f"guest_{idx}").strip()
-        token = (token or "").strip()
-        if token:
-            tokens[token] = username
-    return tokens
+def _create_download_token(filename: str, user_id: str) -> str:
+    """Mint a one-hour download token (consumed by /v1/download/{token}).
+
+    Restored in Phase 4: commit 3225b34 dropped this helper while
+    api/routers/content.py still lazy-imports it — every /v1/export* call
+    has 500'd at `from api_bridge_v2 import _create_download_token` since.
+    """
+    now = _time.time()
+    for existing_token, entry in list(_DOWNLOAD_TOKENS.items()):
+        if not isinstance(entry, dict) or entry.get("expires", 0) <= now:
+            _DOWNLOAD_TOKENS.pop(existing_token, None)
+
+    token = uuid.uuid4().hex
+    _DOWNLOAD_TOKENS[token] = {
+        "filename": filename,
+        "user_id": user_id,
+        "expires": now + 3600,
+    }
+    return token
 
 
-def _resolve_guest_token(request: Request) -> Optional[str]:
-    supplied = (
-        request.headers.get("X-Guest-Token")
-        or request.query_params.get("guest_token")
-        or request.query_params.get("demo_token")
-        or ""
-    ).strip()
-    if not supplied:
-        return None
-    import hmac as _hmac
-    for configured, username in _parse_guest_tokens().items():
-        if _hmac.compare_digest(supplied, configured):
-            return username
-    return None
-
-
-def _resolve_staging_access(request: Request) -> dict:
-    auth_user = (request.headers.get("X-Auth-User") or "").strip()
-    token_user = _resolve_guest_token(request)
-    if token_user:
-        return {"role": "guest", "username": token_user, "demo": True, "method": "guest_token"}
-    if auth_user:
-        if auth_user.lower() in _STAGING_ADMIN_USERS:
-            return {"role": "admin", "username": auth_user, "demo": False, "method": "basic_auth"}
-        return {"role": "guest", "username": auth_user, "demo": True, "method": "basic_auth"}
-    # Preserve internal/backend callers that bypass the public nginx layer.
-    # SECURITY: do NOT trust the Host header — it is fully client-controlled, so
-    # an external request can spoof `Host: 127.0.0.1` to claim admin. With
-    # forwarded_allow_ips="127.0.0.1" in the gunicorn config, uvicorn rewrites
-    # request.client.host to the real client IP, so a loopback peer here is a
-    # genuine same-host backend caller, not proxied external traffic.
-    client_host = getattr(request.client, "host", "") if request.client else ""
-    if client_host in {"127.0.0.1", "::1"}:
-        return {"role": "admin", "username": "internal", "demo": False, "method": "internal"}
-    return {"role": "guest", "username": "public-demo", "demo": True, "method": "public"}
-
-
-def _is_guest_access(access_context: Optional[dict], restrict_for_trial: bool = False) -> bool:
-    return bool(restrict_for_trial or ((access_context or {}).get("role") == "guest"))
-
-
-def _safe_env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)) or default)
-    except Exception:
-        return default
-
-
-_GUEST_LIMIT_MESSAGE = "This guest demo has reached its analysis limit. Please contact EisaX for extended access."
+# Guest/staging access helpers live in api/routers/staging.py (the only live
+# copies). The duplicates that used to sit here had zero callers — removed in
+# the Phase 4 cleanup; _GUEST_LIMIT_MESSAGE is re-imported below for compat.
 
 # ── File-store helpers + portfolio upload (extracted to api/routers/portfolio_upload.py) ──
 from api.routers.portfolio_upload import (
@@ -387,9 +338,7 @@ async def upload_file_ui(
 
 @app.get("/health")
 @limiter.limit("30/minute")
-async def health(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+async def health(request: Request, user: dict = Depends(require_auth)):
     import psutil, time
     uptime = time.time() - psutil.boot_time()
     mem = psutil.virtual_memory()

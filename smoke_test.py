@@ -15,7 +15,8 @@ parser.add_argument("--full", action="store_true", help="include slow stock test
 args = parser.parse_args()
 
 BASE  = args.url.rstrip("/")
-TOKEN = os.getenv("SECURE_TOKEN", "")
+# Phase 4: prefer the internal service key; SECURE_TOKEN fallback until retired
+TOKEN = os.getenv("EISAX_INTERNAL_API_KEY", "").strip() or os.getenv("SECURE_TOKEN", "")
 ADMIN = os.getenv("ADMIN_TOKEN",  "")
 
 PASS = FAIL = WARN = 0

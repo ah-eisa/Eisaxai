@@ -125,6 +125,21 @@ def _resolve(
 
 
 # ---------------------------------------------------------------------------
+# Public non-dependency form — for endpoints that accept a body-token fallback
+# (e.g. /v1/export/html sends the key inside the JSON payload). Feed the body
+# token as x_api_key so every token type (eixa_/JWT/legacy) resolves the same.
+# ---------------------------------------------------------------------------
+
+def resolve_auth(
+    x_api_key: Optional[str],
+    access_token_alt: Optional[str] = None,
+    authorization: Optional[str] = None,
+    client: str = "",
+) -> dict:
+    return _resolve(x_api_key, access_token_alt, authorization, client)
+
+
+# ---------------------------------------------------------------------------
 # Async variant — use this on normal FastAPI route handlers
 # ---------------------------------------------------------------------------
 
