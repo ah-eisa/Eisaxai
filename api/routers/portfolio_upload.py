@@ -32,7 +32,6 @@ from core.dependencies.auth import require_auth
 logger = logging.getLogger("api_bridge")
 limiter = Limiter(key_func=get_remote_address)
 
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 
 # ── File-store config ─────────────────────────────────────────────────────────
 _FILE_CACHE_DIR = str(FILE_CACHE_DIR)

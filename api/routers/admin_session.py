@@ -28,8 +28,7 @@ logger = logging.getLogger("api_bridge")
 # ── Rate limiter (decorator-only; enforcement via app.state.limiter) ──────────
 limiter = Limiter(key_func=get_remote_address)
 
-# ── Env-based globals ─────────────────────────────────────────────────────────
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
+# ── Env-based globals (SECURE_TOKEN retired Phase 4) ─────────────────────────
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 ADMIN_PASSPHRASE = os.getenv("ADMIN_PASSPHRASE", "") or os.getenv("ADMIN_TOKEN", "")
 
@@ -63,8 +62,7 @@ def _check_secure_or_admin_session(token: str, request: Optional[Request] = None
         cookie_tok = request.cookies.get("eisax_admin_session", "")
         if cookie_tok and _decode_admin_session_token(cookie_tok):
             return
-    if SECURE_TOKEN and token and token == SECURE_TOKEN:
-        return
+    # SECURE_TOKEN retired (Phase 4) — admin session tokens only
     if token and _decode_admin_session_token(token):
         return
     raise HTTPException(status_code=403, detail="Forbidden")
@@ -76,17 +74,14 @@ def _check_admin(token: str = "", request: Optional[Request] = None):
         cookie_tok = request.cookies.get("eisax_admin_session", "")
         if cookie_tok and _decode_admin_session_token(cookie_tok):
             return
-    # 2. SECURE_TOKEN header fallback (internal services / CLI)
-    if SECURE_TOKEN and token and token == SECURE_TOKEN:
-        return
-    # 3. Previous signed JWT via header (transition)
+    # 2. Signed admin-session JWT via header
     if token and _decode_admin_session_token(token):
         return
-    # 4. ADMIN_TOKEN password fallback (legacy)
+    # 3. ADMIN_TOKEN password fallback (legacy; SECURE_TOKEN retired Phase 4)
     from api_bridge_v2 import orchestrator as _orch
     if ADMIN_TOKEN and token and _orch.session_mgr.verify_admin_password(token, ADMIN_TOKEN):
         return
-    if not SECURE_TOKEN and not ADMIN_TOKEN:
+    if not ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Admin access is not configured")
     raise HTTPException(status_code=403, detail="Forbidden")
 

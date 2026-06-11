@@ -30,8 +30,6 @@ from core.news_aggregator import get_news as _get_aggregated_news
 logger = logging.getLogger("api_bridge")
 limiter = Limiter(key_func=get_remote_address)
 
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
-
 content_router = APIRouter()
 
 # ── Models ────────────────────────────────────────────────────────────────────

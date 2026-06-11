@@ -4,10 +4,12 @@ core/dependencies/auth.py — FastAPI authentication dependency for EisaX
 Replaces the copy-pasted SECURE_TOKEN check across api_bridge_v2.py
 with a single reusable `Depends()` function.
 
-Supports three auth methods (checked in order):
+Supports two auth methods (checked in order):
   1. Personal API key  (X-API-Key or Authorization header starting with "eixa_")
-  2. Legacy admin token (SECURE_TOKEN env var)
-  3. JWT Bearer token  (Authorization: Bearer <jwt>)
+  2. JWT Bearer token  (Authorization: Bearer <jwt>)
+
+The legacy shared SECURE_TOKEN is RETIRED (Phase 4, 2026-06-11): it is
+detected and rejected with a loud log line so stragglers are identifiable.
 
 Usage:
     @router.get("/some-endpoint")
@@ -53,20 +55,8 @@ def _secure_token() -> str:
     return os.getenv("SECURE_TOKEN", "")
 
 
-# Throttled deprecation warning — one line per client per 5 min, so the soak
-# log shows WHO still uses the legacy shared token without flooding.
-_WARN_EVERY = 300.0
-_last_warn: dict[str, float] = {}
-
-
-def _warn_legacy_token(client: str) -> None:
-    now = time.monotonic()
-    if now - _last_warn.get(client, 0.0) >= _WARN_EVERY:
-        _last_warn[client] = now
-        logger.warning(
-            "[auth] legacy SECURE_TOKEN used by %s — migrate this client to an eixa_ key",
-            client or "unknown-client",
-        )
+# SECURE_TOKEN is RETIRED (Phase 4, 2026-06-11). The env var is read only so
+# stragglers are identified by name in the log — the token grants nothing.
 
 
 # ---------------------------------------------------------------------------
@@ -101,13 +91,17 @@ def _resolve(
             return {"user_id": info["user_id"], "tier": info["tier"], "method": "api_key"}
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
-    # 2. Legacy SECURE_TOKEN (admin bypass — transitional, slated for retirement)
+    # 2. Legacy SECURE_TOKEN — RETIRED: reject loudly so any straggler client
+    #    is visible in the log instead of failing as a generic 401.
     secret = _secure_token()
     if secret and (hmac.compare_digest(token, secret) or hmac.compare_digest(bearer, secret)):
-        _warn_legacy_token(client)
-        return {"user_id": "admin", "tier": "vip", "method": "secure_token"}
+        logger.error(
+            "[auth] RETIRED SECURE_TOKEN rejected for %s — mint an eixa_ key for this client",
+            client or "unknown-client",
+        )
+        raise HTTPException(status_code=401, detail="Legacy token retired — use a personal API key")
 
-    # 3. JWT Bearer token (eixa_/SECURE_TOKEN bearers already returned above)
+    # 3. JWT Bearer token (eixa_ bearers already returned above)
     if bearer:
         payload = _decode_jwt(bearer)
         if payload:

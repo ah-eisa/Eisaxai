@@ -98,10 +98,7 @@ def _resolve_auth(
         if info:
             return {"user_id": info["user_id"], "tier": info["tier"], "method": "api_key"}
         raise HTTPException(401, "Invalid API key")
-    # 2. Legacy SECURE_TOKEN
-    _SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
-    if _SECURE_TOKEN and (token == _SECURE_TOKEN or bearer == _SECURE_TOKEN):
-        return {"user_id": "admin", "tier": "vip", "method": "secure_token"}
+    # 2. Legacy SECURE_TOKEN — retired (Phase 4); no token grant beyond eixa_ keys
     raise HTTPException(403, "Unauthorized")
 
 
@@ -109,10 +106,9 @@ def _resolve_user_context(
     access_token: Optional[str] = None,
     access_token_alt: Optional[str] = None,
     authorization: Optional[str] = None,
-    _SECURE_TOKEN: str = "",
 ) -> dict:
     bearer = (authorization or "").removeprefix("Bearer ").strip()
-    if bearer and not bearer.startswith("eixa_") and bearer != _SECURE_TOKEN:
+    if bearer and not bearer.startswith("eixa_"):
         try:
             payload = decode_token(bearer)
         except _jwt.ExpiredSignatureError:
@@ -135,8 +131,6 @@ def _resolve_user_context(
 
 
 import os
-
-_SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +255,7 @@ async def create_api_key(
 ):
     from core.api_keys import generate_key
 
-    auth = _resolve_user_context(access_token, access_token_alt, authorization, _SECURE_TOKEN)
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
     raw_key = generate_key(str(auth["user_id"]), body.name, body.tier, body.daily_limit)
     return {
         "key": raw_key,
@@ -284,7 +278,7 @@ async def get_api_keys(
 ):
     from core.api_keys import list_user_keys
 
-    auth = _resolve_user_context(access_token, access_token_alt, authorization, _SECURE_TOKEN)
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
     return {
         "user_id": str(auth["user_id"]),
         "keys": list_user_keys(str(auth["user_id"])),
@@ -302,7 +296,7 @@ async def delete_api_key(
 ):
     from core.api_keys import revoke_key
 
-    auth = _resolve_user_context(access_token, access_token_alt, authorization, _SECURE_TOKEN)
+    auth = _resolve_user_context(access_token, access_token_alt, authorization)
     revoke_key(key_id, str(auth["user_id"]))
     return {"ok": True, "key_id": key_id}
 

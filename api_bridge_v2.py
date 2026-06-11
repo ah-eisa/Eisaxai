@@ -34,30 +34,6 @@ from contextlib import asynccontextmanager
 # learning_engine runs as a separate service (eisax-learning.service)
 
 
-def _resolve_auth(
-    x_api_key: str = Header(None, alias='X-API-Key'),
-    access_token: str = Header(None, alias='access-token'),
-    authorization: str = Header(None, alias='Authorization'),
-) -> dict:
-    token = x_api_key or access_token
-    bearer = (authorization or '').removeprefix('Bearer ').strip()
-    # 1. Personal API key (starts with eixa_)
-    if token and token.startswith('eixa_'):
-        from core.api_keys import validate_key
-        info = validate_key(token)
-        if info: return {'user_id': info['user_id'], 'tier': info['tier'], 'method': 'api_key'}
-        raise HTTPException(401, 'Invalid API key')
-    if bearer and bearer.startswith('eixa_'):
-        from core.api_keys import validate_key
-        info = validate_key(bearer)
-        if info: return {'user_id': info['user_id'], 'tier': info['tier'], 'method': 'api_key'}
-        raise HTTPException(401, 'Invalid API key')
-    # 2. Legacy SECURE_TOKEN
-    if SECURE_TOKEN and (token == SECURE_TOKEN or bearer == SECURE_TOKEN):
-        return {'user_id': 'admin', 'tier': 'vip', 'method': 'secure_token'}
-    raise HTTPException(403, 'Unauthorized')
-
-
 # ── JWT auth dependency — defined early so routes above line 3816 can use it ──
 _bearer = HTTPBearer(auto_error=False)
 
@@ -165,7 +141,6 @@ except Exception as _ne:
 orchestrator = MultiAgentOrchestrator(db_path=str(APP_DB))
 tts_service = TTSService()
 
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 _ENVIRONMENT = os.getenv("ENVIRONMENT", "production").strip().lower()
 _STAGING_UPSTREAM_BASE = os.getenv("STAGING_UPSTREAM_BASE", "http://127.0.0.1:8000").rstrip("/")
 _STAGING_LEADS_PATH = Path(
@@ -386,34 +361,6 @@ from core.auth import JWT_SECRET, JWT_ALGORITHM, decode_token, decode_token as _
 from core.user_db import init_users_table
 init_users_table()  # idempotent — creates users table if not exists
 
-# _resolve_user_context used by /v1/upload-portfolio
-def _resolve_user_context(
-    access_token: Optional[str] = None,
-    access_token_alt: Optional[str] = None,
-    authorization: Optional[str] = None,
-) -> dict:
-    bearer = (authorization or "").removeprefix("Bearer ").strip()
-    if bearer and not bearer.startswith("eixa_") and bearer != SECURE_TOKEN:
-        try:
-            payload = _decode_token_for_resolve(bearer)
-        except _jwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Token expired")
-        except _jwt.InvalidTokenError:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return {
-            "user_id": payload["sub"],
-            "tier": "jwt",
-            "method": "jwt",
-            "role": payload.get("role", "user"),
-        }
-    auth = _resolve_auth(
-        x_api_key=access_token,
-        access_token=access_token_alt,
-        authorization=authorization,
-    )
-    auth["role"] = "admin" if auth["user_id"] == "admin" else "user"
-    return auth
-
 from api.routes.auth import router as auth_router
 app.include_router(auth_router)
 
@@ -427,7 +374,8 @@ async def health_check(
     user: dict = Depends(require_auth),
 ):
     from core.services.health_service import run_health_check
-    result = await run_health_check(SECURE_TOKEN)
+    # arg is reserved/unused in health_service (noqa ARG001); SECURE_TOKEN retired
+    result = await run_health_check("")
     status_code = 200 if result["status"] == "ok" else (503 if result["status"] == "down" else 207)
     from fastapi.responses import JSONResponse
     return JSONResponse(content=result, status_code=status_code)

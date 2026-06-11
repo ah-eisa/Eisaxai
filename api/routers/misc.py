@@ -25,7 +25,6 @@ from slowapi.util import get_remote_address
 limiter = Limiter(key_func=get_remote_address)
 logger = logging.getLogger("api_bridge")
 
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 ADMIN_TOKEN  = os.getenv("ADMIN_TOKEN", "")
 
 # ── Paths from config ─────────────────────────────────────────────────────────
@@ -73,18 +72,15 @@ def _check_admin(token: str = "", request: Optional[Request] = None):
         cookie_tok = request.cookies.get("eisax_admin_session", "")
         if cookie_tok and _decode_admin_session_token(cookie_tok):
             return
-    # 2. SECURE_TOKEN header fallback (internal services / CLI)
-    if SECURE_TOKEN and token and token == SECURE_TOKEN:
-        return
-    # 3. Previous signed JWT via header (transition)
+    # 2. Signed admin-session JWT via header
     if token and _decode_admin_session_token(token):
         return
-    # 4. ADMIN_TOKEN password fallback (legacy)
+    # 3. ADMIN_TOKEN password fallback (legacy; SECURE_TOKEN retired Phase 4)
     if ADMIN_TOKEN and token:
         from api_bridge_v2 import orchestrator as _orch
         if _orch.session_mgr.verify_admin_password(token, ADMIN_TOKEN):
             return
-    if not SECURE_TOKEN and not ADMIN_TOKEN:
+    if not ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Admin access is not configured")
     raise HTTPException(status_code=403, detail="Forbidden")
 

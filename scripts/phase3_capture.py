@@ -23,7 +23,7 @@ TICKERS = ["ADNOCGAS.AE", "EMAAR.AE", "COMI.CA", "AAPL", "BTC-USD", "GC=F"]
 def _token():
     with open("/home/ubuntu/investwise/.env") as f:
         for line in f:
-            if line.startswith("SECURE_TOKEN="):
+            if line.startswith("EISAX_INTERNAL_API_KEY="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
 
