@@ -6,6 +6,8 @@ EisaX Health Monitor v3
 - AUTO-RESTART nginx if it goes down
 - alerts via Telegram with ROOT CAUSE details
 - sends daily summary at 8 AM UTC
+- MON-2: read-only remote checks for WealthGate API/portal (em.eisax.com)
+  and the public EisaX website, with dedup + recovery alerts (no auto-heal)
 """
 import os
 import time
@@ -43,6 +45,22 @@ RESTART_LOOKBACK_SECONDS   = 3600
 HEAL_COOLDOWN              = 120   # min 2 min between auto-heals
 
 gunicorn_restart_samples = deque()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REMOTE ENDPOINTS (MON-2: WealthGate / EisaX watchdog — read-only, no heal)
+# These run on other hosts or behind Cloudflare; we only verify availability.
+# ─────────────────────────────────────────────────────────────────────────────
+REMOTE_ENDPOINTS = [
+    # (name, url, expect): ok_json = HTTP 200 + {"ok": true}; http_200 = exactly
+    # 200; http_ok = anything below 500 (redirects fine, 5xx = down).
+    ("WealthGate API",    "https://em.eisax.com/api/health", "ok_json"),
+    ("WealthGate portal", "https://em.eisax.com/login",      "http_200"),
+    ("EisaX website",     "https://www.eisax.com/",          "http_ok"),
+]
+REMOTE_FAIL_THRESHOLD = 2   # consecutive failures before an alert (no blips)
+
+remote_fail_counts: dict[str, int] = {}
+remote_alerted:     dict[str, bool] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +303,73 @@ def should_alert(status: str) -> bool:
     return (time.time() - last_alert_time.get(status, 0)) > ALERT_COOLDOWN
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REMOTE ENDPOINT CHECKS (read-only; no auto-heal — services live elsewhere)
+# ─────────────────────────────────────────────────────────────────────────────
+def check_remote_endpoints() -> list[tuple[str, bool, str]]:
+    results = []
+    for name, url, expect in REMOTE_ENDPOINTS:
+        ok, detail = False, ""
+        try:
+            r = requests.get(url, timeout=10)
+            detail = f"HTTP {r.status_code}"
+            if expect == "ok_json":
+                body_ok = False
+                try:
+                    body_ok = r.json().get("ok") is True
+                except Exception:
+                    pass
+                ok = r.status_code == 200 and body_ok
+                if r.status_code == 200 and not body_ok:
+                    detail += ", body not ok:true"
+            elif expect == "http_200":
+                ok = r.status_code == 200
+            else:  # http_ok
+                ok = r.status_code < 500
+        except requests.exceptions.Timeout:
+            detail = "timeout (>10s)"
+        except requests.exceptions.ConnectionError:
+            detail = "connection failed"
+        except Exception as e:
+            detail = type(e).__name__
+        results.append((name, ok, detail))
+    return results
+
+
+def process_remote_checks() -> bool:
+    """Alert on sustained remote failures, notify recovery. Returns True if
+    any endpoint is currently failing (used to poll faster)."""
+    any_bad = False
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for name, ok, detail in check_remote_endpoints():
+        if ok:
+            if remote_alerted.get(name):
+                send_telegram(
+                    f"✅ <b>{name} RECOVERED</b>\n"
+                    f"Time: {now_str}\n"
+                    f"Check now returns {detail}."
+                )
+                remote_alerted[name] = False
+            remote_fail_counts[name] = 0
+        else:
+            remote_fail_counts[name] = remote_fail_counts.get(name, 0) + 1
+            any_bad = True
+            logging.warning("Remote check failing: %s (%s, consecutive=%s)",
+                            name, detail, remote_fail_counts[name])
+            if (remote_fail_counts[name] >= REMOTE_FAIL_THRESHOLD
+                    and not remote_alerted.get(name)
+                    and should_alert(f"remote:{name}")):
+                send_telegram(
+                    f"🔴 <b>{name} DOWN</b>\n"
+                    f"Time: {now_str}\n"
+                    f"Check: {detail} ({remote_fail_counts[name]} consecutive failures)\n"
+                    f"Checked from eisax2 — remote service, no auto-heal."
+                )
+                last_alert_time[f"remote:{name}"] = time.time()
+                remote_alerted[name] = True
+    return any_bad
+
+
 def format_diag(diag: dict) -> str:
     lines = []
     procs = diag.get("port_8000_procs", "?")
@@ -314,10 +399,15 @@ def maybe_send_daily_summary():
         return
     if now_utc.hour == 8 and now_utc.minute < 10:
         diag = get_diagnostics()
+        remote_lines = "\n".join(
+            f"{'🟢' if ok else '🔴'} {name}: {detail}"
+            for name, ok, detail in check_remote_endpoints()
+        )
         send_telegram(
             f"📊 <b>EisaX Daily Summary</b>\n"
             f"Date: {today}\n\n"
             f"{format_diag(diag)}\n\n"
+            f"🌐 <b>Endpoints</b>\n{remote_lines}\n\n"
             f"Monitor v3: running ✅"
         )
         last_daily_report = today
@@ -339,6 +429,9 @@ def main():
 
         # ── Always check nginx ────────────────────────────────────────────────
         check_and_heal_nginx()
+
+        # ── Remote endpoints (WealthGate API/portal, EisaX website) ──────────
+        remote_bad = process_remote_checks()
 
         # ── DOWN handling ────────────────────────────────────────────────────
         if status == "down":
@@ -435,8 +528,8 @@ def main():
 
         maybe_send_daily_summary()
 
-        # Dynamic interval: faster when something is wrong
-        interval = INTERVAL_BAD if status in ("down", "degraded") else INTERVAL_OK
+        # Dynamic interval: faster when something is wrong (local or remote)
+        interval = INTERVAL_BAD if (status in ("down", "degraded") or remote_bad) else INTERVAL_OK
         time.sleep(interval)
 
 
