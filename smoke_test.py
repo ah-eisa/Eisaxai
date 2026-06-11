@@ -84,13 +84,15 @@ else:                          fail("GET /", f"HTTP {status}")
 # ═══════════════════════════════════════════════════════════════
 section("2. Auth Guard")
 
+# require_auth (Phase 4) returns 401 for bad/missing credentials; legacy inline
+# checks returned 403 — accept both until every endpoint is migrated
 status, _, _ = req("GET", "/v1/health", token="wrong-token")
-if status == 403:   ok("Wrong token → 403")
-else:               fail("Wrong token → 403", f"got {status}")
+if status in (401, 403):   ok(f"Wrong token → {status}")
+else:                      fail("Wrong token → 401/403", f"got {status}")
 
 status, _, _ = req("GET", "/v1/health", token="")
-if status == 403:   ok("Empty token → 403")
-else:               warn("Empty token", f"got {status}")
+if status in (401, 403):   ok(f"Empty token → {status}")
+else:                      warn("Empty token", f"got {status}")
 
 # ═══════════════════════════════════════════════════════════════
 section("3. Health Check")

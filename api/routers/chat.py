@@ -16,14 +16,15 @@ import asyncio
 import io
 import json as _json
 import logging
-import os
 import time as _time
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from core.dependencies.auth import require_auth
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -35,8 +36,6 @@ from api.routers.staging import (
 
 logger = logging.getLogger("api_bridge")
 limiter = Limiter(key_func=get_remote_address)
-
-SECURE_TOKEN = os.getenv("SECURE_TOKEN", "")
 
 chat_router = APIRouter()
 
@@ -80,13 +79,9 @@ def _coerce_chat_payload(raw: dict) -> MessagePayload:
 async def pilot_report(
     payload: PilotReportPayload,
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     from api_bridge_v2 import orchestrator, _APP_VERSION
-    _token = access_token or access_token_alt
-    if _token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     if str(payload.report_type or "").strip().lower() != "pilot_report":
         raise HTTPException(status_code=400, detail="report_type must be 'pilot_report'")
     if not orchestrator.financial_agent:
@@ -214,15 +209,10 @@ async def pilot_report(
 async def unified_chat(
     payload: MessagePayload,
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """نقطة الدخول الرئيسية للمحادثة - مع الحماية"""
     from api_bridge_v2 import orchestrator, _file_store_get_for_user
-
-    _token = access_token or access_token_alt
-    if _token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
     client_ip = (
         request.headers.get("X-Real-IP")
@@ -454,8 +444,7 @@ async def unified_chat(
 @limiter.limit("30/minute")
 async def unified_chat_legacy(
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     try:
         raw = await request.json()
@@ -471,8 +460,7 @@ async def unified_chat_legacy(
     return await unified_chat(
         payload=payload,
         request=request,
-        access_token=access_token,
-        access_token_alt=access_token_alt,
+        user=user,
     )
 
 # ── SSE Streaming Chat ─────────────────────────────────────────────────────────
@@ -482,8 +470,7 @@ async def unified_chat_legacy(
 async def unified_chat_stream(
     payload: MessagePayload,
     request: Request,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     """
     Server-Sent Events streaming chat endpoint.
@@ -497,9 +484,6 @@ async def unified_chat_stream(
       data: [DONE]                               ← stream closed
     """
     from api_bridge_v2 import orchestrator
-    _token = access_token or access_token_alt
-    if _token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
 
     if orchestrator.session_mgr.is_user_blocked(payload.user_id):
         raise HTTPException(status_code=403, detail="Your account has been suspended.")
@@ -545,12 +529,9 @@ async def unified_chat_stream(
 async def text_to_speech(
     request: Request,
     tts_body: TTSRequest,
-    access_token: str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
     from api_bridge_v2 import tts_service
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         audio_bytes = tts_service.generate_speech(tts_body.text, tts_body.language)
         return StreamingResponse(

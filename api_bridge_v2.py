@@ -29,6 +29,7 @@ from core.tts_service import TTSService
 from core.orchestrator import MultiAgentOrchestrator
 from core.news_aggregator import get_news as _get_aggregated_news
 from core.export_engine import export as export_engine
+from core.dependencies.auth import require_auth
 from contextlib import asynccontextmanager
 # learning_engine runs as a separate service (eisax-learning.service)
 
@@ -361,7 +362,7 @@ async def chart_data(request: Request, ticker: str = "NVDA"):
 async def upload_file_ui(
     request: Request,
     file: UploadFile = File(...),
-    user: dict = Depends(_require_jwt),
+    user: dict = Depends(require_auth),
 ):
     """Receive file from chat UI, extract text via Gemini Vision or file_processor."""
     import uuid as _uuid, base64 as _b64
@@ -370,16 +371,9 @@ async def upload_file_ui(
     b64 = _b64.b64encode(raw).decode()
     result = process_file(file.filename, b64)
     file_id = str(_uuid.uuid4())
-    uploader_user_id = str(user["sub"])
-    if not uploader_user_id:
-        try:
-            uploader_user_id = _resolve_user_context(
-                access_token=None,
-                access_token_alt=access_token_alt,
-                authorization=authorization,
-            ).get("user_id")
-        except HTTPException:
-            uploader_user_id = None
+    # require_auth normalizes all methods (JWT/eixa_/legacy) to user_id;
+    # "sub" kept as fallback for any cached _require_jwt-shaped payloads
+    uploader_user_id = str(user.get("user_id") or user.get("sub") or "") or None
     _evict_old_files()
     _file_store_set(file_id, {
         "id": file_id,
@@ -481,12 +475,8 @@ app.include_router(auth_router)
 @limiter.limit("30/minute")
 async def health_check(
     request: Request,
-    access_token:     str = Header(None, alias="X-API-Key"),
-    access_token_alt: str = Header(None, alias="access-token"),
+    user: dict = Depends(require_auth),
 ):
-    _token = access_token or access_token_alt
-    if _token != SECURE_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
     from core.services.health_service import run_health_check
     result = await run_health_check(SECURE_TOKEN)
     status_code = 200 if result["status"] == "ok" else (503 if result["status"] == "down" else 207)

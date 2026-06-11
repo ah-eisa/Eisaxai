@@ -15,11 +15,16 @@ Usage:
         # user is a dict: {"user_id": ..., "tier": ..., "method": ...}
 """
 
+import hmac
+import logging
 import os
+import time
 from functools import lru_cache
 
 from fastapi import Header, HTTPException, Request
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +53,22 @@ def _secure_token() -> str:
     return os.getenv("SECURE_TOKEN", "")
 
 
+# Throttled deprecation warning — one line per client per 5 min, so the soak
+# log shows WHO still uses the legacy shared token without flooding.
+_WARN_EVERY = 300.0
+_last_warn: dict[str, float] = {}
+
+
+def _warn_legacy_token(client: str) -> None:
+    now = time.monotonic()
+    if now - _last_warn.get(client, 0.0) >= _WARN_EVERY:
+        _last_warn[client] = now
+        logger.warning(
+            "[auth] legacy SECURE_TOKEN used by %s — migrate this client to an eixa_ key",
+            client or "unknown-client",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Core resolver (shared logic for sync & async variants)
 # ---------------------------------------------------------------------------
@@ -56,6 +77,7 @@ def _resolve(
     x_api_key: Optional[str],
     access_token_alt: Optional[str],
     authorization: Optional[str],
+    client: str = "",
 ) -> dict:
     """Return user context dict or raise HTTPException."""
 
@@ -79,13 +101,14 @@ def _resolve(
             return {"user_id": info["user_id"], "tier": info["tier"], "method": "api_key"}
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
 
-    # 2. Legacy SECURE_TOKEN (admin bypass)
+    # 2. Legacy SECURE_TOKEN (admin bypass — transitional, slated for retirement)
     secret = _secure_token()
-    if secret and (token == secret or bearer == secret):
+    if secret and (hmac.compare_digest(token, secret) or hmac.compare_digest(bearer, secret)):
+        _warn_legacy_token(client)
         return {"user_id": "admin", "tier": "vip", "method": "secure_token"}
 
-    # 3. JWT Bearer token
-    if bearer and not bearer.startswith("eixa_") and bearer != secret:
+    # 3. JWT Bearer token (eixa_/SECURE_TOKEN bearers already returned above)
+    if bearer:
         payload = _decode_jwt(bearer)
         if payload:
             return {
@@ -121,7 +144,13 @@ async def require_auth(
     Raises:
         HTTPException 401 — invalid / missing credentials
     """
-    return _resolve(x_api_key, access_token_alt, authorization)
+    client_host = getattr(request.client, "host", "") if request.client else ""
+    return _resolve(
+        x_api_key,
+        access_token_alt,
+        authorization,
+        client=f"{client_host} {request.method} {request.url.path}",
+    )
 
 
 # ---------------------------------------------------------------------------

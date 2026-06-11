@@ -18,7 +18,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram.helpers import escape_markdown
 
 EISAX_API_URL = "http://localhost:8000"
-EISAX_TOKEN = os.getenv("SECURE_TOKEN", "")
+# Dedicated service key (Phase 4); SECURE_TOKEN fallback until it is retired
+EISAX_TOKEN = os.getenv("EISAX_BOT_API_KEY", "").strip() or os.getenv("SECURE_TOKEN", "")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN_EISAX", "").strip()
 MAX_TELEGRAM_MSG = 4096
 LOCAL_THROTTLE_SECONDS = 2.0

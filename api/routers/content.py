@@ -22,6 +22,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from api.routes.auth import _require_jwt
+from core.dependencies.auth import require_auth
 from core.config import EXPORTS_DIR
 from core.export_engine import export as export_engine
 from core.news_aggregator import get_news as _get_aggregated_news
@@ -657,9 +658,7 @@ async def brain_wisdom(request: Request, access_token: str = Header(None, alias=
 
 @content_router.post("/v1/alerts")
 @limiter.limit("20/minute")
-async def create_alert(request: Request, access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
+async def create_alert(request: Request, user: dict = Depends(require_auth)):
     body = await request.json()
     from core.price_alerts import add_alert
     alert_id = add_alert(body.get('user_id', 'anonymous'), body['ticker'], body['condition'], body['threshold'])
@@ -667,17 +666,13 @@ async def create_alert(request: Request, access_token: str = Header(None, alias=
 
 @content_router.get("/v1/alerts")
 @limiter.limit("30/minute")
-async def list_alerts(request: Request, user_id: str = 'anonymous', access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
+async def list_alerts(request: Request, user_id: str = 'anonymous', user: dict = Depends(require_auth)):
     from core.price_alerts import get_user_alerts
     return get_user_alerts(user_id)
 
 @content_router.delete("/v1/alerts/{alert_id}")
 @limiter.limit("20/minute")
-async def remove_alert(request: Request, alert_id: int, user_id: str = 'anonymous', access_token: str = Header(None, alias="X-API-Key"), access_token_alt: str = Header(None, alias="access-token")):
-    if (access_token or access_token_alt) != SECURE_TOKEN:
-        raise HTTPException(403, "Unauthorized")
+async def remove_alert(request: Request, alert_id: int, user_id: str = 'anonymous', user: dict = Depends(require_auth)):
     from core.price_alerts import delete_alert
     delete_alert(alert_id, user_id)
     return {'status': 'deleted'}
