@@ -123,7 +123,7 @@ def macro_simulation(req: MacroSimRequest):
         raise
     except Exception as e:
         log.exception("macro_simulation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,7 +150,7 @@ def budget_plan(req: BudgetRequest):
         return _json_safe({"ok": True, **result})
     except Exception as e:
         log.exception("budget_plan failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,7 +197,7 @@ def forward_scenario(req: ForwardScenarioRequest):
         raise
     except Exception as e:
         log.exception("forward_scenario failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -246,7 +246,7 @@ def monte_carlo(req: MonteCarloRequest):
         raise
     except Exception as e:
         log.exception("monte_carlo failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -293,7 +293,7 @@ def market_regimes(req: RegimeRequest):
         raise
     except Exception as e:
         log.exception("market_regimes failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,7 +325,7 @@ def shariah_screen(req: _BasePayload):
         raise
     except Exception as e:
         log.exception("shariah_screen failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -389,7 +389,7 @@ def optimize(req: OptimizerRequest):
         raise
     except Exception as e:
         log.exception("optimize failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +431,7 @@ def dividend_income(req: DividendRequest):
         raise
     except Exception as e:
         log.exception("dividend_income failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -458,7 +458,7 @@ def data_check(req: DataCheckRequest):
         return {"ok": True, **report.to_dict()}
     except Exception as e:
         log.exception("data_check failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/data-check/{ticker}")

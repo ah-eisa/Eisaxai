@@ -1,5 +1,9 @@
 import numpy; import yfinance
 import os
+# Phase 5 hardening: app-created files (SQLite DBs, export PDFs, caches) get
+# 640/750 instead of world-readable 644 — a second local user (e.g. opc) must
+# not read api_keys.db / sessions.db / user data. Set before any DB/dir create.
+os.umask(0o027)
 import logging
 import time as _time
 import asyncio

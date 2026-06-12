@@ -440,7 +440,8 @@ async def create_checkout(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        logger.warning("[billing] service unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Billing service temporarily unavailable")
     except Exception as exc:
         logger.error("[billing/checkout] %s", exc)
         raise HTTPException(status_code=500, detail="Billing service error")
@@ -482,7 +483,8 @@ async def billing_portal(
     except HTTPException:
         raise
     except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        logger.warning("[billing] service unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Billing service temporarily unavailable")
     except Exception as exc:
         logger.error("[billing/portal] %s", exc)
         raise HTTPException(status_code=500, detail="Billing service error")

@@ -540,4 +540,5 @@ async def text_to_speech(
             headers={"Content-Disposition": "inline; filename=speech.mp3"},
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("[tts] speech generation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Speech generation failed")

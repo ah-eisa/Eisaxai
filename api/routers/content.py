@@ -234,7 +234,8 @@ async def export_chat(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("[content] request failed: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @content_router.get("/v1/download/{token}")
@@ -700,7 +701,7 @@ async def export_html_to_pdf(
         filepath = str(EXPORTS_DIR / fname)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         html_to_pdf(inject_print_css(payload.html), filepath)
-        os.chmod(filepath, 0o644)
+        os.chmod(filepath, 0o640)  # served via /v1/download (app reads as owner); not world-readable
         download_token = _create_download_token(fname, "admin")
         return {
             "url": f"/v1/download/{download_token}",
@@ -708,7 +709,8 @@ async def export_html_to_pdf(
             "filename": fname,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("[content] request failed: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
@@ -1000,7 +1002,7 @@ async def export_html_pdf(
         filepath = str(EXPORTS_DIR / fname)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         html_to_pdf(inject_print_css(payload.html), filepath)
-        os.chmod(filepath, 0o644)
+        os.chmod(filepath, 0o640)  # served via /v1/download (app reads as owner); not world-readable
         download_token = _create_download_token(fname, "admin")
         return {
             "url": f"/v1/download/{download_token}",
@@ -1008,4 +1010,5 @@ async def export_html_pdf(
             "filename": fname,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("[content] request failed: %s", e)
+        raise HTTPException(status_code=500, detail="Internal server error")
